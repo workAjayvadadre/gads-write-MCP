@@ -7,14 +7,15 @@ Separate repo, separate process, separate hostname (`adswrite.indiraivf.in`)
 from the read-only `googleads/google-ads-mcp` already running on this box.
 We do not fork or modify Google's code.
 
-Stack: Python 3.11+, FastMCP, streamable-http, Google OAuth, PM2, Nginx,
-Ubuntu EC2. No Docker.
+Stack: Python 3.11+, FastMCP 3.4.x, streamable-http, Google OAuth, PM2,
+Nginx, Ubuntu EC2. No Docker.
 
 ## Working agreement
 
 The author knows Node/TypeScript well and Python poorly. Explain
-Python-specific choices when they are not obvious from a TS background.
-Prefer plain, explicit code over clever idioms.
+Python-specific choices when they are not obvious from a TS background, and
+bridge MCP concepts to Express equivalents. Prefer plain, explicit code over
+clever idioms.
 
 Build **one phase at a time**. Before each phase, state what you are
 building, why it comes at this point, what it protects against, and how to
@@ -23,14 +24,28 @@ verify it. Then build it and **stop** for verification. Do not run ahead.
 If you need a config value, a decision, or a file from the existing server,
 **ask** rather than assuming.
 
+## Phase status
+
+| Phase | Scope | State |
+|---|---|---|
+| 1 | Skeleton: settings, OAuth, `health_check`, ops | **done, verified in production** |
+| 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
+| 3 | Reads: per-user Ads client, accounts, performance, search terms | not started |
+| 4 | First mutation (`pause`/`enable`), test account only | not started |
+| 5 | Budget, bids, negatives, keywords, RSA | not started |
+| 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
+
+`google-ads` is deliberately not a dependency until Phase 3.
+
 ## Non-negotiable constraints
 
 ### Architecture
 - Only `src/gads_write/ads/executor.py` may call the Google Ads API mutate.
-  Tool functions NEVER call the API directly. No exceptions.
+  Tool functions NEVER call the API directly. `tests/test_architecture.py`
+  fails the build otherwise.
 - Every write tool returns a `plan_id` + preview. It does not execute.
   Execution happens only in `tools/confirm.py`, after re-evaluating policy.
-- Every tool calls `check_guards()` before doing anything else.
+- Every tool calls `Guard.check()` before doing anything else.
 
 ### Forbidden in v1
 - No remove/delete tools for campaigns, ad groups, keywords, conversion
@@ -41,16 +56,16 @@ If you need a config value, a decision, or a file from the existing server,
 
 ### Credentials
 - Never a static refresh token. Every Google Ads call uses the authenticated
-  user's OAuth token from the request context, so Google's own permission
-  model is the outermost guard.
+  user's OAuth token, so Google's own permission model is the outermost
+  guard.
 - Never log tokens, client secrets, or credentials.
 
-### Adding a write tool — all must be true
-1. Registered per role tier, not globally
-2. Inputs validated in `safety/validators.py`
-3. Policy checked in `safety/guards.py`, then AGAIN at confirm time
+### Adding a write tool - all must be true
+1. Registered in `tools/registry.py` with its required tier
+2. Inputs validated via `safety/validators.py`
+3. `Guard.check()` called first, and AGAIN at confirm time
 4. Returns preview + `plan_id`, no side effects
-5. Audit line written on apply
+5. Audit line written on apply via `Guard.record_application()`
 6. Has a test in `tests/`
 
 ### Style
@@ -64,48 +79,102 @@ conversion, update masks) are where silent, expensive bugs live. If you are
 not certain of an API detail, say so and check the docs rather than
 producing plausible-looking code.
 
-**Money is in micros** — millionths of the currency unit. A missing
+**Money is in micros** - millionths of the currency unit. A missing
 conversion is a 1,000,000x error that type-checks fine. Name variables with
-their unit (`budget_micros`, `budget_rupees`), never bare `budget`.
+their unit (`budget_micros`, `budget_units`), never a bare `budget`.
 
-## Phase status
+---
 
-| Phase | Scope | State |
-|---|---|---|
-| 1 | Skeleton: settings, OAuth, `health_check`, ops | verified |
-| 2 | Safety core against a fake executor, no API calls | **partial** - units, validators, policy, plans, spend, audit, executor Protocol built and tested. `guards.py`, `auth/tiers.py` (TierResolver) and the tier middleware are blocked on three interface decisions; see the Phase 2 section below. |
-| 3 | Reads: per-user client, accounts, performance, search terms | not started |
-| 4 | First mutation (`pause`/`enable`), test account only | not started |
-| 5 | Remaining tools: budget, bids, negatives, keywords, RSA | not started |
-| 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
+## Decisions already made, and why
 
-`google-ads` is deliberately not a dependency until Phase 3.
+These are the things that are NOT obvious from reading the code, and that
+would otherwise be re-litigated.
 
-### Phase 2: tier resolution is pluggable
+**Tier comes from Google Ads, not from a file.** The operational
+requirement is: add someone in the Google Ads UI and they work here, with no
+developer involvement. `roles.yaml` in `mode: file` is temporary Phase 2
+backing only. In Phase 3 it flips to `mode: google_ads` and the `users` map
+empties out, becoming a break-glass override.
 
-Tier must NOT come from roles.yaml in production. It is derived from the
-user's own Google Ads MCC role (Read-only -> readonly, Standard -> operator,
-Admin -> lead) so that adding someone in the Google Ads UI grants access with
-no developer involvement.
+**Tier is per-account, not global.** `resolve(caller, customer_id)`. Google
+stores access on `customer_user_access`, which is per-customer; a person can
+be Standard on one account and Read-only on another. A global tier would
+have to take the lowest across all accounts (one read-only account demotes
+someone everywhere) or the highest (a genuine privilege escalation).
 
-- `TierResolver` is an interface. `FileTierResolver` (roles.yaml) is temporary
-  Phase 2 backing; `GoogleAdsTierResolver` arrives in Phase 3 and becomes the
-  default, at which point roles.yaml shrinks to an optional override list.
-- Guards, middleware and tests depend on the interface only, never on
-  roles.yaml directly.
-- Tier is resolved on **every call**, not at connect. A demoted user must not
-  keep operator powers until they reconnect.
+**`tools/list` carries no customer_id**, so visibility and authorization
+answer different questions. `visible_tier(caller)` = highest tier anywhere,
+used only to build the menu. `resolve(caller, customer_id)` is the boundary.
+Hiding a tool is UX; the check on `tools/call` is the security.
 
-Open risk for Phase 3: `customer_user_access` is documented as how admins list
-users, but the docs do not say whether a STANDARD or READ_ONLY user can read
-their own row using their own token. If they cannot, `GoogleAdsTierResolver`
-cannot resolve non-admins. Settle this with an empirical test against the real
-MCC before building on it.
+**EMAIL_ONLY, UNKNOWN, UNSPECIFIED and no-access-row all map to `none`.**
+`UNKNOWN` means a value from a newer API version nobody has reviewed; it
+must never map to a permissive tier. There is no `BILLING_ONLY` in the API.
+
+**An indeterminate tier lookup fails closed**, with a distinct audit verdict
+(`lookup_failed`) so an outage is visible as an outage. `Tier.NONE` means
+"we asked, they have nothing"; `TierLookupError` means "we do not know".
+Conflating them would mean anyone able to cause a Google outage could grant
+themselves permissions. The break-glass is a deliberate `roles.yaml` edit -
+visible, in git, obviously temporary - not an automatic fallback.
+
+**`none` and `readonly` limits are pinned to zero in code**, not trusted to
+`policy.yaml`. A test caught `readonly` silently inheriting the permissive
+defaults because the config omitted its block. Their blocks in the YAML are
+documentation; `safety/policy.py` is the enforcement.
+
+**The daily spend ceiling is derived from the audit log, not a counter.**
+An in-memory counter would make `pm2 restart` a way to clear the cap. Only
+positive deltas count: a decrease must not create headroom, or lowering
+campaign A by 5000 would fund raising campaign B past the cap.
+
+**Plans are consumed before execution**, not after. A crash mid-apply
+leaves the plan burnt, forcing a human to look at the account rather than
+blindly retry when we cannot know whether the mutation landed.
+
+**A bad config edit keeps the last good version.** Both `PolicyStore` and
+`RoleStore` refuse an invalid reload rather than relaxing to defaults or
+crashing a live request. `last_error` is surfaced in `health_check`.
+
+**`AccessToken.token` is the real Google access token** under
+`GoogleProvider`, not the FastMCP JWT. Verified against fastmcp 3.4.7
+source; citations are in `auth/identity.py`. Re-check on a major upgrade.
+
+## Open risks
+
+**Can a non-admin read their own access role?** Google documents
+`customer_user_access` as how *admins* list users. It does not say whether a
+STANDARD or READ_ONLY user can query their own row with their own token. If
+they cannot, `GoogleAdsTierResolver` fails for every non-admin and the whole
+"just add them in Google Ads" model breaks. **Settle this with a real query
+against the MCC before building Phase 3 on it.** Fallback: a read-only
+service credential used *solely* for the role lookup, with every actual read
+and write still on the user's own token.
+
+**Human approval is enforced by the client, not the server.** Nothing at the
+protocol level stops Claude calling draft then confirm in one turn. The
+server guarantees the approval is a separate authenticated call, owner-bound,
+expiring, single-use and re-evaluated. A server-side guarantee needs
+out-of-band approval (Slack/email) or a confirmation code the model never
+sees. Decide in Phase 6.
+
+**`policy.yaml` still holds placeholder numbers.** Every limit and the
+account allowlist (`0000000000`) were invented to make tests meaningful.
+They must be replaced before `GADS_WRITE_ENABLED` is ever true.
+
+## Environment gotchas
+
+- PowerShell 5.1 `Get-Content`/`Set-Content` **corrupts UTF-8**. Use the
+  Edit/Write tools for source edits, never a shell round trip.
+- The Bash tool here has no coreutils on PATH. Use PowerShell.
+- `.gitattributes` forces LF so `ops/run.sh` does not reach Ubuntu with CRLF.
+- The package must be `pip install -e .` for `python -m gads_write.server`;
+  pytest works without it via `pythonpath` in pyproject.
 
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest          # tests
-.venv/bin/python -m gads_write.server   # run locally
-pm2 restart gads-write-mcp          # prod; picks up .env and config/*.yaml
+.venv/Scripts/python -m pytest          # 201 tests, no network, no credentials
+.venv/Scripts/python -m gads_write.server
+pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```
