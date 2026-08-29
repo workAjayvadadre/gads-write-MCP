@@ -1,0 +1,93 @@
+"""Which tier each tool requires, and whether it can change anything.
+
+There are no URL paths in MCP. Every request arrives at `POST /mcp` with the
+tool name as a string in the JSON body, so authorization cannot key on a
+route prefix the way `app.use('/admin', requireAdmin)` does in Express. This
+registry is the lookup table that replaces that.
+
+The security property that matters here is the DEFAULT. A tool with no entry
+resolves to `unknown_tool_spec()`, which requires `lead` and is flagged as
+writing. So forgetting to register a new tool makes it maximally restricted,
+not accidentally public. Registering is how you loosen a tool, never how you
+tighten it.
+
+Python notes for a TypeScript reader:
+  - This is a plain module-level dict, populated at import time. Same shape
+    as a route table you build once at boot.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ..auth.tiers import Tier
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """What the gate needs to know about a tool before running it."""
+
+    name: str
+    required_tier: Tier
+    # True if this tool can change anything in Google Ads. Write tools are
+    # hidden and refused entirely when GADS_WRITE_ENABLED is false.
+    writes: bool
+    # Stable operation name, matched against policy.blocked_operations.
+    # None for tools that are not mutations.
+    operation: str | None = None
+    # True for the confirm tool, which is a write in the sense that it
+    # applies one, but carries a plan_id rather than change arguments.
+    applies_plan: bool = False
+
+
+_REGISTRY: dict[str, ToolSpec] = {}
+
+
+def register(spec: ToolSpec) -> ToolSpec:
+    """Add a tool to the registry. Duplicate names are a programming error."""
+    if spec.name in _REGISTRY:
+        raise ValueError(f"tool {spec.name!r} is already registered")
+    _REGISTRY[spec.name] = spec
+    return spec
+
+
+def unknown_tool_spec(name: str) -> ToolSpec:
+    """The fail-closed default for a tool nobody registered.
+
+    Requires the highest tier and is treated as a write, so an unregistered
+    tool is hidden from everyone below lead and blocked by the kill switch.
+    The gate refuses it outright; this exists so that the refusal path has a
+    well-formed spec to log rather than a None to crash on.
+    """
+    return ToolSpec(name=name, required_tier=Tier.LEAD, writes=True, operation=name)
+
+
+def spec_for(name: str) -> ToolSpec:
+    return _REGISTRY.get(name) or unknown_tool_spec(name)
+
+
+def is_registered(name: str) -> bool:
+    return name in _REGISTRY
+
+
+def all_specs() -> dict[str, ToolSpec]:
+    return dict(_REGISTRY)
+
+
+def reset_for_tests() -> None:
+    """Clear the registry. Tests only."""
+    _REGISTRY.clear()
+    _register_builtin_tools()
+
+
+def _register_builtin_tools() -> None:
+    # health_check is the one tool available at tier `none`. Someone not yet
+    # listed must still be able to ask "who does this server think I am, and
+    # what do I need to do about it?" - otherwise their only feedback is an
+    # empty tool list, which looks like the server being broken.
+    register(
+        ToolSpec(name="health_check", required_tier=Tier.NONE, writes=False)
+    )
+
+
+_register_builtin_tools()
