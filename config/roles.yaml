@@ -1,0 +1,40 @@
+# Who may do what.
+#
+# `mode` decides where tiers actually come from:
+#
+#   file        This file is the source of truth. Phase 2 default.
+#   google_ads  The user's own Google Ads access level is the source of
+#               truth (Admin -> lead, Standard -> operator, Read only ->
+#               readonly). Arrives in Phase 3. In that mode the `users` map
+#               below becomes a BREAK-GLASS OVERRIDE, normally empty.
+#
+# Emails are matched case-insensitively against the address Google asserts in
+# the OAuth token, never against anything a caller sends, so it cannot be
+# spoofed by the client.
+#
+# This file hot-reloads. Save it and the change applies on the next request,
+# with no restart. A demoted user loses their powers immediately.
+
+mode: file
+
+# Tiers, lowest to highest:
+#   none      authenticated, but no tools beyond health_check
+#   readonly  reads only
+#   operator  reads, pause/enable, negative keywords, budgets within policy
+#   lead      everything operator can do, plus keywords, bids, new RSAs
+#
+# Anyone not listed gets `default_tier`. Keep that at "none".
+default_tier: none
+
+users:
+  # REPLACE with real addresses before deploying.
+  # While mode is `file`, at least one `lead` is required or the server
+  # refuses to boot.
+  #
+  # Once mode is `google_ads`, this map should normally be EMPTY. Adding
+  # someone here then means "Google could not tell us this person's role and
+  # a lead has deliberately overridden it" - a temporary, visible, in-git
+  # decision rather than a silent automatic fallback.
+  "indiragenai@indiraivfgenai.com": lead
+  # "someone@indiraivf.com": operator
+  # "analyst@indiraivf.com": readonly

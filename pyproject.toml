@@ -1,0 +1,37 @@
+[project]
+name = "gads-write-mcp"
+version = "0.1.0"
+description = "Guardrailed write MCP server for Google Ads"
+requires-python = ">=3.11"
+
+# NOTE: the `google-ads` client library is deliberately NOT a dependency yet.
+# Phase 1-2 make zero Google Ads API calls. It is added in Phase 3, after we
+# confirm the current library version and the Ads API version it targets.
+dependencies = [
+    # Pinned to the major version this code was verified against. auth/identity.py
+    # depends on where OAuthProxy puts the upstream Google token; re-verify that
+    # before widening this range.
+    "fastmcp>=3.4,<4",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# The TierResolver interface is async because Phase 3's implementation does
+# network I/O. "auto" means async test functions just work.
+asyncio_mode = "auto"
