@@ -112,5 +112,44 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="get_search_terms", required_tier=Tier.READONLY, writes=False)
     )
 
+    # --- Phase 4 writes ----------------------------------------------------
+    # `writes=True` puts these behind the kill switch: GADS_WRITE_ENABLED
+    # false hides them from tools/list and refuses them on tools/call.
+    #
+    # Both sit at operator. Pause and enable are NOT symmetric - pausing
+    # stops spend, enabling resumes it, and in Phase 4 enable is the only
+    # tool that can cause money to be spent. Raising enable_campaign to
+    # Tier.LEAD here is a one-line change and needs nothing else.
+    register(
+        ToolSpec(
+            name="pause_campaign",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="pause_campaign",
+        )
+    )
+    register(
+        ToolSpec(
+            name="enable_campaign",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="enable_campaign",
+        )
+    )
+    # `operation=None` on purpose: confirm_and_apply is not itself a
+    # mutation kind, so it must not be matched against
+    # policy.blocked_operations. The gate re-check inside it runs against the
+    # ORIGINAL drafting tool, which carries the real operation name and the
+    # real tier requirement.
+    register(
+        ToolSpec(
+            name="confirm_and_apply",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation=None,
+            applies_plan=True,
+        )
+    )
+
 
 _register_builtin_tools()

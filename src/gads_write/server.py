@@ -23,6 +23,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 
 from .ads.api_version import API_VERSION
+from .ads.executor import GoogleAdsExecutor
 from .ads.reads import GoogleAdsReader
 from .auth.google_ads_roles import (
     GoogleAdsTierResolver,
@@ -44,7 +45,9 @@ from .safety.plans import PlanStore
 from .safety.policy import PolicyStore
 from .safety.spend import DailySpendLedger
 from .settings import ConfigError, Settings, load_settings
+from .tools.confirm import register_confirm_tool
 from .tools.reads import register_read_tools
+from .tools.writes import register_write_tools
 
 logger = logging.getLogger("gads_write")
 
@@ -161,6 +164,12 @@ try:
         settings=SETTINGS, token_provider=google_access_token
     )
 
+    # The single execution path. Nothing else in the process may mutate an
+    # account; tests/test_architecture.py fails the build if anything tries.
+    EXECUTOR = GoogleAdsExecutor(
+        settings=SETTINGS, token_provider=google_access_token
+    )
+
     TIER_RESOLVER: TierResolver = _build_tier_resolver(
         settings=SETTINGS,
         role_store=ROLE_STORE,
@@ -200,6 +209,22 @@ register_read_tools(
     policy_store=POLICY_STORE,
 )
 
+# Phase 4 writes. These draft plans and apply them; they are hidden and
+# refused entirely while GADS_WRITE_ENABLED is false.
+register_write_tools(
+    mcp,
+    guard=GUARD,
+    reader=READER,
+    policy_store=POLICY_STORE,
+    plan_store=PLAN_STORE,
+)
+register_confirm_tool(
+    mcp,
+    guard=GUARD,
+    executor=EXECUTOR,
+    plan_store=PLAN_STORE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -237,7 +262,7 @@ async def health_check() -> dict:
         },
         "server": {
             "name": "gads-write-mcp",
-            "phase": "3 - reads live, no write tools yet",
+            "phase": "4 - pause/enable campaigns, two-step confirm",
             "environment": SETTINGS.env,
             "base_url": SETTINGS.base_url,
             "google_ads_api_version": API_VERSION,
@@ -263,8 +288,13 @@ async def health_check() -> dict:
             "Tier 'none' means you are authenticated but have no access. "
             "Ask a lead to add you in Google Ads."
             if tier is Tier.NONE
-            else "Read tools are available. No write tools exist yet - they "
-            "arrive in Phase 4."
+            else (
+                "Reads are available. Writes are disabled on this server "
+                "(GADS_WRITE_ENABLED=false)."
+                if not SETTINGS.write_enabled
+                else "Reads and campaign pause/enable are available. Every "
+                "write returns a plan_id and applies only via confirm_and_apply."
+            )
         ),
     }
 
