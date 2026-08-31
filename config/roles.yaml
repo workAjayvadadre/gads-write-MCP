@@ -15,7 +15,12 @@
 # This file hot-reloads. Save it and the change applies on the next request,
 # with no restart. A demoted user loses their powers immediately.
 
-mode: google_ads
+# Currently `file` for local development: `google_ads` resolves every tier by
+# calling the Google Ads API, which needs working credentials and a real
+# account on the allowlist. The Google Ads resolver is built and tested
+# (tests/test_google_ads_tiers.py) and boots in both modes - switch this one
+# word back to `google_ads` when credentials are in place.
+mode: file
 
 # Tiers, lowest to highest:
 #   none      authenticated, but no tools beyond health_check
@@ -42,7 +47,10 @@ default_tier: none
 #
 # To restore access if the Google Ads lookup fails, uncomment one line, save,
 # and it applies on the next request - no restart.
-users: {}
-  # "indiragenai@indiraivfgenai.com": lead
+#
+# While mode is `file` this map is the ONLY source of tiers, and at least one
+# `lead` is required or the server refuses to boot.
+users:
+  "indiragenai@indiraivfgenai.com": lead
   # "someone@indiraivf.com": operator
   # "analyst@indiraivf.com": readonly

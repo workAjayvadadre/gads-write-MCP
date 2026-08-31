@@ -4,10 +4,6 @@
 # If an edit makes this file invalid, the server KEEPS THE LAST GOOD VERSION
 # and logs the error. It will not fall back to permissive defaults, and it
 # will not crash mid-request. Check `pm2 logs gads-write-mcp` after editing.
-#
-# PLACEHOLDER VALUES. Every number below was chosen by Claude to make the
-# tests meaningful, not by anyone who knows this business. Replace them
-# before GADS_WRITE_ENABLED is ever set to true.
 
 # Bumped when the structure changes, so a half-written file cannot parse as
 # a valid-but-empty policy.
@@ -20,7 +16,9 @@ version: 2
 # Digits only, no dashes.
 # ---------------------------------------------------------------------
 allowed_customer_ids:
-  - "0000000000"   # REPLACE: test account, used for Phase 4 verification
+  - "0000000000"   # PLACEHOLDER: replace with the real test account before
+                   # GADS_WRITE_ENABLED is ever set to true. Nothing can be
+                   # read or written until this is a real ID.
 
 currency_code: "INR"
 
@@ -30,24 +28,37 @@ currency_code: "INR"
 timezone: "Asia/Kolkata"
 
 # ---------------------------------------------------------------------
-# Limits. All amounts are in whole currency units, NOT micros.
+# Limits. All amounts are in whole currency units (rupees), NOT micros.
+#
+# The rule these encode: NOTHING GOES ABOVE 50, NOTHING BELOW 10.
+# That absolute band is the real safety mechanism. It binds regardless of
+# tier, regardless of percentages, and regardless of how many changes
+# somebody makes.
 #
 # `defaults` applies to every tier. `tiers` overrides per tier, key by key:
-# an override only replaces the keys it names.
+# an override only replaces the keys it names, so anything not listed below
+# inherits from `defaults`. That inheritance is why `defaults` is set to the
+# widest values in the band rather than something arbitrary - an inherited
+# value must still be inside the band.
 #
-# Boundaries are INCLUSIVE. max_daily: 5000 means 5000 is allowed and
-# 5000.01 is not.
+# Boundaries are INCLUSIVE. max_daily: 50 means 50 is allowed and 50.01 is
+# not.
 # ---------------------------------------------------------------------
 limits:
   defaults:
     budget:
-      min_daily: 50
-      max_daily: 5000
-      max_increase_percent: 25
-      max_total_increase_per_user_per_day: 10000
+      min_daily: 10
+      max_daily: 50
+      # "Never more than double in one change." At a 10-50 band a tighter
+      # percentage stops being a safety feature and starts being an
+      # obstacle: at 10% it takes ~17 approved changes to get from 10 to 50,
+      # and people work around obstacles. The absolute ceiling does the real
+      # work here; this exists to stop a fat-fingered 10x in a single step.
+      max_increase_percent: 100
+      max_total_increase_per_user_per_day: 50
     bids:
-      max_cpc: 200
-      max_increase_percent: 30
+      max_cpc: 50
+      max_increase_percent: 100
 
   tiers:
     readonly:
@@ -65,19 +76,26 @@ limits:
 
     operator:
       budget:
-        max_daily: 2000
-        max_increase_percent: 20
-        max_total_increase_per_user_per_day: 3000
+        # min_daily inherits 10 from defaults.
+        max_daily: 20
+        max_increase_percent: 100
+        # An operator may add at most 20 rupees of daily budget across ALL
+        # campaigns in one day. With max_daily also 20, that is one
+        # full-size increase per day.
+        max_total_increase_per_user_per_day: 20
       bids:
-        max_cpc: 100
+        max_cpc: 20
+        max_increase_percent: 100
 
     lead:
       budget:
-        max_daily: 5000
-        max_increase_percent: 25
-        max_total_increase_per_user_per_day: 10000
+        # min_daily inherits 10 from defaults.
+        max_daily: 50
+        max_increase_percent: 100
+        max_total_increase_per_user_per_day: 50
       bids:
-        max_cpc: 200
+        max_cpc: 50
+        max_increase_percent: 100
 
 # ---------------------------------------------------------------------
 # Structural rules.
