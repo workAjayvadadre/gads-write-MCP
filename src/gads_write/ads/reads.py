@@ -151,6 +151,22 @@ class CampaignRow:
 
 
 @dataclass(frozen=True)
+class CampaignSummary:
+    """One campaign's current state, with no metrics.
+
+    Used to build a write preview. A preview that cannot say what it is
+    changing *from* is not worth approving, and fetching this also catches
+    "no such campaign" before a plan is ever issued.
+    """
+
+    campaign_id: str
+    name: str
+    status: str
+    channel_type: str
+    daily_budget_micros: int
+
+
+@dataclass(frozen=True)
 class SearchTermRow:
     search_term: str
     status: str
@@ -202,6 +218,16 @@ class AdsReader(Protocol):
     async def campaign_performance(
         self, *, customer_id: str, start_date: str, end_date: str, limit: int
     ) -> tuple[CampaignRow, ...]: ...
+
+    async def campaign_by_id(
+        self, *, customer_id: str, campaign_id: str
+    ) -> CampaignSummary | None:
+        """One campaign's current state, or None if it does not exist.
+
+        None is a definite "no such campaign in this account". A failure to
+        look raises AdsReadError, as everywhere else here.
+        """
+        ...
 
     async def search_terms(
         self,
@@ -369,6 +395,33 @@ class GoogleAdsReader(AdsReader):
                 conversions=float(row.metrics.conversions or 0.0),
             )
             for row in rows
+        )
+
+    async def campaign_by_id(
+        self, *, customer_id: str, campaign_id: str
+    ) -> CampaignSummary | None:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe_campaign = _literal(campaign_id, field="campaign_id")
+
+        query = (
+            "SELECT campaign.id, campaign.name, campaign.status, "
+            "campaign.advertising_channel_type, "
+            "campaign_budget.amount_micros "
+            "FROM campaign "
+            f"WHERE campaign.id = {safe_campaign} "
+            "LIMIT 1"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        if not rows:
+            return None
+
+        row = rows[0]
+        return CampaignSummary(
+            campaign_id=str(row.campaign.id),
+            name=row.campaign.name or "",
+            status=_enum_name(row.campaign.status),
+            channel_type=_enum_name(row.campaign.advertising_channel_type),
+            daily_budget_micros=int(row.campaign_budget.amount_micros or 0),
         )
 
     async def search_terms(

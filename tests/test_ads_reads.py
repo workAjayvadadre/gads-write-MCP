@@ -288,6 +288,7 @@ async def _capture_queries() -> list[str]:
 
     await reader.account_summary("1234567890")
     await reader.access_role(customer_id="1234567890", email="a@b.com")
+    await reader.campaign_by_id(customer_id="1234567890", campaign_id="55")
     await reader.campaign_performance(
         customer_id="1234567890", start_date="2026-08-01", end_date="2026-08-31", limit=10
     )
@@ -319,7 +320,11 @@ async def test_reports_aggregate_over_the_range_rather_than_per_day() -> None:
 
 async def test_removed_campaigns_are_excluded_from_reports() -> None:
     queries = await _capture_queries()
-    campaign_query = next(q for q in queries if " FROM campaign " in q)
+    # The performance report, not the single-campaign lookup - both select
+    # FROM campaign, only one is a report.
+    campaign_query = next(
+        q for q in queries if " FROM campaign " in q and "segments.date" in q
+    )
     assert "campaign.status != 'REMOVED'" in campaign_query
 
 
