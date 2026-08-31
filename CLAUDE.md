@@ -31,7 +31,7 @@ If you need a config value, a decision, or a file from the existing server,
 | 1 | Skeleton: settings, OAuth, `health_check`, ops | **done, verified in production** |
 | 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
 | 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
-| 4 | First mutation (`pause`/`enable`), test account only | not started |
+| 4 | First mutation (`pause`/`enable`), two-step confirm | **code done, 301 tests; NOT yet run against a live account** |
 | 5 | Budget, bids, negatives, keywords, RSA | not started |
 | 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
 
@@ -181,6 +181,36 @@ via `GADS_TIER_CACHE_SECONDS`, refused above 900, `0` disables it, and the
 value is shown in `health_check`. Failures are never cached - an outage must
 not become sticky.
 
+**The update mask is derived from set fields, then checked against an
+allowlist.** A mask names the fields to overwrite, and a mask naming a field
+that is *unset* on the message blanks it - that is how a status change
+silently erases a campaign name. `protobuf_helpers.field_mask(None, msg._pb)`
+can only list fields actually set, which is why Google's own samples are
+safe; `ALLOWED_MASK_PATHS` in `ads/executor.py` is the second line of defence
+against a future edit that sets an extra field without thinking.
+
+**`partial_failure` is false on every mutate.** With it on, the API returns
+200 and buries per-operation errors inside the response body, so a
+"successful" call can change nothing. All-or-nothing plus an exception is the
+behaviour we want.
+
+**`pause` and `enable` are both `operator`, and they are not symmetric.**
+Pausing stops spend and is always safe; enabling resumes it, and in Phase 4
+it is the only tool that can cause money to be spent, carrying no amount for
+the policy engine to check. Raising `enable_campaign` to `lead` in
+`tools/registry.py` is a one-line change if that ever feels wrong.
+
+**Enabling a campaign does not count towards the daily spend ceiling.** The
+ceiling sums positive budget *deltas*, and enabling changes no budget - it
+unlocks an existing one. Inventing a delta (say, the campaign's daily budget)
+would make the ceiling fire on a number nobody changed. Recorded as a real
+gap: in Phase 4 the ceiling does not constrain enables. Phase 5, where
+budgets become editable, is where it starts doing work.
+
+**A REMOVED campaign is refused at draft time.** Removal is terminal in
+Google Ads, so an enable could never succeed. Catching it before a plan
+exists beats an opaque API rejection after a human has approved something.
+
 **Reads go through the full gate too.** They cannot spend money, but the
 account allowlist has to hold for them or this becomes a way to read any
 account the caller has on their personal Google login, through our developer
@@ -218,6 +248,17 @@ expiring, single-use and re-evaluated. A server-side guarantee needs
 out-of-band approval (Slack/email) or a confirmation code the model never
 sees. Decide in Phase 6.
 
+**Phase 4 has never touched a real Google Ads account.** Every test uses a
+fake executor, or a real `GoogleAdsClient` built offline with only
+`mutate_campaigns` replaced. So the proto construction, enum lookup,
+`campaign_path` and update-mask logic are exercised for real, but no request
+has ever left the process. Before first live use: put the real test-account
+ID in `policy.yaml`, set `GADS_WRITE_ENABLED=true`, and pause one campaign
+that does not matter. `MutationRequest.validate_only` exists for a dry run
+against Google and is wired through the executor, but `confirm_and_apply`
+always sends `validate_only=False` - a validate-only tool is a Phase 6
+decision, not a silent flag.
+
 **`policy.yaml` still holds placeholder numbers.** Every limit and the
 account allowlist (`0000000000`) were invented to make tests meaningful.
 They must be replaced before `GADS_WRITE_ENABLED` is ever true.
@@ -234,7 +275,7 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 268 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 301 tests, no network, no credentials
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```
