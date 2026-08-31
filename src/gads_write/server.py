@@ -22,7 +22,19 @@ import sys
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 
-from .auth.identity import AuthError, current_caller, has_google_access_token
+from .ads.api_version import API_VERSION
+from .ads.reads import GoogleAdsReader
+from .auth.google_ads_roles import (
+    GoogleAdsTierResolver,
+    OverridingTierResolver,
+    TierCache,
+)
+from .auth.identity import (
+    AuthError,
+    current_caller,
+    google_access_token,
+    has_google_access_token,
+)
 from .auth.roles import FileTierResolver, RoleStore
 from .auth.tiers import Tier, TierResolver
 from .mcp_middleware import TierMiddleware
@@ -32,6 +44,7 @@ from .safety.plans import PlanStore
 from .safety.policy import PolicyStore
 from .safety.spend import DailySpendLedger
 from .settings import ConfigError, Settings, load_settings
+from .tools.reads import register_read_tools
 
 logger = logging.getLogger("gads_write")
 
@@ -92,20 +105,42 @@ def _build_auth_provider(settings: Settings) -> GoogleProvider:
     return GoogleProvider(**kwargs)  # type: ignore[arg-type]
 
 
-def _build_tier_resolver(role_store: RoleStore) -> TierResolver:
+def _build_tier_resolver(
+    *,
+    settings: Settings,
+    role_store: RoleStore,
+    policy_store: PolicyStore,
+    reader: GoogleAdsReader,
+) -> TierResolver:
     """Pick the tier backing named by roles.yaml `mode`.
 
-    `google_ads` is refused rather than silently falling back to the file.
-    Flipping that switch before the resolver exists would otherwise look like
-    it worked while everyone quietly kept their file-assigned tiers.
+    `file`        roles.yaml is the source of truth. Fine for a staging box;
+                  it cannot express per-account access and it drifts from
+                  reality the moment someone is changed in the Google Ads UI.
+
+    `google_ads`  The intended production setting. Tiers come from the user's
+                  own Google Ads access role, and roles.yaml `users` becomes
+                  a break-glass override that is normally empty.
+
+    The allowlist is passed as a callable, not a value, so that editing
+    policy.yaml changes which accounts count towards a user's visible tier
+    without a restart - the same hot-reload behaviour as everything else.
     """
     mode = role_store.current().mode
+
     if mode == "file":
         return FileTierResolver(role_store)
-    raise ConfigError(
-        f"roles.yaml sets mode: {mode!r}, but the Google Ads tier resolver "
-        "does not exist yet (Phase 3). Set mode: file until it does."
-    )
+
+    if mode == "google_ads":
+        primary = GoogleAdsTierResolver(
+            reader=reader,
+            login_customer_id=settings.login_customer_id,
+            allowed_customer_ids=lambda: policy_store.current().allowed_customer_ids,
+            cache=TierCache(settings.tier_cache_seconds),
+        )
+        return OverridingTierResolver(overrides=role_store, primary=primary)
+
+    raise ConfigError(f"roles.yaml sets an unsupported mode: {mode!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +151,22 @@ try:
     _configure_logging(SETTINGS)
 
     ROLE_STORE = RoleStore(SETTINGS.roles_path)
-    TIER_RESOLVER: TierResolver = _build_tier_resolver(ROLE_STORE)
     POLICY_STORE = PolicyStore(SETTINGS.policy_path)
+
+    # Holds no credential. `google_access_token` is called per request and
+    # reads the current caller's token from the request context, so one
+    # long-lived reader never carries one user's credential into another
+    # user's request.
+    READER = GoogleAdsReader(
+        settings=SETTINGS, token_provider=google_access_token
+    )
+
+    TIER_RESOLVER: TierResolver = _build_tier_resolver(
+        settings=SETTINGS,
+        role_store=ROLE_STORE,
+        policy_store=POLICY_STORE,
+        reader=READER,
+    )
     AUDIT_LOG = AuditLog(SETTINGS.audit_log_path)
     SPEND_LEDGER = DailySpendLedger(AUDIT_LOG)
     PLAN_STORE = PlanStore()
@@ -139,6 +188,16 @@ mcp = FastMCP(name="gads-write-mcp", auth=_build_auth_provider(SETTINGS))
 # Registered before any tool so it wraps every one of them.
 mcp.add_middleware(
     TierMiddleware(tier_resolver=TIER_RESOLVER, settings=SETTINGS)
+)
+
+# Phase 3 reads. Registered here, in the composition root, with their
+# dependencies passed in explicitly - tools/reads.py reaches for no globals,
+# which is what lets tests build the same tools against fakes.
+register_read_tools(
+    mcp,
+    guard=GUARD,
+    reader=READER,
+    policy_store=POLICY_STORE,
 )
 
 
@@ -178,9 +237,10 @@ async def health_check() -> dict:
         },
         "server": {
             "name": "gads-write-mcp",
-            "phase": "2 - safety core wired, no Google Ads access yet",
+            "phase": "3 - reads live, no write tools yet",
             "environment": SETTINGS.env,
             "base_url": SETTINGS.base_url,
+            "google_ads_api_version": API_VERSION,
         },
         "safety": {
             # The kill switch. False means every write is refused at the
@@ -188,6 +248,8 @@ async def health_check() -> dict:
             "write_enabled": SETTINGS.write_enabled,
             "managed_accounts": len(policy.allowed_customer_ids),
             "open_plans": PLAN_STORE.open_count(),
+            # How long a demotion in the Google Ads UI can take to bite.
+            "tier_cache_seconds": SETTINGS.tier_cache_seconds,
             # Surfaced so a bad config edit is visible here rather than only
             # in the logs. Both should be null.
             "policy_reload_error": POLICY_STORE.last_error,
@@ -199,9 +261,10 @@ async def health_check() -> dict:
         },
         "note": (
             "Tier 'none' means you are authenticated but have no access. "
-            "Ask a lead to add you."
+            "Ask a lead to add you in Google Ads."
             if tier is Tier.NONE
-            else "No write tools exist yet. They arrive in Phase 4."
+            else "Read tools are available. No write tools exist yet - they "
+            "arrive in Phase 4."
         ),
     }
 

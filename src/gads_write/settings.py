@@ -56,6 +56,12 @@ class Settings:
     roles_path: Path
     audit_log_path: Path
 
+    # --- phase 3 ---
+    # How long a resolved Google Ads tier may be reused before it is looked
+    # up again. See auth/google_ads_roles.py:TierCache for the trade-off;
+    # 0 disables caching and pays a Google round trip on every call.
+    tier_cache_seconds: int = 60
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"
@@ -188,8 +194,29 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
     developer_token = _env("GADS_DEVELOPER_TOKEN")
     if not developer_token:
         problems.append(
-            "GADS_DEVELOPER_TOKEN is required. It is unused until Phase 3, but it is "
-            "validated now so a missing value fails at deploy time, not mid-change."
+            "GADS_DEVELOPER_TOKEN is required. Every Google Ads call is made with "
+            "it alongside the calling user's own OAuth token."
+        )
+
+    raw_cache = _env("GADS_TIER_CACHE_SECONDS", "60") or "60"
+    tier_cache_seconds = 60
+    try:
+        tier_cache_seconds = int(raw_cache)
+        if tier_cache_seconds < 0:
+            raise ValueError
+        if tier_cache_seconds > 900:
+            # A long TTL turns a demotion in the Google Ads UI into something
+            # that takes effect "eventually", which is the exact failure the
+            # resolve-per-call requirement exists to prevent.
+            problems.append(
+                f"GADS_TIER_CACHE_SECONDS is {tier_cache_seconds}, which is longer "
+                "than 15 minutes. A removed user would keep their access for that "
+                "long. Lower it, or set 0 to disable caching entirely."
+            )
+    except ValueError:
+        problems.append(
+            f"GADS_TIER_CACHE_SECONDS must be a non-negative whole number of "
+            f"seconds, got {raw_cache!r}"
         )
 
     login_customer_id = _env("GADS_LOGIN_CUSTOMER_ID")
@@ -234,4 +261,5 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         policy_path=policy_path,
         roles_path=roles_path,
         audit_log_path=audit_log_path,
+        tier_cache_seconds=tier_cache_seconds,
     )

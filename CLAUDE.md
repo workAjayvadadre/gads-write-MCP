@@ -30,19 +30,29 @@ If you need a config value, a decision, or a file from the existing server,
 |---|---|---|
 | 1 | Skeleton: settings, OAuth, `health_check`, ops | **done, verified in production** |
 | 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
-| 3 | Reads: per-user Ads client, accounts, performance, search terms | not started |
+| 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
 | 4 | First mutation (`pause`/`enable`), test account only | not started |
 | 5 | Budget, bids, negatives, keywords, RSA | not started |
 | 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
 
-`google-ads` is deliberately not a dependency until Phase 3.
+Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
+`ads/api_version.py` and nowhere else.
+
+`config/roles.yaml` still ships `mode: file`. The Google Ads resolver is
+built, tested and boots, but flipping the switch is a deliberate decision
+that depends on the open risk below.
 
 ## Non-negotiable constraints
 
 ### Architecture
-- Only `src/gads_write/ads/executor.py` may call the Google Ads API mutate.
-  Tool functions NEVER call the API directly. `tests/test_architecture.py`
-  fails the build otherwise.
+- Only `src/gads_write/ads/executor.py` may call the Google Ads API mutate,
+  and only `src/gads_write/ads/reads.py` may run a read. Tool functions call
+  neither the API nor a service object directly.
+  `tests/test_architecture.py` fails the build otherwise, and also pins that
+  the read path may only ask for `GoogleAdsService` and `CustomerService`.
+- GAQL is assembled by string interpolation because the API takes a query
+  string with no bound parameters. Every interpolated value is validated in
+  `safety/validators.py` and asserted again by `_literal()` in `ads/reads.py`.
 - Every write tool returns a `plan_id` + preview. It does not execute.
   Execution happens only in `tools/confirm.py`, after re-evaluating policy.
 - Every tool calls `Guard.check()` before doing anything else.
@@ -140,16 +150,66 @@ crashing a live request. `last_error` is surfaced in `health_check`.
 `GoogleProvider`, not the FastMCP JWT. Verified against fastmcp 3.4.7
 source; citations are in `auth/identity.py`. Re-check on a major upgrade.
 
+**The API version is pinned, not inherited.** `google-ads` 31.4.0 ships v21
+through v25 and its own default moves on upgrade. Letting that default drift
+would silently re-point every query at a version nobody reviewed. The pin is
+`ads/api_version.py`; `test_ads_reads.py` parses every SELECT clause and
+checks each field against that version's generated protos, so a rename or an
+unreviewed version bump fails the build.
+
+**A role is resolved on the account, then inherited from the MCC.** Google
+resolves a user's effective role against the `login-customer-id`, and roles
+are inherited down the hierarchy. Most team members have one access row on
+the MCC and none on the child accounts they work in, so asking only the
+child would see "no row" and lock out the whole team. A direct grant on the
+child is more specific and wins; otherwise the manager's role applies. That
+degrades safely - the failure direction is someone being offered less than
+the UI shows them.
+
+**`metrics.average_cpc` is deliberately unused.** It is a double, and the
+generated stubs carry no unit comment, so whether it is micros or currency
+units could not be established without guessing. Average CPC is computed
+from `cost_micros / clicks`, both of which are certain. This is the
+1,000,000x rule applied literally: when the unit is unverifiable, derive the
+number from ones that are.
+
+**Tiers are cached for 60 seconds, and that is a real trade-off.** Without a
+cache, one `tools/list` costs a Google round trip per managed account. The
+requirement that mattered was that a demotion must not wait for a reconnect;
+a short TTL bounds that window to seconds instead of a session. Configurable
+via `GADS_TIER_CACHE_SECONDS`, refused above 900, `0` disables it, and the
+value is shown in `health_check`. Failures are never cached - an outage must
+not become sticky.
+
+**Reads go through the full gate too.** They cannot spend money, but the
+account allowlist has to hold for them or this becomes a way to read any
+account the caller has on their personal Google login, through our developer
+token. Every read is audited, which is what makes "who looked at this
+account, and when" answerable.
+
 ## Open risks
 
-**Can a non-admin read their own access role?** Google documents
-`customer_user_access` as how *admins* list users. It does not say whether a
-STANDARD or READ_ONLY user can query their own row with their own token. If
-they cannot, `GoogleAdsTierResolver` fails for every non-admin and the whole
-"just add them in Google Ads" model breaks. **Settle this with a real query
-against the MCC before building Phase 3 on it.** Fallback: a read-only
-service credential used *solely* for the role lookup, with every actual read
-and write still on the user's own token.
+**Can a non-admin read their own access role? STILL OPEN.** Google documents
+`customer_user_access` as how *admins* list users, and does not say whether a
+STANDARD or READ_ONLY user can query their own row with their own token. The
+field-reference pages are JavaScript-rendered so WebFetch cannot read them,
+and the read-only Google Ads connector available here authenticates as a
+Gmail account that is not in the MCC (`NOT_ADS_USER`), so it could not be
+settled empirically either.
+
+Phase 3 was built so that this is a *runtime-observable fact rather than a
+design assumption*. `GoogleAdsTierResolver` never guesses: a permission
+failure becomes `TierLookupError`, which fails closed with the distinct
+`lookup_failed` audit verdict and a message naming the fallback. The first
+non-admin who connects answers the question loudly, and nobody is
+over-privileged in the meantime.
+
+**Settle it before flipping `roles.yaml` to `mode: google_ads`** - have one
+STANDARD or READ_ONLY user connect and call `health_check`. If the model
+breaks, the fallback is a read-only service credential used *solely* for the
+role lookup, with every actual read and write still on the user's own token;
+`OverridingTierResolver` keeps the team working in the meantime via a
+deliberate, in-git `users:` entry.
 
 **Human approval is enforced by the client, not the server.** Nothing at the
 protocol level stops Claude calling draft then confirm in one turn. The
@@ -174,7 +234,7 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 201 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 268 tests, no network, no credentials
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```

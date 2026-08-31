@@ -89,5 +89,28 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="health_check", required_tier=Tier.NONE, writes=False)
     )
 
+    # --- Phase 3 reads -----------------------------------------------------
+    # `writes=False` means the kill switch does not hide these: turning
+    # GADS_WRITE_ENABLED off is meant to make the server read-only, not
+    # useless. `operation=None` because there is no mutation to match
+    # against policy.blocked_operations.
+    #
+    # readonly is the floor for all three. Someone at tier `none` is
+    # authenticated but has no Google Ads access we recognise, and account
+    # names and spend figures are not public information.
+    register(
+        ToolSpec(name="list_accounts", required_tier=Tier.READONLY, writes=False)
+    )
+    register(
+        ToolSpec(
+            name="get_campaign_performance",
+            required_tier=Tier.READONLY,
+            writes=False,
+        )
+    )
+    register(
+        ToolSpec(name="get_search_terms", required_tier=Tier.READONLY, writes=False)
+    )
+
 
 _register_builtin_tools()
