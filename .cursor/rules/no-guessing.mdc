@@ -1,0 +1,9 @@
+---
+alwaysApply: true
+---
+
+Google Ads API details (field names, enums, resource name formats,
+micros conversion, update masks) are where silent, expensive bugs live.
+If you are not certain of an API detail, say so and check the docs
+rather than producing plausible-looking code. A wrong field name that
+type-checks can set a budget to the wrong value.

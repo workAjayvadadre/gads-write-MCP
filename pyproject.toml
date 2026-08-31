@@ -1,0 +1,39 @@
+[project]
+name = "gads-write-mcp"
+version = "0.1.0"
+description = "Guardrailed write MCP server for Google Ads"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Pinned to the major version this code was verified against. auth/identity.py
+    # depends on where OAuthProxy puts the upstream Google token; re-verify that
+    # before widening this range.
+    "fastmcp>=3.4,<4",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    # Added in Phase 3. Major versions of this library drop old Google Ads API
+    # versions, so ads/api_version.py asserts at import time that the version
+    # this code was written against is still present. Widening this range
+    # without reading that file is how you get a silent field rename.
+    "google-ads>=31.4,<32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# The TierResolver interface is async because Phase 3's implementation does
+# network I/O. "auto" means async test functions just work.
+asyncio_mode = "auto"

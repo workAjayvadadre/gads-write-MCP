@@ -1,0 +1,14 @@
+# Development happens on Windows; deployment is Ubuntu. Without this, git
+# checks out CRLF line endings and ops/run.sh fails on the server with
+# "bad interpreter: /usr/bin/env bash^M" - a confusing error for a file that
+# looks correct in every editor.
+#
+# Normalise everything to LF in the repository and on checkout.
+* text=auto eol=lf
+
+# Belt and braces for the files where CRLF actually breaks execution.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.conf text eol=lf

@@ -1,0 +1,48 @@
+# Who may do what.
+#
+# `mode` decides where tiers actually come from:
+#
+#   file        This file is the source of truth. Phase 2 default.
+#   google_ads  The user's own Google Ads access level is the source of
+#               truth (Admin -> lead, Standard -> operator, Read only ->
+#               readonly). Arrives in Phase 3. In that mode the `users` map
+#               below becomes a BREAK-GLASS OVERRIDE, normally empty.
+#
+# Emails are matched case-insensitively against the address Google asserts in
+# the OAuth token, never against anything a caller sends, so it cannot be
+# spoofed by the client.
+#
+# This file hot-reloads. Save it and the change applies on the next request,
+# with no restart. A demoted user loses their powers immediately.
+
+mode: google_ads
+
+# Tiers, lowest to highest:
+#   none      authenticated, but no tools beyond health_check
+#   readonly  reads only
+#   operator  reads, pause/enable, negative keywords, budgets within policy
+#   lead      everything operator can do, plus keywords, bids, new RSAs
+#
+# Only consulted in `mode: file`. In `mode: google_ads` an address that is
+# absent from `users` below means "ask Google", not "deny" - so this value
+# is inert while that mode is set.
+default_tier: none
+
+# BREAK-GLASS ONLY. Normally empty.
+#
+# In `mode: google_ads` this map is checked BEFORE Google. An entry here
+# therefore means: "Google could not tell us this person's role, and a lead
+# has deliberately overridden it." It is a visible, in-git, obviously
+# temporary decision rather than a silent automatic fallback on error, and
+# the server logs a warning every time one is used.
+#
+# Because it short-circuits Google entirely, an address left here will never
+# exercise the real resolver. That is why this map was emptied when the mode
+# flipped: leaving an entry would have made the switch inert for that person.
+#
+# To restore access if the Google Ads lookup fails, uncomment one line, save,
+# and it applies on the next request - no restart.
+users: {}
+  # "indiragenai@indiraivfgenai.com": lead
+  # "someone@indiraivf.com": operator
+  # "analyst@indiraivf.com": readonly

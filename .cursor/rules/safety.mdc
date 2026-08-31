@@ -1,0 +1,37 @@
+---
+alwaysApply: true
+---
+
+
+# gads-write-mcp — non-negotiable constraints
+
+## Architecture
+- Only `src/gads_write/ads/executor.py` may call the Google Ads API mutate.
+  Tool functions NEVER call the API directly. No exceptions.
+- Every write tool returns a plan_id + preview. It does not execute.
+  Execution happens only in confirm.py, after re-evaluating policy.
+- Every tool calls check_guards() before doing anything else.
+
+## Forbidden in v1
+- No remove/delete tools for campaigns, ad groups, keywords,
+  conversion actions, or budgets. Pausing is reversible; removal is not.
+- No hardcoded customer IDs, budgets, limits, or emails in Python.
+  All of that lives in config/policy.yaml and config/roles.yaml.
+- No wildcard account access. Customer IDs must be on the allowlist.
+
+## Credentials
+- Never use a static refresh token. Every Google Ads call uses the
+  authenticated user's OAuth token from the request context.
+- Never log tokens, client secrets, or credentials.
+
+## When adding a write tool, all must be true
+1. Registered per role tier, not globally
+2. Inputs validated in validators.py
+3. Policy checked in guards.py, then AGAIN at confirm time
+4. Returns preview + plan_id, no side effects
+5. Audit line written on apply
+6. Has a test in tests/
+
+## Style
+- Python 3.11+, type hints on every function, async where FastMCP expects it
+- Fail fast and loud. Never silently swallow an error from the Ads API.
