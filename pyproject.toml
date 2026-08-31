@@ -4,9 +4,6 @@ version = "0.1.0"
 description = "Guardrailed write MCP server for Google Ads"
 requires-python = ">=3.11"
 
-# NOTE: the `google-ads` client library is deliberately NOT a dependency yet.
-# Phase 1-2 make zero Google Ads API calls. It is added in Phase 3, after we
-# confirm the current library version and the Ads API version it targets.
 dependencies = [
     # Pinned to the major version this code was verified against. auth/identity.py
     # depends on where OAuthProxy puts the upstream Google token; re-verify that
@@ -14,6 +11,11 @@ dependencies = [
     "fastmcp>=3.4,<4",
     "PyYAML>=6.0",
     "python-dotenv>=1.0",
+    # Added in Phase 3. Major versions of this library drop old Google Ads API
+    # versions, so ads/api_version.py asserts at import time that the version
+    # this code was written against is still present. Widening this range
+    # without reading that file is how you get a silent field rename.
+    "google-ads>=31.4,<32",
 ]
 
 [project.optional-dependencies]

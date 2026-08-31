@@ -24,8 +24,10 @@ Python notes for a TypeScript reader:
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from urllib.parse import urlparse
 
@@ -318,6 +320,108 @@ def _check_text(
             else f"{length} characters"
         )
         result.add(field_name, f"{detail}, limit is {limit}")
+
+
+# ---------------------------------------------------------------------------
+# reporting inputs
+# ---------------------------------------------------------------------------
+# These exist because GAQL is assembled by string interpolation: the Google
+# Ads API takes a query as a string and offers no bound parameters, so there
+# is no `?` placeholder to hide behind. Anything that reaches a query is
+# checked here first and asserted AGAIN in ads/reads.py. Two layers on
+# purpose - this one produces a message a human can act on, that one is a
+# backstop against a validation call somebody forgot to make.
+#
+# Date constants like LAST_30_DAYS are deliberately not accepted. Dates are
+# computed in Python against the account's own timezone and passed as
+# literal ISO dates, so the server never depends on GAQL grammar it has not
+# verified, and "yesterday" means yesterday in Mumbai rather than in UTC.
+
+MAX_REPORT_DAYS = 365
+MAX_REPORT_ROWS = 1000
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_iso_date(value: object, *, field_name: str) -> ValidationResult:
+    """Exactly YYYY-MM-DD, and a real calendar date.
+
+    The regex alone would accept 2026-02-31; `date.fromisoformat` is what
+    rejects it. Both are needed: the regex pins the shape that reaches the
+    query, the parse pins the meaning.
+    """
+    result = ValidationResult()
+    text = str(value).strip()
+    if not _ISO_DATE.match(text):
+        result.add(field_name, f"{text!r} is not a date in YYYY-MM-DD form")
+        return result
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        result.add(field_name, f"{text!r} is not a real calendar date")
+    return result
+
+
+def validate_date_range(
+    start_date: object,
+    end_date: object,
+    *,
+    max_days: int = MAX_REPORT_DAYS,
+) -> ValidationResult:
+    """A well-formed, correctly ordered, bounded date range."""
+    result = ValidationResult()
+    result.extend(validate_iso_date(start_date, field_name="start_date"))
+    result.extend(validate_iso_date(end_date, field_name="end_date"))
+    if not result.ok:
+        return result
+
+    start = date.fromisoformat(str(start_date).strip())
+    end = date.fromisoformat(str(end_date).strip())
+
+    if start > end:
+        result.add(
+            "start_date", f"{start} is after end_date {end}"
+        )
+        return result
+
+    span_days = (end - start).days + 1
+    if span_days > max_days:
+        result.add(
+            "start_date",
+            f"the range {start}..{end} covers {span_days} days; the maximum is "
+            f"{max_days}. Narrow the range.",
+        )
+    return result
+
+
+def validate_row_limit(
+    limit: object, *, maximum: int = MAX_REPORT_ROWS, field_name: str = "limit"
+) -> ValidationResult:
+    """A positive row count within a bound.
+
+    Bounded because an unbounded report is a way to turn one tool call into
+    a very large Google Ads response and a very large model context.
+    """
+    result = ValidationResult()
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        # bool is a subclass of int in Python, and True would silently become
+        # a LIMIT of 1.
+        result.add(field_name, f"must be a whole number, got {limit!r}")
+        return result
+    if limit < 1:
+        result.add(field_name, f"must be at least 1, got {limit}")
+    elif limit > maximum:
+        result.add(field_name, f"must be at most {maximum}, got {limit}")
+    return result
+
+
+def validate_numeric_id(value: object, *, field_name: str) -> ValidationResult:
+    """Digits only. Used for campaign and ad group IDs in report filters."""
+    result = ValidationResult()
+    text = str(value).strip()
+    if not text.isdigit():
+        result.add(field_name, f"{text!r} is not a numeric ID")
+    return result
 
 
 def _duplicates(items: list[str]) -> set[str]:

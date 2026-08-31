@@ -13,11 +13,24 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "gads_write"
 
 # The one file allowed to call a Google Ads mutate.
 EXECUTOR = SRC / "ads" / "executor.py"
+# The one file allowed to run a Google Ads read.
+READER = SRC / "ads" / "reads.py"
 
-# `campaign_service.mutate_campaigns(...)` and friends.
-MUTATE_CALL = re.compile(r"\.mutate_\w+\s*\(")
-# `client.get_service("CampaignService")` - the gateway to a mutate.
+# `campaign_service.mutate_campaigns(...)` AND the bare
+# `google_ads_service.mutate(...)` bulk mutate. The bare form matters: it is
+# a real method on GoogleAdsServiceClient (verified against v25), so a
+# pattern that only caught `mutate_<something>` would have left the single
+# most powerful call in the API unguarded.
+MUTATE_CALL = re.compile(r"\.mutate(_\w+)?\s*\(")
+
+# `client.get_service("CampaignService")` - the gateway to any API call.
 GET_SERVICE = re.compile(r"\bget_service\s*\(")
+
+# Services ads/reads.py is permitted to ask for. Neither can mutate anything
+# through the methods used there, and confining the list means a future edit
+# that reaches for CampaignService in the read path fails the build.
+READ_SAFE_SERVICES = {"GoogleAdsService", "CustomerService"}
+SERVICE_NAME = re.compile(r"get_service\(\s*[\"'](\w+)[\"']")
 
 
 def _python_files() -> list[Path]:
@@ -31,13 +44,66 @@ def test_only_executor_may_call_mutate() -> None:
             continue
         text = path.read_text(encoding="utf-8")
         for number, line in enumerate(text.splitlines(), start=1):
-            if MUTATE_CALL.search(line) or GET_SERVICE.search(line):
+            if MUTATE_CALL.search(line):
                 offenders.append(f"{path.relative_to(SRC)}:{number}: {line.strip()}")
 
     assert not offenders, (
         "Google Ads mutate calls are only permitted in ads/executor.py.\n"
         "Move this through Executor.apply() so it cannot bypass the guard "
         "chain or the audit log.\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_get_service_is_confined_to_the_two_api_modules() -> None:
+    """Only the executor and the reader may reach for a service client.
+
+    Everything else - tools, guards, resolvers - goes through one of their
+    narrow interfaces. This is what stops a tool quietly acquiring its own
+    API access and skipping the gate.
+    """
+    offenders: list[str] = []
+    for path in _python_files():
+        if path in (EXECUTOR, READER):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            if GET_SERVICE.search(line):
+                offenders.append(f"{path.relative_to(SRC)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "get_service() is only permitted in ads/executor.py (mutations) and "
+        "ads/reads.py (reads):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_read_path_asks_only_for_read_safe_services() -> None:
+    text = READER.read_text(encoding="utf-8")
+    requested = set(SERVICE_NAME.findall(text))
+    unexpected = requested - READ_SAFE_SERVICES
+    assert not unexpected, (
+        f"ads/reads.py requested {sorted(unexpected)}. The read path may only "
+        f"use {sorted(READ_SAFE_SERVICES)}; anything that can mutate belongs "
+        "in ads/executor.py."
+    )
+
+
+def test_tools_never_import_the_ads_client() -> None:
+    """Tool functions call ads/reads.py and ads/executor.py, never Google.
+
+    tools/__init__.py promises tools are thin. This is that promise enforced:
+    a tool that imported the client library could build its own query or its
+    own mutation and never touch the gate.
+    """
+    offenders: list[str] = []
+    for path in (SRC / "tools").rglob("*.py"):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")) and "google.ads" in stripped:
+                offenders.append(f"{path.relative_to(SRC)}:{number}: {stripped}")
+
+    assert not offenders, (
+        "tools/ must not import the Google Ads client library:\n  "
+        + "\n  ".join(offenders)
     )
 
 
