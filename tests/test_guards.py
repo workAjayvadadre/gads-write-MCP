@@ -67,15 +67,9 @@ class FakeTierResolver:
 def _tools():
     """A tool set to gate. Restored after every test."""
     reset_for_tests()
+    # update_campaign_budget is a real registry builtin from Phase 5, so it
+    # is not re-registered here; these tests run against the production spec.
     register(ToolSpec(name="get_campaigns", required_tier=Tier.READONLY, writes=False))
-    register(
-        ToolSpec(
-            name="update_campaign_budget",
-            required_tier=Tier.OPERATOR,
-            writes=True,
-            operation="update_campaign_budget",
-        )
-    )
     register(
         ToolSpec(
             name="remove_campaign",

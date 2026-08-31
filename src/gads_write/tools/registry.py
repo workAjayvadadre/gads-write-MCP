@@ -136,6 +136,54 @@ def _register_builtin_tools() -> None:
             operation="enable_campaign",
         )
     )
+    # --- Phase 5 writes ----------------------------------------------------
+    # operator: budgets and negative keywords. Negatives only ever reduce
+    # spend, and budgets are bounded by the policy limits plus the per-user
+    # daily ceiling.
+    register(
+        ToolSpec(
+            name="update_campaign_budget",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="update_campaign_budget",
+        )
+    )
+    register(
+        ToolSpec(
+            name="add_negative_keyword",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="add_negative_keyword",
+        )
+    )
+    # lead: the three that create new spending surface or raise what a click
+    # costs. A new keyword or ad reaches an audience nobody has reviewed, and
+    # a bid change has no daily ceiling behind it the way a budget does.
+    register(
+        ToolSpec(
+            name="add_keyword",
+            required_tier=Tier.LEAD,
+            writes=True,
+            operation="add_keyword",
+        )
+    )
+    register(
+        ToolSpec(
+            name="update_ad_group_bid",
+            required_tier=Tier.LEAD,
+            writes=True,
+            operation="update_ad_group_bid",
+        )
+    )
+    register(
+        ToolSpec(
+            name="create_responsive_search_ad",
+            required_tier=Tier.LEAD,
+            writes=True,
+            operation="create_responsive_search_ad",
+        )
+    )
+
     # `operation=None` on purpose: confirm_and_apply is not itself a
     # mutation kind, so it must not be matched against
     # policy.blocked_operations. The gate re-check inside it runs against the

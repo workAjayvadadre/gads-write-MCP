@@ -60,19 +60,11 @@ def _settings(tmp_path, *, write_enabled: bool) -> Settings:
 @pytest.fixture(autouse=True)
 def _registry():
     reset_for_tests()
+    # update_campaign_budget (operator) and create_responsive_search_ad
+    # (lead) are real registry builtins from Phase 5, so they are NOT
+    # registered here - these tests now run against the production specs
+    # rather than hand-made copies of them.
     register(ToolSpec(name="get_campaigns", required_tier=Tier.READONLY, writes=False))
-    register(
-        ToolSpec(
-            name="update_campaign_budget", required_tier=Tier.OPERATOR,
-            writes=True, operation="update_campaign_budget",
-        )
-    )
-    register(
-        ToolSpec(
-            name="create_responsive_search_ad", required_tier=Tier.LEAD,
-            writes=True, operation="create_responsive_search_ad",
-        )
-    )
     yield
     reset_for_tests()
 

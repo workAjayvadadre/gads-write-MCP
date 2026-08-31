@@ -31,8 +31,8 @@ If you need a config value, a decision, or a file from the existing server,
 | 1 | Skeleton: settings, OAuth, `health_check`, ops | **done, verified in production** |
 | 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
 | 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
-| 4 | First mutation (`pause`/`enable`), two-step confirm | **code done, 301 tests; NOT yet run against a live account** |
-| 5 | Budget, bids, negatives, keywords, RSA | not started |
+| 4 | First mutation (`pause`/`enable`), two-step confirm | **code done; NOT yet run against a live account** |
+| 5 | Budget, bids, negatives, keywords, RSA | **code done, 351 tests; NOT yet run against a live account** |
 | 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
@@ -207,6 +207,45 @@ would make the ceiling fire on a number nobody changed. Recorded as a real
 gap: in Phase 4 the ceiling does not constrain enables. Phase 5, where
 budgets become editable, is where it starts doing work.
 
+**A SHARED budget is refused outright.** `campaign_budget.explicitly_shared`
+means several campaigns draw on the same budget, so changing it affects all
+of them - while the preview names one campaign. A misleading preview breaks
+the entire approval model, which is worth more than the convenience. Change
+it in the Google Ads UI, or give the campaign its own budget.
+
+**Update masks are allowlisted PER OPERATION, not globally.** A single union
+would let a budget mutation legally carry `status`. Creates are listed
+separately in `CREATE_OPERATIONS` because they have no mask at all - there is
+no existing row to partially overwrite.
+
+**`negative` is always set explicitly**, on both negative keywords (True) and
+positive ones (False). A negative keyword with the flag left to chance is a
+*positive* targeting criterion: the exact opposite of what was asked for, and
+expensive.
+
+**Keyword text is 80 characters**, verified on the API's System Limits page
+against `CriterionError.KEYWORD_TEXT_TOO_LONG`. The widely-repeated 10-word
+limit is NOT in Google's documentation, so it is not enforced; if it exists,
+Google rejects the mutation and the error is surfaced verbatim. Google Ads UI
+match-type syntax (`[exact]`, `"phrase"`) is refused, because the API takes
+bare text plus a separate match_type and brackets would become part of the
+keyword.
+
+**`REVALIDATORS` maps every write tool to its re-validator**, and
+`confirm_and_apply` fails closed on a tool missing from that table. Draft-time
+and confirm-time validation must be literally the same function, or a plan
+could be applied under rules it was never checked against.
+
+**Budgets gate twice.** Policy cannot be evaluated without the CURRENT value,
+and the account must not be read before the allowlist has authorised it. So
+those tools run the chain once to authorise (marked `dry_run`, audited as a
+look) and again with the numbers. Two audit lines per draft is deliberate.
+
+**The spend delta must reach the audit log on apply.** The daily ceiling is
+derived from that log, so `confirm_and_apply` passing `spend_delta_units=None`
+would mean the ceiling silently never accumulated. Only a *successful* apply
+contributes; a failure must not consume headroom it never used.
+
 **A REMOVED campaign is refused at draft time.** Removal is terminal in
 Google Ads, so an enable could never succeed. Catching it before a plan
 exists beats an opaque API rejection after a human has approved something.
@@ -219,7 +258,14 @@ account, and when" answerable.
 
 ## Open risks
 
-**Can a non-admin read their own access role? STILL OPEN.** Google documents
+**Can a non-admin read their own access role? CONFIRMED YES by the account
+owner (2026-08-31), not verified in this environment.** Worth one spot-check
+with a real STANDARD or READ_ONLY user on first deploy, since the whole
+"add them in Google Ads and they just work" model rests on it. The original
+analysis follows, because the fallback still matters if that spot-check
+fails.
+
+**Original question:** Google documents
 `customer_user_access` as how *admins* list users, and does not say whether a
 STANDARD or READ_ONLY user can query their own row with their own token. The
 field-reference pages are JavaScript-rendered so WebFetch cannot read them,
@@ -248,7 +294,11 @@ expiring, single-use and re-evaluated. A server-side guarantee needs
 out-of-band approval (Slack/email) or a confirmation code the model never
 sees. Decide in Phase 6.
 
-**Phase 4 has never touched a real Google Ads account.** Every test uses a
+**`roles.yaml` is `mode: file` for local development.** `google_ads` needs
+live credentials to resolve any tier at all. The Google Ads resolver is built,
+tested and boots in both modes; switching back is one word.
+
+**Phases 4 and 5 have never touched a real Google Ads account.** Every test uses a
 fake executor, or a real `GoogleAdsClient` built offline with only
 `mutate_campaigns` replaced. So the proto construction, enum lookup,
 `campaign_path` and update-mask logic are exercised for real, but no request
@@ -275,7 +325,7 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 301 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 351 tests, no network, no credentials
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```

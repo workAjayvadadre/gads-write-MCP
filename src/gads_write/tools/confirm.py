@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastmcp.exceptions import ToolError
@@ -47,8 +48,7 @@ from fastmcp.exceptions import ToolError
 from ..ads.executor import Executor, MutationRequest
 from ..auth.identity import current_caller
 from ..safety.plans import PlanError, PlanStore
-from .registry import spec_for
-from .writes import validate_campaign_status_args
+from .writes import REVALIDATORS
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,30 @@ def register_confirm_tool(
         except PlanError as exc:
             raise ToolError(f"{exc} Nothing was changed.") from exc
 
-        spec = spec_for(plan.tool)
-        operation = spec.operation or plan.tool
+        # The executor operation and its payload were decided at draft time
+        # and stored on the plan, so nothing is re-derived here. One tool can
+        # map to several operations - add_negative_keyword is a campaign
+        # criterion or an ad group criterion depending on what was targeted.
+        operation = str(plan.metadata.get("operation") or "").strip()
+        payload = plan.metadata.get("payload")
+        if not operation or not isinstance(payload, dict):
+            raise ToolError(
+                f"Plan {plan_id!r} carries no executor operation, so it cannot be "
+                "applied. Draft the change again. Nothing was changed."
+            )
+
+        # Fail closed: a tool with no re-validator cannot be confirmed at all,
+        # rather than being confirmed without re-validation.
+        revalidator = REVALIDATORS.get(plan.tool)
+        if revalidator is None:
+            raise ToolError(
+                f"No re-validation is defined for {plan.tool!r}, so this plan "
+                "cannot be applied. Nothing was changed."
+            )
+
+        # A budget increase has to reach the audit log, or the per-user daily
+        # ceiling - which is derived from that log - would never accumulate.
+        spend_delta = _decimal_or_none(plan.spend_delta_units)
 
         # --- 3. the full gate again, against the ORIGINAL tool ---------
         decision = await guard.check(
@@ -90,7 +112,8 @@ def register_confirm_tool(
             caller=caller,
             customer_id=plan.customer_id,
             arguments=plan.arguments,
-            validate=lambda _policy: validate_campaign_status_args(plan.arguments),
+            validate=lambda policy: revalidator(policy, plan.arguments),
+            spend_delta_units=spend_delta,
             plan_id=plan.plan_id,
         )
         if not decision.allowed:
@@ -111,7 +134,7 @@ def register_confirm_tool(
         request = MutationRequest(
             customer_id=plan.customer_id,
             operation=operation,
-            payload={"campaign_id": plan.arguments.get("campaign_id", "")},
+            payload=dict(payload),
             validate_only=False,
         )
 
@@ -156,7 +179,9 @@ def register_confirm_tool(
             arguments=plan.arguments,
             plan_id=plan.plan_id,
             resource_names=list(result.resource_names),
-            spend_delta_units=None,
+            # Only a SUCCESSFUL apply contributes to the daily ceiling. A
+            # failed one must not consume headroom it never used.
+            spend_delta_units=spend_delta,
             result=dict(result.details),
         )
 
@@ -181,3 +206,13 @@ def register_confirm_tool(
 
 
 __all__ = ["register_confirm_tool"]
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    """Plans store the spend delta as a string; the audit log wants a number."""
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
