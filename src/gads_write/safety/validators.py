@@ -10,10 +10,12 @@ Verified against Google's documentation:
   - RSA path1/path2: 15 chars each
   - Characters in double-width scripts (CJK) count as 2
 
-Deliberately NOT here yet: keyword text limits. Keywords are Phase 5, and
-rather than write a plausible-looking `MAX_KEYWORD_CHARS = 80` from memory,
-that constant gets added when it is verified against the docs alongside the
-tool that needs it.
+  - Keyword text: 80 characters. Verified against the Google Ads API
+    "System limits" page, which pairs it with the error code
+    `CriterionError.KEYWORD_TEXT_TOO_LONG`. A word-count limit is widely
+    repeated in blog posts but is NOT in Google's own documentation, so it
+    is deliberately not enforced here - if one exists, Google rejects the
+    mutation and ads/executor.py surfaces that error verbatim.
 
 Python notes for a TypeScript reader:
   - `unicodedata.east_asian_width` returns a two-letter class per character;
@@ -41,6 +43,11 @@ RSA_MIN_HEADLINES = 3
 RSA_MAX_HEADLINES = 15
 RSA_MIN_DESCRIPTIONS = 2
 RSA_MAX_DESCRIPTIONS = 4
+
+# Verified: developers.google.com/google-ads/api/docs/best-practices/system-limits
+# lists "80 characters" for keyword text, with error code
+# CriterionError.KEYWORD_TEXT_TOO_LONG.
+KEYWORD_MAX_CHARS = 80
 
 # KeywordMatchTypeEnum. UNSPECIFIED and UNKNOWN are real enum members but are
 # never valid as *input*; UNKNOWN is documented as a return-only value.
@@ -149,6 +156,53 @@ def validate_status(status: str, *, field_name: str = "status") -> ValidationRes
         )
     elif text not in VALID_STATUSES:
         result.add(field_name, f"{status!r} is not one of {sorted(VALID_STATUSES)}")
+    return result
+
+
+def validate_keyword_text(
+    text: object, *, field_name: str = "keyword_text"
+) -> ValidationResult:
+    """Non-empty, within Google's 80-character keyword limit.
+
+    Counted the way Google counts, so CJK characters cost two. Leading and
+    trailing whitespace is not an error but is not counted either, because
+    the executor sends the stripped text.
+
+    Match-type punctuation is rejected. In the Google Ads UI you type
+    "shoes" for broad, "shoes" in quotes for phrase and [shoes] for exact,
+    but the API takes the bare text plus a separate match_type field.
+    Passing the UI syntax through would create a keyword that literally
+    contains brackets, which silently matches nothing.
+    """
+    result = ValidationResult()
+    if not isinstance(text, str):
+        result.add(field_name, f"expected text, got {type(text).__name__}")
+        return result
+
+    stripped = text.strip()
+    if not stripped:
+        result.add(field_name, "must not be empty")
+        return result
+
+    if stripped[0] in "[\"'" or stripped[-1] in "]\"'":
+        result.add(
+            field_name,
+            f"{stripped!r} looks like Google Ads UI match-type syntax. Pass the "
+            "bare keyword text and set match_type separately; brackets and "
+            "quotes would become part of the keyword itself.",
+        )
+        return result
+
+    length = ads_char_length(stripped)
+    if length > KEYWORD_MAX_CHARS:
+        detail = (
+            f"{length} characters as Google counts them "
+            f"({len(stripped)} code points)"
+            if length != len(stripped)
+            else f"{length} characters"
+        )
+        result.add(field_name, f"{detail}, limit is {KEYWORD_MAX_CHARS}")
+
     return result
 
 

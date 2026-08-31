@@ -164,6 +164,32 @@ class CampaignSummary:
     status: str
     channel_type: str
     daily_budget_micros: int
+    # The budget is a separate resource that a campaign points at, so changing
+    # a budget means mutating CampaignBudget, not Campaign.
+    budget_resource_name: str = ""
+    budget_id: str = ""
+    # True when this budget is shared by more than one campaign. Changing a
+    # shared budget affects every campaign using it, which would make a
+    # preview naming one campaign actively misleading. tools/writes.py
+    # refuses these.
+    budget_is_shared: bool = False
+    # Needed for rules.block_broad_match_with_manual_cpc.
+    bidding_strategy_type: str = ""
+
+
+@dataclass(frozen=True)
+class AdGroupSummary:
+    """One ad group's current state. Used for bid previews."""
+
+    ad_group_id: str
+    name: str
+    status: str
+    campaign_id: str
+    campaign_name: str
+    # The ad group's default max CPC. Zero when the campaign uses an
+    # automated bidding strategy and no manual bid applies.
+    cpc_bid_micros: int
+    bidding_strategy_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -227,6 +253,12 @@ class AdsReader(Protocol):
         None is a definite "no such campaign in this account". A failure to
         look raises AdsReadError, as everywhere else here.
         """
+        ...
+
+    async def ad_group_by_id(
+        self, *, customer_id: str, ad_group_id: str
+    ) -> AdGroupSummary | None:
+        """One ad group's current state, or None if it does not exist."""
         ...
 
     async def search_terms(
@@ -405,8 +437,9 @@ class GoogleAdsReader(AdsReader):
 
         query = (
             "SELECT campaign.id, campaign.name, campaign.status, "
-            "campaign.advertising_channel_type, "
-            "campaign_budget.amount_micros "
+            "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
+            "campaign_budget.resource_name, campaign_budget.id, "
+            "campaign_budget.amount_micros, campaign_budget.explicitly_shared "
             "FROM campaign "
             f"WHERE campaign.id = {safe_campaign} "
             "LIMIT 1"
@@ -422,6 +455,39 @@ class GoogleAdsReader(AdsReader):
             status=_enum_name(row.campaign.status),
             channel_type=_enum_name(row.campaign.advertising_channel_type),
             daily_budget_micros=int(row.campaign_budget.amount_micros or 0),
+            budget_resource_name=row.campaign_budget.resource_name or "",
+            budget_id=str(row.campaign_budget.id or ""),
+            budget_is_shared=bool(row.campaign_budget.explicitly_shared),
+            bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+        )
+
+    async def ad_group_by_id(
+        self, *, customer_id: str, ad_group_id: str
+    ) -> AdGroupSummary | None:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe_ad_group = _literal(ad_group_id, field="ad_group_id")
+
+        query = (
+            "SELECT ad_group.id, ad_group.name, ad_group.status, "
+            "ad_group.cpc_bid_micros, "
+            "campaign.id, campaign.name, campaign.bidding_strategy_type "
+            "FROM ad_group "
+            f"WHERE ad_group.id = {safe_ad_group} "
+            "LIMIT 1"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        if not rows:
+            return None
+
+        row = rows[0]
+        return AdGroupSummary(
+            ad_group_id=str(row.ad_group.id),
+            name=row.ad_group.name or "",
+            status=_enum_name(row.ad_group.status),
+            campaign_id=str(row.campaign.id),
+            campaign_name=row.campaign.name or "",
+            cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
+            bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
         )
 
     async def search_terms(
