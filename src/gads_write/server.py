@@ -223,6 +223,10 @@ register_confirm_tool(
     guard=GUARD,
     executor=EXECUTOR,
     plan_store=PLAN_STORE,
+    # Confirm re-reads the entity a plan targets, because budget and bid
+    # limits are relative and a plan stores an absolute target. See the
+    # module docstring in tools/confirm.py.
+    reader=READER,
 )
 
 

@@ -32,7 +32,7 @@ If you need a config value, a decision, or a file from the existing server,
 | 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
 | 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
 | 4 | First mutation (`pause`/`enable`), two-step confirm | **code done; NOT yet run against a live account** |
-| 5 | Budget, bids, negatives, keywords, RSA | **code done, 351 tests; NOT yet run against a live account** |
+| 5 | Budget, bids, negatives, keywords, RSA | **code done, 357 tests; NOT yet run against a live account** |
 | 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
@@ -231,15 +231,35 @@ match-type syntax (`[exact]`, `"phrase"`) is refused, because the API takes
 bare text plus a separate match_type and brackets would become part of the
 keyword.
 
-**`REVALIDATORS` maps every write tool to its re-validator**, and
-`confirm_and_apply` fails closed on a tool missing from that table. Draft-time
-and confirm-time validation must be literally the same function, or a plan
-could be applied under rules it was never checked against.
+**`tools/operations.py` owns every check for every write tool, and both steps
+go through it.** `OPERATIONS` maps a tool to its argument validator, its
+policy recheck, and which entity that recheck needs the current state of.
+`confirm_and_apply` fails closed on a tool missing from that table.
 
-**Budgets gate twice.** Policy cannot be evaluated without the CURRENT value,
-and the account must not be read before the allowlist has authorised it. So
-those tools run the chain once to authorise (marked `dry_run`, audited as a
-look) and again with the numbers. Two audit lines per draft is deliberate.
+This used to be split, and the split was a real hole. `REVALIDATORS` carried
+only the argument validator; the money rules - `max_daily`,
+`max_increase_percent`, `max_cpc`, broad-match-under-manual-CPC and the daily
+ceiling - lived in an `evaluate` closure inside each draft tool's body,
+reachable from nowhere else. `Guard.check` skips policy evaluation entirely
+when `evaluate is None`, and confirm never passed one, so confirm re-ran a
+strictly weaker check than draft: a plan drafted while the operator ceiling
+was 2000 still applied after a lead dropped it to 60. Four regression tests
+in `tests/test_phase5_tools.py` pin it shut.
+
+**Confirm re-reads the current state; it does not trust the plan.** Budget
+and bid rules are relative - a percentage increase needs something to be a
+percentage *of* - while a plan stores an absolute target. Trusting the value
+the preview was built from let an approved "100 -> 120" become +1100% if
+someone lowered the budget to 10 in the Google Ads UI first. A read that
+fails refuses the plan without consuming it: not knowing what we would be
+changing is a reason to stop, not a reason to burn the plan.
+
+**Budgets gate twice, at draft and at confirm.** Policy cannot be evaluated
+without the CURRENT value, and the account must not be read before the
+allowlist has authorised it. So those tools run the chain once to authorise
+(marked `dry_run`, audited as a look) and again with the numbers. Two audit
+lines is deliberate, at both steps. Tools whose rules are absolute - negative
+keywords, RSAs, pause/enable - pay for neither the second line nor the read.
 
 **The spend delta must reach the audit log on apply.** The daily ceiling is
 derived from that log, so `confirm_and_apply` passing `spend_delta_units=None`
@@ -325,7 +345,7 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 351 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 357 tests, no network, no credentials
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```

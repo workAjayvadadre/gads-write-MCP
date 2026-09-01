@@ -8,23 +8,36 @@ The order of operations is the point, and it is not arbitrary:
 
   1. identity          who is confirming, per Google
   2. peek the plan     ownership, expiry and single-use, WITHOUT consuming it
-  3. re-run the gate   the full chain again, against the ORIGINAL tool
-  4. consume the plan  marked used BEFORE anything is applied
-  5. apply             ads/executor.py
-  6. audit             record what actually happened, or the failure
+  3. authorise         tier, kill switch and allowlist, before any read
+  4. re-read state     what the account looks like NOW, not at draft time
+  5. re-run the gate   the full chain again, against the ORIGINAL tool
+  6. consume the plan  marked used BEFORE anything is applied
+  7. apply             ads/executor.py
+  8. audit             record what actually happened, or the failure
 
-Why 3 exists at all, given the draft already passed the gate: because time
+Why 5 exists at all, given the draft already passed the gate: because time
 passed. Between draft and confirm, someone may have been demoted in Google
 Ads, the account may have been dropped from the allowlist, `policy.yaml` may
 have been tightened, or the kill switch may have been thrown. A plan carries
 intent, never authority. Re-checking is what makes that true rather than
 merely stated.
 
-Note that step 3 checks the ORIGINAL tool's tier, not this tool's. Otherwise
+Note that step 5 checks the ORIGINAL tool's tier, not this tool's. Otherwise
 a `lead`-only change could be drafted by a lead and applied by an operator,
 and the tier on the drafting tool would be decorative.
 
-Why 4 comes before 5: if the apply crashes halfway, the plan is already
+Why 3 and 4 exist: the gate cannot judge a budget or a bid without the
+CURRENT value, because every one of those rules is relative - a percentage
+increase needs something to be a percentage OF. A plan stores an absolute
+target, so trusting the value the preview was built from would let an
+approved "100 -> 120" become a 1100% increase if someone lowered the budget
+to 10 in the Google Ads UI first. Step 3 comes before step 4 for the same
+reason tools/writes.py authorises before reading: the account allowlist must
+hold before this server touches an account at all. That costs a second audit
+line on the tools that need state, which is the same deliberate trade
+drafting already makes.
+
+Why 6 comes before 7: if the apply crashes halfway, the plan is already
 burnt. Nobody can retry it blindly. That is the safe failure mode when we
 cannot know whether the mutation reached Google - a human has to look at the
 account and draft afresh. The alternative, consuming on success, turns a
@@ -46,9 +59,10 @@ from typing import Any
 from fastmcp.exceptions import ToolError
 
 from ..ads.executor import Executor, MutationRequest
+from ..ads.reads import AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..safety.plans import PlanError, PlanStore
-from .writes import REVALIDATORS
+from .operations import OPERATIONS, ReadKind, read_current
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +73,7 @@ def register_confirm_tool(
     guard: Any,
     executor: Executor,
     plan_store: PlanStore,
+    reader: AdsReader,
     caller_provider: Callable[[], Any] = current_caller,
 ) -> None:
     """Define confirm_and_apply on `mcp`."""
@@ -93,10 +108,10 @@ def register_confirm_tool(
                 "applied. Draft the change again. Nothing was changed."
             )
 
-        # Fail closed: a tool with no re-validator cannot be confirmed at all,
-        # rather than being confirmed without re-validation.
-        revalidator = REVALIDATORS.get(plan.tool)
-        if revalidator is None:
+        # Fail closed: a tool with no entry in the checks table cannot be
+        # confirmed at all, rather than being confirmed without re-checking.
+        checks = OPERATIONS.get(plan.tool)
+        if checks is None:
             raise ToolError(
                 f"No re-validation is defined for {plan.tool!r}, so this plan "
                 "cannot be applied. Nothing was changed."
@@ -106,13 +121,60 @@ def register_confirm_tool(
         # ceiling - which is derived from that log - would never accumulate.
         spend_delta = _decimal_or_none(plan.spend_delta_units)
 
-        # --- 3. the full gate again, against the ORIGINAL tool ---------
+        # --- 3 & 4. authorise, then re-read the CURRENT state ----------
+        # Only for tools whose rules are relative. A negative keyword or an
+        # RSA is judged on its own arguments, so it pays for neither the
+        # extra audit line nor the round trip to Google.
+        current: Any = None
+        if checks.reads is not ReadKind.NONE:
+            authorised = await guard.check(
+                tool=plan.tool,
+                caller=caller,
+                customer_id=plan.customer_id,
+                arguments=plan.arguments,
+                plan_id=plan.plan_id,
+                dry_run=True,
+            )
+            if not authorised.allowed:
+                raise ToolError(
+                    f"This plan can no longer be applied: "
+                    f"{authorised.reason_text}. Nothing was changed."
+                )
+            try:
+                current = await read_current(
+                    reader,
+                    checks,
+                    customer_id=plan.customer_id,
+                    arguments=plan.arguments,
+                )
+            except AdsReadError as exc:
+                # Refused, not consumed. We could not establish what we would
+                # be changing, which is a reason to stop - not a reason to
+                # burn the plan.
+                raise ToolError(
+                    f"could not re-read the current state in account "
+                    f"{plan.customer_id} to re-check this plan: {exc}. "
+                    "Nothing was changed; try again in a moment."
+                ) from exc
+
+        def recheck(policy: Any, tier: Any, spend_today: Decimal) -> Any:
+            # Same function the draft ran, with the state as it is NOW.
+            return checks.recheck(
+                policy,
+                tier=tier,
+                arguments=plan.arguments,
+                current=current,
+                spend_today=spend_today,
+            )
+
+        # --- 5. the full gate again, against the ORIGINAL tool ---------
         decision = await guard.check(
             tool=plan.tool,
             caller=caller,
             customer_id=plan.customer_id,
             arguments=plan.arguments,
-            validate=lambda policy: revalidator(policy, plan.arguments),
+            validate=lambda policy: checks.validate(policy, plan.arguments),
+            evaluate=recheck if checks.recheck is not None else None,
             spend_delta_units=spend_delta,
             plan_id=plan.plan_id,
         )
@@ -125,7 +187,7 @@ def register_confirm_tool(
                 "Nothing was changed."
             )
 
-        # --- 4. claim it, before anything is applied -------------------
+        # --- 6. claim it, before anything is applied -------------------
         try:
             plan = plan_store.consume(plan_id, caller_email=caller.email)
         except PlanError as exc:
@@ -138,7 +200,7 @@ def register_confirm_tool(
             validate_only=False,
         )
 
-        # --- 5. apply --------------------------------------------------
+        # --- 7. apply --------------------------------------------------
         try:
             result = await executor.apply(request)
         except Exception as exc:  # noqa: BLE001 - audited, then re-raised
@@ -173,7 +235,7 @@ def register_confirm_tool(
                 "used up; draft a new one."
             )
 
-        # --- 6. audit the success --------------------------------------
+        # --- 8. audit the success --------------------------------------
         guard.record_application(
             decision,
             arguments=plan.arguments,

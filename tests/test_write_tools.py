@@ -183,7 +183,7 @@ def harness(tmp_path, write_policy):
         )
         register_confirm_tool(
             mcp, guard=guard, executor=executor, plan_store=plan_store,
-            caller_provider=caller,
+            reader=reader, caller_provider=caller,
         )
         return Harness(
             mcp=mcp, reader=reader, executor=executor, tiers=tiers, clock=clock,

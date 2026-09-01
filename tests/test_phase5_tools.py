@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import yaml
 from fastmcp import Client, FastMCP
 
 from gads_write.ads.executor import MutationResult
-from gads_write.ads.reads import AdGroupSummary, CampaignSummary
+from gads_write.ads.reads import AdGroupSummary, AdsReadError, CampaignSummary
 from gads_write.auth.tiers import Tier
 from gads_write.mcp_middleware import TierMiddleware
 from gads_write.safety.audit import AuditLog
@@ -78,8 +79,12 @@ class FakeReader:
         self.cpc_bid_micros = 50_000_000          # 50 units
         self.campaign_missing = False
         self.ad_group_missing = False
+        # Simulates a Google Ads outage at confirm time.
+        self.read_fails = False
 
     async def campaign_by_id(self, *, customer_id, campaign_id):
+        if self.read_fails:
+            raise AdsReadError("the Google Ads API is unavailable")
         if self.campaign_missing:
             return None
         return CampaignSummary(
@@ -95,6 +100,8 @@ class FakeReader:
         )
 
     async def ad_group_by_id(self, *, customer_id, ad_group_id):
+        if self.read_fails:
+            raise AdsReadError("the Google Ads API is unavailable")
         if self.ad_group_missing:
             return None
         return AdGroupSummary(
@@ -135,6 +142,9 @@ class Harness:
     tiers: MutableTier
     caller: CallerBox
     audit_path: Path
+    # Exposed so a test can tighten policy.yaml between draft and confirm,
+    # the way a lead would in production. PolicyStore reloads on mtime.
+    policy_path: Path
 
 
 @pytest.fixture
@@ -174,11 +184,12 @@ def linked(tmp_path, write_policy):
         )
         register_confirm_tool(
             mcp, guard=guard, executor=executor, plan_store=plans,
-            caller_provider=caller,
+            reader=reader, caller_provider=caller,
         )
         return Harness(
             mcp=mcp, reader=reader, executor=executor, tiers=tiers,
             caller=caller, audit_path=settings.audit_log_path,
+            policy_path=policy_path,
         )
 
     return _build
@@ -322,6 +333,113 @@ async def test_the_daily_ceiling_accumulates_across_changes(linked) -> None:
     assert deltas == [Decimal("10"), Decimal("15"), Decimal("20")]
 
 
+# ---------------------------------------------------------------------------
+# a plan is intent, never a permission
+# ---------------------------------------------------------------------------
+# Both of these are the same claim from plans.py and CLAUDE.md, stated twice:
+#
+#   "The plan stores intent, never a permission. Policy is re-checked at
+#    confirm time by guards.py, so a plan drafted under looser limits fails
+#    once they are tightened."
+#
+# A plan holds an ABSOLUTE target (amount_micros), but every budget rule is
+# RELATIVE - max_increase_percent compares against the campaign's current
+# budget, and max_daily against the tier's ceiling as policy.yaml stands NOW.
+# So the approval a human gave is only meaningful if both halves of that
+# comparison are re-established at confirm time, not just the target.
+
+
+def _tighten_policy(path: Path, tier: str, block: str, **limits: int) -> None:
+    """Rewrite policy.yaml the way a lead would. PolicyStore reloads on mtime."""
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    tier_limits = data["limits"]["tiers"].setdefault(tier, {})
+    tier_limits.setdefault(block, {}).update(limits)
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+async def test_a_plan_is_refused_once_the_policy_is_tightened(linked) -> None:
+    """Drafted at 120 while operator allowed 2000. A lead then drops the
+    operator ceiling to 60 and the increase cap to 1%. Confirming afterwards
+    must be refused: the plan carried intent, not a permission."""
+    h = linked(Tier.OPERATOR)          # 100 -> 120 is +20%, inside 2000 / +20%
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
+    )
+
+    _tighten_policy(
+        h.policy_path, "operator", "budget", max_daily=60, max_increase_percent=1
+    )
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert "60" in str(caught.value)
+    assert h.executor.applied == []
+
+
+async def test_a_refused_plan_is_not_consumed(linked) -> None:
+    """Refused by policy is not the same as used up. If a lead widens the
+    limit again, the same plan_id must still be confirmable - otherwise a
+    momentary tightening silently destroys work people already approved."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
+    )
+
+    _tighten_policy(h.policy_path, "operator", "budget", max_daily=60)
+    with pytest.raises(Exception):
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    _tighten_policy(h.policy_path, "operator", "budget", max_daily=2000)
+    applied = await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert applied["applied"] is True
+    assert len(h.executor.applied) == 1
+
+
+async def test_a_read_failure_at_confirm_refuses_without_burning_the_plan(linked) -> None:
+    """We could not establish what we would be changing. That is a reason to
+    stop, not a reason to consume the plan."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+    )
+
+    h.reader.read_fails = True
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+    assert "Nothing was changed" in str(caught.value)
+    assert h.executor.applied == []
+
+    h.reader.read_fails = False
+    applied = await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+    assert applied["applied"] is True
+
+
+async def test_a_plan_is_refused_once_the_current_budget_has_moved(linked) -> None:
+    """The human approved 'INR 100.00 -> INR 120.00', an increase of 20%.
+    If someone lowers the budget to 10 in the Google Ads UI first, confirming
+    the same plan is a 1100% increase - a change nobody previewed and one the
+    operator's +20% cap forbids."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
+    )
+    assert "INR 100.00 -> INR 120.00" in draft["preview"]
+
+    h.reader.budget_micros = 10_000_000   # someone edits it in the Ads UI
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert "20" in str(caught.value)      # the max_increase_percent refusal
+    assert h.executor.applied == []
+
+
 # ===========================================================================
 # negative keywords
 # ===========================================================================
@@ -400,6 +518,27 @@ async def test_broad_match_is_fine_on_automated_bidding(linked) -> None:
          "keyword_text": "ivf", "match_type": "BROAD"},
     )
     assert payload["plan_id"]
+
+
+async def test_a_keyword_is_refused_once_the_campaign_moves_to_manual_cpc(linked) -> None:
+    """Broad match was legitimate when drafted, because the ad group was on an
+    automated strategy. Moving it to manual CPC before confirming makes the
+    same keyword the thing rules.block_broad_match_with_manual_cpc forbids."""
+    h = linked(Tier.LEAD)
+    h.reader.bidding_strategy = "MAXIMIZE_CONVERSIONS"
+    draft = await _call(
+        h.mcp, "add_keyword",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
+         "keyword_text": "fertility clinic", "match_type": "BROAD"},
+    )
+
+    h.reader.bidding_strategy = "MANUAL_CPC"
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert "broad match" in str(caught.value).lower()
+    assert h.executor.applied == []
 
 
 async def test_a_new_keyword_is_created_paused(linked) -> None:
@@ -484,6 +623,24 @@ async def test_confirming_a_bid_sends_micros(linked) -> None:
     request = h.executor.applied[0]
     assert request.operation == "update_ad_group_bid"
     assert request.payload["cpc_bid_micros"] == 60_000_000
+
+
+async def test_a_bid_plan_is_refused_once_the_max_cpc_is_tightened(linked) -> None:
+    """Drafted at 60 while lead's max CPC was 200. Dropping it to 55 must
+    refuse the plan rather than let the approval outlive the limit."""
+    h = linked(Tier.LEAD)
+    draft = await _call(
+        h.mcp, "update_ad_group_bid",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 60},
+    )
+
+    _tighten_policy(h.policy_path, "lead", "bids", max_cpc=55)
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert "55" in str(caught.value)
+    assert h.executor.applied == []
 
 
 async def test_an_operator_cannot_change_bids(linked) -> None:
