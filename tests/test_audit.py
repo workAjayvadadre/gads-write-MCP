@@ -156,3 +156,52 @@ def test_filter_by_local_date(tmp_path: Path) -> None:
     log.append(_record(now=datetime(2026, 1, 2, 6, 0, tzinfo=timezone.utc)))
 
     assert len(list(log.iter_records(local_date="2026-01-01"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# retention: the log has to look after itself
+# ---------------------------------------------------------------------------
+# This server is meant to run unattended. A log that needs a human to rotate
+# it every few months is a log that eventually fills a disk, and a logrotate
+# rule written by someone who does not know the daily spend ceiling is
+# derived from this file would silently reset every user's allowance.
+
+
+def test_records_past_the_retention_window_are_pruned_automatically(
+    tmp_path: Path,
+) -> None:
+    """No cron, no logrotate, no human. Appending is enough to keep it tidy."""
+    log = AuditLog(
+        tmp_path / "audit.jsonl",
+        retention_days=30,
+        clock=lambda: datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    log.append(_record(now=datetime(2026, 1, 1, 6, 0, tzinfo=timezone.utc)))
+    log.append(_record(now=datetime(2026, 2, 28, 6, 0, tzinfo=timezone.utc)))
+
+    assert list(log.iter_records(local_date="2026-01-01")) == []
+    assert len(list(log.iter_records(local_date="2026-02-28"))) == 1
+
+
+def test_a_pre_partition_audit_file_is_still_read(tmp_path: Path) -> None:
+    """Deploying the partitioned log must not lose the history it inherits.
+
+    The daily spend ceiling is derived from this log. If an existing
+    audit.jsonl stopped being read, everyone's allowance would silently reset
+    to zero-used on the deploy - the exact failure the partitioning is meant
+    to prevent.
+    """
+    moment = datetime(2026, 1, 1, 6, 0, tzinfo=timezone.utc)
+    legacy = tmp_path / "audit.jsonl"
+    legacy.write_text(
+        _record(now=moment, spend_delta_units="200").to_json_line() + "\n",
+        encoding="utf-8",
+    )
+
+    log = AuditLog(legacy)
+    log.append(_record(tool="pause_campaign", now=moment))
+
+    tools = [r["tool"] for r in log.iter_records(local_date="2026-01-01")]
+    assert "update_campaign_budget" in tools, "inherited history was dropped"
+    assert "pause_campaign" in tools, "newly written record was dropped"

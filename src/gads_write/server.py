@@ -38,6 +38,7 @@ from .auth.identity import (
 )
 from .auth.roles import FileTierResolver, RoleStore
 from .auth.tiers import Tier, TierResolver
+from .health import register_health_route
 from .mcp_middleware import TierMiddleware
 from .safety.audit import AuditLog
 from .safety.guards import Guard
@@ -176,7 +177,11 @@ try:
         policy_store=POLICY_STORE,
         reader=READER,
     )
-    AUDIT_LOG = AuditLog(SETTINGS.audit_log_path)
+    # Prunes itself: no cron, no logrotate, nothing to remember. See
+    # safety/audit.py for why rotation is in-process rather than in ops.
+    AUDIT_LOG = AuditLog(
+        SETTINGS.audit_log_path, retention_days=SETTINGS.audit_retention_days
+    )
     SPEND_LEDGER = DailySpendLedger(AUDIT_LOG)
     PLAN_STORE = PlanStore()
 
@@ -197,6 +202,15 @@ mcp = FastMCP(name="gads-write-mcp", auth=_build_auth_provider(SETTINGS))
 # Registered before any tool so it wraps every one of them.
 mcp.add_middleware(
     TierMiddleware(tier_resolver=TIER_RESOLVER, settings=SETTINGS)
+)
+
+# Unauthenticated liveness. Returns 503 when a config edit was refused, so a
+# monitor notices we are serving an older policy than the files show.
+register_health_route(
+    mcp,
+    settings=SETTINGS,
+    policy_store=POLICY_STORE,
+    role_store=ROLE_STORE,
 )
 
 # Phase 3 reads. Registered here, in the composition root, with their
@@ -223,6 +237,11 @@ register_confirm_tool(
     guard=GUARD,
     executor=EXECUTOR,
     plan_store=PLAN_STORE,
+    settings=SETTINGS,
+    # Confirm re-reads the entity a plan targets, because budget and bid
+    # limits are relative and a plan stores an absolute target. See the
+    # module docstring in tools/confirm.py.
+    reader=READER,
 )
 
 

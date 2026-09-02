@@ -32,8 +32,8 @@ If you need a config value, a decision, or a file from the existing server,
 | 2 | Safety core + gate + tier middleware, no API calls | **done, 201 tests** |
 | 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
 | 4 | First mutation (`pause`/`enable`), two-step confirm | **code done; NOT yet run against a live account** |
-| 5 | Budget, bids, negatives, keywords, RSA | **code done, 351 tests; NOT yet run against a live account** |
-| 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
+| 5 | Budget, bids, negatives, keywords, RSA | **code done, 366 tests; NOT yet run against a live account** |
+| 6 | Rollout: runbook, health endpoint, self-managing audit log, human approval | **code done, 375 tests; not yet exercised against a live client** |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
 `ads/api_version.py` and nowhere else.
@@ -231,15 +231,68 @@ match-type syntax (`[exact]`, `"phrase"`) is refused, because the API takes
 bare text plus a separate match_type and brackets would become part of the
 keyword.
 
-**`REVALIDATORS` maps every write tool to its re-validator**, and
-`confirm_and_apply` fails closed on a tool missing from that table. Draft-time
-and confirm-time validation must be literally the same function, or a plan
-could be applied under rules it was never checked against.
+**`tools/operations.py` owns every check for every write tool, and both steps
+go through it.** `OPERATIONS` maps a tool to its argument validator, its
+policy recheck, and which entity that recheck needs the current state of.
+`confirm_and_apply` fails closed on a tool missing from that table.
 
-**Budgets gate twice.** Policy cannot be evaluated without the CURRENT value,
-and the account must not be read before the allowlist has authorised it. So
-those tools run the chain once to authorise (marked `dry_run`, audited as a
-look) and again with the numbers. Two audit lines per draft is deliberate.
+This used to be split, and the split was a real hole. `REVALIDATORS` carried
+only the argument validator; the money rules - `max_daily`,
+`max_increase_percent`, `max_cpc`, broad-match-under-manual-CPC and the daily
+ceiling - lived in an `evaluate` closure inside each draft tool's body,
+reachable from nowhere else. `Guard.check` skips policy evaluation entirely
+when `evaluate is None`, and confirm never passed one, so confirm re-ran a
+strictly weaker check than draft: a plan drafted while the operator ceiling
+was 2000 still applied after a lead dropped it to 60. Four regression tests
+in `tests/test_phase5_tools.py` pin it shut.
+
+**Confirm re-reads the current state; it does not trust the plan.** Budget
+and bid rules are relative - a percentage increase needs something to be a
+percentage *of* - while a plan stores an absolute target. Trusting the value
+the preview was built from let an approved "100 -> 120" become +1100% if
+someone lowered the budget to 10 in the Google Ads UI first. A read that
+fails refuses the plan without consuming it: not knowing what we would be
+changing is a reason to stop, not a reason to burn the plan.
+
+**Budgets gate twice, at draft and at confirm.** Policy cannot be evaluated
+without the CURRENT value, and the account must not be read before the
+allowlist has authorised it. So those tools run the chain once to authorise
+(marked `dry_run`, audited as a look) and again with the numbers. Two audit
+lines is deliberate, at both steps. Tools whose rules are absolute - negative
+keywords, RSAs, pause/enable - pay for neither the second line nor the read.
+
+**The audit log partitions by date and prunes itself, in-process.** Rotation
+is deliberately NOT a logrotate rule. The daily spend ceiling is rebuilt from
+these files, so an external tool that truncated or moved them would silently
+hand every user a fresh allowance - a security control disabled by a routine
+ops action, with no error and no log line. `GADS_AUDIT_RETENTION_DAYS`
+(default 400, minimum 1) is the only knob, and the server needs no cron, no
+logrotate and no scheduled maintenance. A pre-existing single `audit.jsonl`
+is still read so a deploy does not lose history.
+
+**The ceiling is only consulted when a rule needs it.** It used to be read on
+every gate check, including reads, which have no spend to check. Combined
+with the flat file that meant every tool call re-parsed the whole log: 27 ms
+at one month, 1.5 s at one year. Partitioning plus the conditional read takes
+a one-year log from 1483 ms to 27 ms per budget check, and to zero file reads
+for anything that is not a monetary change.
+
+**`/healthz` returns 503 when a config reload was refused**, not 200 with a
+status field. The failure it exists to catch is silent: the server runs
+perfectly on its last good policy while the team believes a newly-edited
+limit is in force. 503 is the one code every monitoring tool alerts on by
+default; a status field in the body relies on whoever configures the monitor
+reading it, which is exactly the step that gets skipped. This runs as a
+single PM2 process behind Nginx, not behind a load balancer that would evict
+it, so the 503 costs no availability. The endpoint is unauthenticated and so
+deliberately exposes no customer IDs, emails, or credentials.
+
+**The tier cache is not a security boundary.** Every Google Ads call uses the
+caller's own OAuth token, so someone removed from Google Ads is refused by
+Google immediately, whatever our cached tier says. The TTL only affects which
+tools appear in the menu and which tier is recorded in the audit line. This
+was previously described as a security knob; it is not, and that is a direct
+consequence of the no-static-refresh-token rule.
 
 **The spend delta must reach the audit log on apply.** The daily ceiling is
 derived from that log, so `confirm_and_apply` passing `spend_delta_units=None`
@@ -287,12 +340,19 @@ role lookup, with every actual read and write still on the user's own token;
 `OverridingTierResolver` keeps the team working in the meantime via a
 deliberate, in-git `users:` entry.
 
-**Human approval is enforced by the client, not the server.** Nothing at the
-protocol level stops Claude calling draft then confirm in one turn. The
-server guarantees the approval is a separate authenticated call, owner-bound,
-expiring, single-use and re-evaluated. A server-side guarantee needs
-out-of-band approval (Slack/email) or a confirmation code the model never
-sees. Decide in Phase 6.
+**Human approval is now enforced by the server, via MCP elicitation.**
+`confirm_and_apply` stops and asks the client to show the preview to a
+person, and applies nothing unless they accept. A client that cannot elicit
+is REFUSED, not waved through - failing open would leave exactly the hole
+this closes. Controlled by `GADS_REQUIRE_HUMAN_CONFIRMATION`, default true.
+
+The elicitation happens AFTER the gate (nobody is asked to approve something
+policy would refuse anyway) and BEFORE the plan is consumed (declining leaves
+the plan open rather than burning it).
+
+Not yet exercised against Claude's own connector UI - if it turns out not to
+support elicitation, writes will refuse rather than misbehave, and the
+setting is the deliberate escape hatch.
 
 **`roles.yaml` is `mode: file` for local development.** `google_ads` needs
 live credentials to resolve any tier at all. The Google Ads resolver is built,
@@ -325,7 +385,24 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 351 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 375 tests, no network, no credentials
+curl -s localhost:8081/healthz          # 200 ok / 503 degraded, no auth needed
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues in `IIVF-admin/gads-write-mcp`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, each label named after itself. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

@@ -28,6 +28,8 @@ ENV_KEYS = (
     "GADS_AUDIT_LOG_PATH",
     "GADS_HOST",
     "GADS_PORT",
+    "GADS_TIER_CACHE_SECONDS",
+    "GADS_AUDIT_RETENTION_DAYS",
 )
 
 
@@ -54,6 +56,33 @@ def _load(tmp_path: Path) -> Settings:
     # env_file points at a path that does not exist, so a developer's real
     # .env on disk can never influence a test result.
     return load_settings(env_file=tmp_path / "no-such.env")
+
+
+# ---------------------------------------------------------------------------
+# audit retention
+# ---------------------------------------------------------------------------
+# The audit log prunes itself so the server can run unattended. The window is
+# configurable, but a nonsensical value must not silently become "keep
+# nothing" - that would delete the daily spend ceiling's own evidence.
+
+
+def test_audit_retention_defaults_to_a_sane_window(env, tmp_path: Path) -> None:
+    assert _load(tmp_path).audit_retention_days >= 365
+
+
+def test_audit_retention_can_be_configured(env, tmp_path: Path) -> None:
+    env.setenv("GADS_AUDIT_RETENTION_DAYS", "90")
+    assert _load(tmp_path).audit_retention_days == 90
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "forever"])
+def test_a_nonsensical_retention_window_refuses_to_start(
+    env, tmp_path: Path, bad: str
+) -> None:
+    env.setenv("GADS_AUDIT_RETENTION_DAYS", bad)
+    with pytest.raises(ConfigError) as caught:
+        _load(tmp_path)
+    assert "GADS_AUDIT_RETENTION_DAYS" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +166,20 @@ def test_invalid_policy_yaml_is_rejected(env, tmp_path: Path) -> None:
     env.setenv("GADS_POLICY_PATH", str(broken))
     with pytest.raises(ConfigError):
         _load(tmp_path)
+
+
+def test_a_mis_shaped_policy_block_is_rejected_at_boot(
+    env, tmp_path: Path, write_policy
+) -> None:
+    """Valid YAML, wrong shape. Boot must refuse with the same readable
+    message as any other bad config, not a raw traceback."""
+    env.setenv(
+        "GADS_POLICY_PATH",
+        str(write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})),
+    )
+    with pytest.raises(ConfigError) as caught:
+        _load(tmp_path)
+    assert "budget" in str(caught.value)
 
 
 def test_roles_in_file_mode_without_a_lead_is_rejected(

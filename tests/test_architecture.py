@@ -152,3 +152,32 @@ def test_no_remove_or_delete_tools_exist() -> None:
         "v1 has no remove/delete operations - pausing is reversible, removal "
         "is not:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_every_write_tool_has_checks_defined() -> None:
+    # Three tables describe a write tool: registry.py says which tier it
+    # needs, operations.py says how to check it, executor.py says how to
+    # apply it. Nothing cross-checks them, and a tool registered without an
+    # OPERATIONS entry is draftable but can never be confirmed - which is
+    # the safe direction to get it wrong, but a silent one. This makes the
+    # omission fail the build instead.
+    from gads_write.tools.operations import OPERATIONS
+    from gads_write.tools.registry import all_specs
+
+    drafting_tools = {
+        name
+        for name, spec in all_specs().items()
+        if spec.writes and not spec.applies_plan
+    }
+    missing = sorted(drafting_tools - set(OPERATIONS))
+    assert not missing, (
+        "these write tools are registered but have no entry in "
+        "tools/operations.py, so they can be drafted and never confirmed:\n  "
+        + "\n  ".join(missing)
+    )
+
+    unregistered = sorted(set(OPERATIONS) - drafting_tools)
+    assert not unregistered, (
+        "these tools have checks defined but are not registered as writes "
+        "in tools/registry.py:\n  " + "\n  ".join(unregistered)
+    )

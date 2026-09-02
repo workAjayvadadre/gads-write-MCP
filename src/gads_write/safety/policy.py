@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
@@ -114,7 +115,19 @@ class Policy:
 # parsing
 # ---------------------------------------------------------------------------
 
-def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
+def _require(mapping: Any, key: str, where: str) -> Any:
+    # The isinstance check is not defensive noise. A block written as
+    # `budget:` with nothing under it parses to None, and the tier merge
+    # below replaces the inherited defaults dict with that None. Without
+    # this, `key not in None` raises TypeError - which is not a PolicyError,
+    # so it escapes PolicyStore's safety net and reaches a live request while
+    # last_error stays empty and /healthz keeps answering "ok".
+    if not isinstance(mapping, Mapping):
+        raise PolicyError(
+            f"{where}: expected a mapping of settings, got "
+            f"{type(mapping).__name__} - a block left empty or set to a "
+            f"single value cannot be merged with the defaults"
+        )
     if key not in mapping:
         raise PolicyError(f"{where}: missing required key {key!r}")
     return mapping[key]
@@ -146,19 +159,27 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _parse_tier_limits(raw: dict[str, Any], where: str) -> TierLimits:
+    # Each sub-block names itself in `where`, so a mis-shaped one says which
+    # block it was rather than only which tier.
+    budget_where = f"{where}.budget"
+    bids_where = f"{where}.bids"
     budget_raw = _require(raw, "budget", where)
     bids_raw = _require(raw, "bids", where)
 
     budget = BudgetLimits(
-        min_daily_units=_money(_require(budget_raw, "min_daily", where), f"{where}.budget.min_daily"),
-        max_daily_units=_money(_require(budget_raw, "max_daily", where), f"{where}.budget.max_daily"),
+        min_daily_units=_money(
+            _require(budget_raw, "min_daily", budget_where), f"{budget_where}.min_daily"
+        ),
+        max_daily_units=_money(
+            _require(budget_raw, "max_daily", budget_where), f"{budget_where}.max_daily"
+        ),
         max_increase_percent=_money(
-            _require(budget_raw, "max_increase_percent", where),
-            f"{where}.budget.max_increase_percent",
+            _require(budget_raw, "max_increase_percent", budget_where),
+            f"{budget_where}.max_increase_percent",
         ),
         max_total_increase_per_user_per_day_units=_money(
-            _require(budget_raw, "max_total_increase_per_user_per_day", where),
-            f"{where}.budget.max_total_increase_per_user_per_day",
+            _require(budget_raw, "max_total_increase_per_user_per_day", budget_where),
+            f"{budget_where}.max_total_increase_per_user_per_day",
         ),
     )
     if budget.min_daily_units > budget.max_daily_units:
@@ -168,10 +189,12 @@ def _parse_tier_limits(raw: dict[str, Any], where: str) -> TierLimits:
         )
 
     bids = BidLimits(
-        max_cpc_units=_money(_require(bids_raw, "max_cpc", where), f"{where}.bids.max_cpc"),
+        max_cpc_units=_money(
+            _require(bids_raw, "max_cpc", bids_where), f"{bids_where}.max_cpc"
+        ),
         max_increase_percent=_money(
-            _require(bids_raw, "max_increase_percent", where),
-            f"{where}.bids.max_increase_percent",
+            _require(bids_raw, "max_increase_percent", bids_where),
+            f"{bids_where}.max_increase_percent",
         ),
     )
     return TierLimits(budget=budget, bids=bids)
@@ -351,9 +374,18 @@ class PolicyStore:
                 return self._policy
             try:
                 policy = load_policy_file(self._path)
-            except PolicyError as exc:
+            except Exception as exc:  # noqa: BLE001 - see below
                 # Keep the last good policy. Do NOT relax to defaults and do
                 # NOT raise into the caller's request.
+                #
+                # Deliberately broader than PolicyError. The parser aims to
+                # turn every bad edit into one, but it only takes one shape
+                # nobody anticipated - a mis-shaped block raising TypeError,
+                # say - for the exception to reach a live request while
+                # last_error stays empty and /healthz reports a healthy
+                # server. The rule is about the OUTCOME, not the exception
+                # type: whatever goes wrong, keep serving the last good
+                # policy and make the failure visible.
                 self._last_error = str(exc)
                 self._stamp = stamp  # avoid re-parsing the same broken file
                 logger.error(

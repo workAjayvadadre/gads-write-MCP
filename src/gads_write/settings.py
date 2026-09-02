@@ -62,6 +62,20 @@ class Settings:
     # 0 disables caching and pays a Google round trip on every call.
     tier_cache_seconds: int = 60
 
+    # How many days of audit files the log keeps before deleting them itself.
+    # Rotation is done in-process on purpose: the daily spend ceiling is
+    # derived from these files, so an external logrotate rule would silently
+    # reset everyone's allowance. See safety/audit.py.
+    audit_retention_days: int = 400
+
+    # When true, confirm_and_apply stops and asks the connected client to
+    # show the preview to a person, and applies nothing unless they accept.
+    # This is what makes human approval a property of the SERVER rather than
+    # a habit of the client: two tool calls in one model turn are no longer
+    # enough to change anything. Defaults to true; turning it off is a
+    # deliberate act, like the kill switch.
+    require_human_confirmation: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"
@@ -114,17 +128,21 @@ def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
     boot-time checks and runtime checks can never drift apart. Imports are
     local to this function to keep module import order simple.
     """
-    from .auth.roles import RoleConfigError, RoleTable
-    from .safety.policy import PolicyError, load_policy_file
+    from .auth.roles import RoleTable
+    from .safety.policy import load_policy_file
 
     problems: list[str] = []
 
+    # Both blocks catch Exception rather than the parsers' own error types.
+    # A config file that breaks in a shape the parser did not anticipate
+    # must still be reported as a configuration problem, in the same
+    # readable list as every other one - not as a raw traceback at boot.
     if not policy_path.is_file():
         problems.append(f"policy file not found at {policy_path}")
     else:
         try:
             load_policy_file(policy_path)
-        except PolicyError as exc:
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             problems.append(str(exc))
 
     if not roles_path.is_file():
@@ -132,7 +150,7 @@ def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
     else:
         try:
             RoleTable.load(roles_path)
-        except RoleConfigError as exc:
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             problems.append(str(exc))
 
     return problems
@@ -234,6 +252,27 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         problems.append(str(exc))
         write_enabled = False
 
+    try:
+        # Defaults to true. Turning it off means a model can apply a drafted
+        # change with no person in the loop, so it has to be typed out.
+        require_human_confirmation = _env_bool("GADS_REQUIRE_HUMAN_CONFIRMATION", True)
+    except ConfigError as exc:
+        problems.append(str(exc))
+        require_human_confirmation = True
+
+    raw_retention = _env("GADS_AUDIT_RETENTION_DAYS", "400") or "400"
+    audit_retention_days = 400
+    try:
+        audit_retention_days = int(raw_retention)
+        if audit_retention_days < 1:
+            raise ValueError
+    except ValueError:
+        problems.append(
+            f"GADS_AUDIT_RETENTION_DAYS must be a whole number of days, at least 1, "
+            f"got {raw_retention!r}. The audit log is the daily spend ceiling's only "
+            "evidence, so it cannot be set to keep nothing."
+        )
+
     policy_path = _resolve(_env("GADS_POLICY_PATH", "config/policy.yaml") or "config/policy.yaml")
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
@@ -262,4 +301,6 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         roles_path=roles_path,
         audit_log_path=audit_log_path,
         tier_cache_seconds=tier_cache_seconds,
+        audit_retention_days=audit_retention_days,
+        require_human_confirmation=require_human_confirmation,
     )

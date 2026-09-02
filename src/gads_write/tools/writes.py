@@ -50,18 +50,18 @@ from ..safety.plans import PlanError, PlanStore
 from ..safety.policy import (
     Policy,
     PolicyStore,
-    evaluate_bid_change,
-    evaluate_budget_change,
-    evaluate_match_type_against_bidding,
 )
 from ..safety.units import MoneyError, coerce_units, format_micros, format_units, to_micros
-from ..safety.validators import (
-    ValidationResult,
-    validate_customer_id,
-    validate_keyword_text,
-    validate_match_type,
-    validate_numeric_id,
-    validate_rsa,
+from ..safety.validators import ValidationResult
+from .operations import (
+    OPERATIONS,
+    budget_spend_delta,
+    recheck_bid,
+    recheck_budget,
+    recheck_keyword,
+    shared_budget_verdict,
+    units_from_micros,
+    validate_campaign_status_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,91 +74,10 @@ TOOL_TARGET_STATUS: dict[str, str] = {
 }
 
 
-def validate_campaign_status_args(arguments: dict[str, Any]) -> ValidationResult:
-    """Validate the arguments of a campaign status change."""
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    result.extend(
-        validate_numeric_id(arguments.get("campaign_id", ""), field_name="campaign_id")
-    )
-    return result
-
-
-def _validate_budget_args(policy: Policy, arguments: dict[str, Any]) -> ValidationResult:
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    result.extend(
-        validate_numeric_id(arguments.get("campaign_id", ""), field_name="campaign_id")
-    )
-    return result
-
-
-def _validate_negative_keyword_args(
-    policy: Policy, arguments: dict[str, Any]
-) -> ValidationResult:
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    target = arguments.get("campaign_id") or arguments.get("ad_group_id") or ""
-    result.extend(validate_numeric_id(target, field_name="target_id"))
-    result.extend(validate_keyword_text(arguments.get("keyword_text", "")))
-    result.extend(validate_match_type(arguments.get("match_type", "")))
-    return result
-
-
-def _validate_keyword_args(policy: Policy, arguments: dict[str, Any]) -> ValidationResult:
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    result.extend(
-        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
-    )
-    result.extend(validate_keyword_text(arguments.get("keyword_text", "")))
-    result.extend(validate_match_type(arguments.get("match_type", "")))
-    return result
-
-
-def _validate_bid_args(policy: Policy, arguments: dict[str, Any]) -> ValidationResult:
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    result.extend(
-        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
-    )
-    return result
-
-
-def _validate_rsa_args(policy: Policy, arguments: dict[str, Any]) -> ValidationResult:
-    result = ValidationResult()
-    result.extend(validate_customer_id(arguments.get("customer_id", "")))
-    result.extend(
-        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
-    )
-    result.extend(
-        validate_rsa(
-            headlines=list(arguments.get("headlines") or []),
-            descriptions=list(arguments.get("descriptions") or []),
-            final_urls=list(arguments.get("final_urls") or []),
-            allowed_domains=policy.rules.allowed_final_url_domains,
-            path1=arguments.get("path1"),
-            path2=arguments.get("path2"),
-        )
-    )
-    return result
-
-
-# tool name -> the validator that re-checks its arguments at confirm time.
-#
-# Shared with tools/confirm.py on purpose: the checks run at draft time and
-# the checks re-run at confirm time must be the same code, or a plan could be
-# applied under rules it was never checked against. A tool missing from this
-# table cannot be confirmed at all - see confirm.py, which fails closed.
-REVALIDATORS: dict[str, Callable[[Policy, dict[str, Any]], ValidationResult]] = {
-    "pause_campaign": lambda _policy, args: validate_campaign_status_args(args),
-    "enable_campaign": lambda _policy, args: validate_campaign_status_args(args),
-    "update_campaign_budget": _validate_budget_args,
-    "add_negative_keyword": _validate_negative_keyword_args,
-    "add_keyword": _validate_keyword_args,
-    "update_ad_group_bid": _validate_bid_args,
-    "create_responsive_search_ad": _validate_rsa_args,
-}
+# Every validator and every policy recheck now lives in tools/operations.py,
+# so that the checks this module runs at draft time and the checks
+# tools/confirm.py re-runs at confirm time are literally the same functions.
+# They used to be two sets, and the confirm-time set was the weaker one.
 
 
 def register_write_tools(
@@ -184,7 +103,7 @@ def register_write_tools(
             caller=caller,
             customer_id=customer_id,
             arguments=arguments,
-            validate=lambda _policy: validate_campaign_status_args(arguments),
+            validate=lambda policy: validate_campaign_status_args(policy, arguments),
         )
         if not decision.allowed:
             raise ToolError(f"{decision.reason_text}. Nothing was changed.")
@@ -331,6 +250,31 @@ def register_write_tools(
             raise ToolError(f"{decision.reason_text}. Nothing was changed.")
         return decision
 
+    # These two adapt the shared checks in tools/operations.py to the shapes
+    # Guard.check wants. They exist so that a draft cannot accidentally run a
+    # different check from the one confirm will re-run: there is one
+    # definition per tool, and both steps go through it.
+
+    def _validator(tool: str, arguments: dict[str, Any]) -> Callable[[Policy], ValidationResult]:
+        validate = OPERATIONS[tool].validate
+        return lambda policy: validate(policy, arguments)
+
+    def _evaluator(
+        recheck: Any,
+        arguments: dict[str, Any],
+        *,
+        current: Any,
+        payload: dict[str, Any] | None = None,
+    ) -> Callable[[Policy, Any, Decimal], Any]:
+        return lambda policy, tier, spend_today: recheck(
+            policy,
+            tier=tier,
+            arguments=arguments,
+            current=current,
+            payload=dict(payload or {}),
+            spend_today=spend_today,
+        )
+
     async def _campaign_or_fail(customer_id: str, campaign_id: str) -> Any:
         try:
             campaign = await reader.campaign_by_id(
@@ -423,17 +367,14 @@ def register_write_tools(
         caller, _ = await _authorise("update_campaign_budget", customer_id, arguments)
         campaign = await _campaign_or_fail(customer_id, campaign_id)
 
-        if campaign.budget_is_shared:
-            # A shared budget is used by several campaigns, so changing it
-            # would affect all of them while the preview names only one.
-            # A misleading preview breaks the entire approval model, so this
-            # is refused rather than warned about.
+        # Refused here as well as inside the recheck, so whoever is drafting
+        # gets the explanation before a plan_id exists rather than a bare
+        # policy denial. Same function confirm runs, so the two cannot drift.
+        shared = shared_budget_verdict(campaign)
+        if not shared.allowed:
             raise ToolError(
-                f"Campaign {campaign.name!r} uses a SHARED budget "
-                f"({campaign.budget_resource_name}), which other campaigns also "
-                "use. Changing it would affect them too, and this preview can "
-                "only describe one campaign. Change it in the Google Ads UI, or "
-                "give this campaign its own budget. Nothing was changed."
+                f"Campaign {campaign.name!r}: {' '.join(shared.reasons)} "
+                "Nothing was changed."
             )
         if not campaign.budget_resource_name:
             raise ToolError(
@@ -441,33 +382,34 @@ def register_write_tools(
                 "Nothing was changed."
             )
 
-        current_units = Decimal(campaign.daily_budget_micros) / Decimal(1_000_000)
+        current_units = units_from_micros(campaign.daily_budget_micros)
         try:
             new_units = coerce_units(new_daily_budget, field="new_daily_budget")
         except MoneyError as exc:
             raise ToolError(f"{exc}. Nothing was changed.") from exc
 
         delta = new_units - current_units
-        spend_delta = delta if delta > 0 else None
+        # Built BEFORE the gate, because the recheck has to compare the
+        # resource we would change against the one the campaign actually
+        # uses. Confirm rebuilds neither: it re-reads the campaign and runs
+        # the same comparison against the payload stored on the plan.
+        payload = {
+            "budget_resource_name": campaign.budget_resource_name,
+            "amount_micros": int(to_micros(new_units)),
+        }
+        spend_delta = budget_spend_delta(arguments, campaign)
 
-        def validate(policy: Policy) -> ValidationResult:
-            return _validate_budget_args(policy, arguments)
-
-        def evaluate(policy: Policy, tier: Any, spend_today: Decimal) -> Any:
-            return evaluate_budget_change(
-                policy,
-                tier=tier,
-                current_units=current_units,
-                new_units=new_units,
-                already_increased_today_units=spend_today,
-            )
-
+        # The same functions tools/confirm.py will re-run, against the
+        # campaign as it is right now. `campaign` is what makes the percentage
+        # limits meaningful; confirm re-reads it rather than trusting this one.
         decision = await _decide(
             "update_campaign_budget",
             customer_id,
             arguments,
-            validate=validate,
-            evaluate=evaluate,
+            validate=_validator("update_campaign_budget", arguments),
+            evaluate=_evaluator(
+                recheck_budget, arguments, current=campaign, payload=payload
+            ),
             spend_delta_units=spend_delta,
         )
         policy = decision.policy or policy_store.current()
@@ -499,10 +441,9 @@ def register_write_tools(
                 "campaign_name": campaign.name,
                 "current_budget_micros": campaign.daily_budget_micros,
                 "operation": "update_campaign_budget",
-                "payload": {
-                    "budget_resource_name": campaign.budget_resource_name,
-                    "amount_micros": int(to_micros(new_units)),
-                },
+                # The same object the gate just judged, not a second one built
+                # from the same variables. Two derivations can drift.
+                "payload": payload,
             },
             extra={
                 "campaign_id": campaign.campaign_id,
@@ -568,15 +509,9 @@ def register_write_tools(
                 f"in campaign {target.campaign_name!r}"
             )
 
-        def validate(policy: Policy) -> ValidationResult:
-            result = ValidationResult()
-            result.extend(validate_customer_id(customer_id))
-            result.extend(validate_numeric_id(target_id, field_name="target_id"))
-            result.extend(validate_keyword_text(keyword_text))
-            result.extend(validate_match_type(match_type))
-            return result
-
-        decision = await _decide(tool, customer_id, arguments, validate=validate)
+        decision = await _decide(
+            tool, customer_id, arguments, validate=_validator(tool, arguments)
+        )
         policy = decision.policy or policy_store.current()
 
         preview = "\n".join(
@@ -644,24 +579,15 @@ def register_write_tools(
         caller, _ = await _authorise("add_keyword", customer_id, arguments)
         ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
 
-        def validate(policy: Policy) -> ValidationResult:
-            result = ValidationResult()
-            result.extend(validate_customer_id(customer_id))
-            result.extend(validate_numeric_id(ad_group_id, field_name="ad_group_id"))
-            result.extend(validate_keyword_text(keyword_text))
-            result.extend(validate_match_type(match_type))
-            return result
-
-        def evaluate(policy: Policy, tier: Any, spend_today: Decimal) -> Any:
-            # Broad match under manual CPC is the classic way to burn money.
-            return evaluate_match_type_against_bidding(
-                policy,
-                match_type=match_type,
-                bidding_strategy=ad_group.bidding_strategy_type,
-            )
-
+        # Broad match under manual CPC is the classic way to burn money, and
+        # the strategy can change between drafting and confirming, so confirm
+        # re-reads the ad group and runs recheck_keyword again.
         decision = await _decide(
-            "add_keyword", customer_id, arguments, validate=validate, evaluate=evaluate
+            "add_keyword",
+            customer_id,
+            arguments,
+            validate=_validator("add_keyword", arguments),
+            evaluate=_evaluator(recheck_keyword, arguments, current=ad_group),
         )
         policy = decision.policy or policy_store.current()
         status = "PAUSED" if policy.rules.new_entities_start_paused else "ENABLED"
@@ -726,29 +652,18 @@ def register_write_tools(
         caller, _ = await _authorise("update_ad_group_bid", customer_id, arguments)
         ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
 
-        current_units = Decimal(ad_group.cpc_bid_micros) / Decimal(1_000_000)
+        current_units = units_from_micros(ad_group.cpc_bid_micros)
         try:
             new_units = coerce_units(new_max_cpc, field="new_max_cpc")
         except MoneyError as exc:
             raise ToolError(f"{exc}. Nothing was changed.") from exc
 
-        def validate(policy: Policy) -> ValidationResult:
-            result = ValidationResult()
-            result.extend(validate_customer_id(customer_id))
-            result.extend(validate_numeric_id(ad_group_id, field_name="ad_group_id"))
-            return result
-
-        def evaluate(policy: Policy, tier: Any, spend_today: Decimal) -> Any:
-            return evaluate_bid_change(
-                policy, tier=tier, current_units=current_units, new_units=new_units
-            )
-
         decision = await _decide(
             "update_ad_group_bid",
             customer_id,
             arguments,
-            validate=validate,
-            evaluate=evaluate,
+            validate=_validator("update_ad_group_bid", arguments),
+            evaluate=_evaluator(recheck_bid, arguments, current=ad_group),
         )
         policy = decision.policy or policy_store.current()
         code = policy.currency_code
@@ -826,24 +741,11 @@ def register_write_tools(
         )
         ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
 
-        def validate(policy: Policy) -> ValidationResult:
-            result = ValidationResult()
-            result.extend(validate_customer_id(customer_id))
-            result.extend(validate_numeric_id(ad_group_id, field_name="ad_group_id"))
-            result.extend(
-                validate_rsa(
-                    headlines=headlines,
-                    descriptions=descriptions,
-                    final_urls=final_urls,
-                    allowed_domains=policy.rules.allowed_final_url_domains,
-                    path1=path1,
-                    path2=path2,
-                )
-            )
-            return result
-
         decision = await _decide(
-            "create_responsive_search_ad", customer_id, arguments, validate=validate
+            "create_responsive_search_ad",
+            customer_id,
+            arguments,
+            validate=_validator("create_responsive_search_ad", arguments),
         )
         policy = decision.policy or policy_store.current()
         status = "PAUSED" if policy.rules.new_entities_start_paused else "ENABLED"
@@ -935,7 +837,5 @@ def _preview(
 
 __all__ = [
     "register_write_tools",
-    "validate_campaign_status_args",
-    "REVALIDATORS",
     "TOOL_TARGET_STATUS",
 ]

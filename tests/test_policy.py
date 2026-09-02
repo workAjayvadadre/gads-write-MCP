@@ -323,6 +323,68 @@ def test_structurally_invalid_edit_is_also_refused(write_policy) -> None:
     assert store.last_error is not None
 
 
+@pytest.mark.parametrize("broken_block", [None, 5, "daily"])
+def test_a_mis_shaped_tier_block_is_refused_rather_than_crashing(
+    write_policy, broken_block
+) -> None:
+    """Valid YAML, wrong shape.
+
+    `budget:` with nothing under it parses to None, and the tier merge
+    overwrites the defaults dict with it. The parser must name the problem
+    as a PolicyError like every other bad edit - anything else escapes the
+    store's safety net and reaches a live request.
+    """
+    with pytest.raises(PolicyError) as caught:
+        load_policy_file(
+            write_policy({"limits": {"tiers": {"operator": {"budget": broken_block}}}})
+        )
+    assert "budget" in str(caught.value)
+
+
+def test_a_mis_shaped_tier_block_keeps_the_last_good_policy(write_policy) -> None:
+    """The same edit, arriving as a hot reload rather than at boot."""
+    path = write_policy()
+    store = PolicyStore(path)
+    assert store.current().limits_for(Tier.OPERATOR).budget.max_daily_units == Decimal(2000)
+
+    write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})
+
+    still = store.current()
+    assert still.limits_for(Tier.OPERATOR).budget.max_daily_units == Decimal(2000)
+    assert store.last_error is not None
+    assert store.reload_count == 0
+
+
+def test_an_unexpected_reload_failure_still_keeps_the_last_good_policy(
+    write_policy, monkeypatch
+) -> None:
+    """The safety net, independent of any particular bad edit.
+
+    PolicyStore used to catch only PolicyError, so a parser bug that raised
+    anything else - a TypeError on a mis-shaped block, say - escaped into
+    the caller's request AND left last_error unset, so /healthz went on
+    reporting a healthy server. Whatever goes wrong, the rule is the same:
+    keep the last good policy, record it, never raise into a request.
+    """
+    import gads_write.safety.policy as policy_module
+
+    path = write_policy()
+    store = PolicyStore(path)
+    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
+
+    def explode(_path):
+        raise RuntimeError("something nobody anticipated")
+
+    monkeypatch.setattr(policy_module, "load_policy_file", explode)
+    write_policy({"limits": {"defaults": {"budget": {"max_daily": 9999}}}})
+
+    still = store.current()
+    assert still.limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
+    assert store.last_error is not None
+    assert "something nobody anticipated" in store.last_error
+    assert store.reload_count == 0
+
+
 def test_a_bad_edit_followed_by_a_good_one_recovers(write_policy) -> None:
     path = write_policy()
     store = PolicyStore(path)

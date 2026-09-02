@@ -259,12 +259,16 @@ class Guard:
                 return deny_with_tier("validation", *result.as_messages())
 
         # --- 7 & 8. policy limits, including this user's daily ceiling -------
-        # The ledger read happens here, last, because it is the only check
-        # that touches the filesystem.
-        spend_today = self._spend.total_increase_units(
-            user_email=email, local_date=local_date
-        )
+        # Last, because it is the only check that touches the filesystem, and
+        # ONLY when a rule actually needs the number. The ledger is rebuilt
+        # from the audit log, so reading it unconditionally made every call -
+        # including reads, which have no spend to check - slower every day
+        # the log grew. Tools with no monetary rule never open it.
+        spend_today = Decimal(0)
         if evaluate is not None:
+            spend_today = self._spend.total_increase_units(
+                user_email=email, local_date=local_date
+            )
             verdict = evaluate(policy, tier, spend_today)
             if not verdict.allowed:
                 return deny_with_tier("policy", *verdict.reasons)

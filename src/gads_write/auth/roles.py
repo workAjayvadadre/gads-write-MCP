@@ -157,9 +157,14 @@ class RoleStore:
                 return self._table
             try:
                 table = RoleTable.load(self._path)
-            except RoleConfigError as exc:
+            except Exception as exc:  # noqa: BLE001 - outcome, not type
                 # Keep the last good table. A broken edit must not grant
                 # anyone anything, and must not crash a live request.
+                #
+                # Broader than RoleConfigError on purpose, for the same
+                # reason as PolicyStore: an unanticipated exception type
+                # would otherwise reach a live request while last_error
+                # stayed empty and /healthz went on reporting "ok".
                 self._last_error = str(exc)
                 self._stamp = stamp
                 logger.error("roles reload REFUSED, keeping previous table: %s", exc)

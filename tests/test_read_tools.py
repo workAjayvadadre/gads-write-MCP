@@ -165,13 +165,12 @@ def harness(tmp_path, write_policy):
 
 
 def _audit_lines(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    """Read through the log's own interface.
+
+    The audit log partitions files by date, so reaching for the configured
+    path directly would be testing a storage detail rather than behaviour.
+    """
+    return list(AuditLog(path).iter_records())
 
 
 # ---------------------------------------------------------------------------
