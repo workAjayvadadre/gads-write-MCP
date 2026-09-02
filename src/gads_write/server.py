@@ -38,6 +38,7 @@ from .auth.identity import (
 )
 from .auth.roles import FileTierResolver, RoleStore
 from .auth.tiers import Tier, TierResolver
+from .health import register_health_route
 from .mcp_middleware import TierMiddleware
 from .safety.audit import AuditLog
 from .safety.guards import Guard
@@ -203,6 +204,15 @@ mcp.add_middleware(
     TierMiddleware(tier_resolver=TIER_RESOLVER, settings=SETTINGS)
 )
 
+# Unauthenticated liveness. Returns 503 when a config edit was refused, so a
+# monitor notices we are serving an older policy than the files show.
+register_health_route(
+    mcp,
+    settings=SETTINGS,
+    policy_store=POLICY_STORE,
+    role_store=ROLE_STORE,
+)
+
 # Phase 3 reads. Registered here, in the composition root, with their
 # dependencies passed in explicitly - tools/reads.py reaches for no globals,
 # which is what lets tests build the same tools against fakes.
@@ -227,6 +237,7 @@ register_confirm_tool(
     guard=GUARD,
     executor=EXECUTOR,
     plan_store=PLAN_STORE,
+    settings=SETTINGS,
     # Confirm re-reads the entity a plan targets, because budget and bid
     # limits are relative and a plan stores an absolute target. See the
     # module docstring in tools/confirm.py.

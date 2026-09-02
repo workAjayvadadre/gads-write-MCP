@@ -68,6 +68,14 @@ class Settings:
     # reset everyone's allowance. See safety/audit.py.
     audit_retention_days: int = 400
 
+    # When true, confirm_and_apply stops and asks the connected client to
+    # show the preview to a person, and applies nothing unless they accept.
+    # This is what makes human approval a property of the SERVER rather than
+    # a habit of the client: two tool calls in one model turn are no longer
+    # enough to change anything. Defaults to true; turning it off is a
+    # deliberate act, like the kill switch.
+    require_human_confirmation: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"
@@ -240,6 +248,14 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         problems.append(str(exc))
         write_enabled = False
 
+    try:
+        # Defaults to true. Turning it off means a model can apply a drafted
+        # change with no person in the loop, so it has to be typed out.
+        require_human_confirmation = _env_bool("GADS_REQUIRE_HUMAN_CONFIRMATION", True)
+    except ConfigError as exc:
+        problems.append(str(exc))
+        require_human_confirmation = True
+
     raw_retention = _env("GADS_AUDIT_RETENTION_DAYS", "400") or "400"
     audit_retention_days = 400
     try:
@@ -282,4 +298,5 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         audit_log_path=audit_log_path,
         tier_cache_seconds=tier_cache_seconds,
         audit_retention_days=audit_retention_days,
+        require_human_confirmation=require_human_confirmation,
     )

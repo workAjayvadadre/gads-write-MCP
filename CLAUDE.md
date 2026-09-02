@@ -33,7 +33,7 @@ If you need a config value, a decision, or a file from the existing server,
 | 3 | Reads: per-user Ads client, accounts, performance, search terms | **done, 268 tests** |
 | 4 | First mutation (`pause`/`enable`), two-step confirm | **code done; NOT yet run against a live account** |
 | 5 | Budget, bids, negatives, keywords, RSA | **code done, 366 tests; NOT yet run against a live account** |
-| 6 | Rollout: runbook, log shipping, alerting, rollback | not started |
+| 6 | Rollout: runbook, health endpoint, self-managing audit log, human approval | **code done, 375 tests; not yet exercised against a live client** |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
 `ads/api_version.py` and nowhere else.
@@ -277,6 +277,16 @@ at one month, 1.5 s at one year. Partitioning plus the conditional read takes
 a one-year log from 1483 ms to 27 ms per budget check, and to zero file reads
 for anything that is not a monetary change.
 
+**`/healthz` returns 503 when a config reload was refused**, not 200 with a
+status field. The failure it exists to catch is silent: the server runs
+perfectly on its last good policy while the team believes a newly-edited
+limit is in force. 503 is the one code every monitoring tool alerts on by
+default; a status field in the body relies on whoever configures the monitor
+reading it, which is exactly the step that gets skipped. This runs as a
+single PM2 process behind Nginx, not behind a load balancer that would evict
+it, so the 503 costs no availability. The endpoint is unauthenticated and so
+deliberately exposes no customer IDs, emails, or credentials.
+
 **The tier cache is not a security boundary.** Every Google Ads call uses the
 caller's own OAuth token, so someone removed from Google Ads is refused by
 Google immediately, whatever our cached tier says. The TTL only affects which
@@ -330,12 +340,19 @@ role lookup, with every actual read and write still on the user's own token;
 `OverridingTierResolver` keeps the team working in the meantime via a
 deliberate, in-git `users:` entry.
 
-**Human approval is enforced by the client, not the server.** Nothing at the
-protocol level stops Claude calling draft then confirm in one turn. The
-server guarantees the approval is a separate authenticated call, owner-bound,
-expiring, single-use and re-evaluated. A server-side guarantee needs
-out-of-band approval (Slack/email) or a confirmation code the model never
-sees. Decide in Phase 6.
+**Human approval is now enforced by the server, via MCP elicitation.**
+`confirm_and_apply` stops and asks the client to show the preview to a
+person, and applies nothing unless they accept. A client that cannot elicit
+is REFUSED, not waved through - failing open would leave exactly the hole
+this closes. Controlled by `GADS_REQUIRE_HUMAN_CONFIRMATION`, default true.
+
+The elicitation happens AFTER the gate (nobody is asked to approve something
+policy would refuse anyway) and BEFORE the plan is consumed (declining leaves
+the plan open rather than burning it).
+
+Not yet exercised against Claude's own connector UI - if it turns out not to
+support elicitation, writes will refuse rather than misbehave, and the
+setting is the deliberate escape hatch.
 
 **`roles.yaml` is `mode: file` for local development.** `google_ads` needs
 live credentials to resolve any tier at all. The Google Ads resolver is built,
@@ -368,7 +385,8 @@ They must be replaced before `GADS_WRITE_ENABLED` is ever true.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 366 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 375 tests, no network, no credentials
+curl -s localhost:8081/healthz          # 200 ok / 503 degraded, no auth needed
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env and config/*.yaml
 ```

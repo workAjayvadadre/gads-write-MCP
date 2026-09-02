@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 from fastmcp import Client, FastMCP
+from fastmcp.client.elicitation import ElicitResult
 
 from gads_write.ads.executor import MutationResult
 from gads_write.ads.reads import AdGroupSummary, AdsReadError, CampaignSummary
@@ -184,6 +185,7 @@ def linked(tmp_path, write_policy):
         )
         register_confirm_tool(
             mcp, guard=guard, executor=executor, plan_store=plans,
+            settings=settings,
             reader=reader, caller_provider=caller,
         )
         return Harness(
@@ -195,8 +197,14 @@ def linked(tmp_path, write_policy):
     return _build
 
 
+async def _approve(message, response_type, params, context):
+    """Stand in for a person clicking Apply. See test_human_confirmation.py
+    for whether approval is enforced at all."""
+    return ElicitResult(action="accept", content=None)
+
+
 async def _call(mcp, tool, args) -> dict:
-    async with Client(mcp) as client:
+    async with Client(mcp, elicitation_handler=_approve) as client:
         result = await client.call_tool(tool, args)
     return json.loads(result.content[0].text)
 

@@ -56,7 +56,9 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from fastmcp import Context
 from fastmcp.exceptions import ToolError
+from fastmcp.server.elicitation import AcceptedElicitation
 
 from ..ads.executor import Executor, MutationRequest
 from ..ads.reads import AdsReader, AdsReadError
@@ -67,6 +69,46 @@ from .operations import OPERATIONS, ReadKind, read_current
 logger = logging.getLogger(__name__)
 
 
+async def _require_human_approval(ctx: Context, plan: Any) -> None:
+    """Show the preview to a person and refuse unless they accept.
+
+    This is what turns human approval from a client-side habit into a server
+    guarantee. `pause_campaign` and `confirm_and_apply` are two ordinary tool
+    calls, and nothing at the protocol level stopped a model making both in
+    the same turn - so the person could be told "done" having never seen what
+    changed. Elicitation blocks here until the client returns an answer.
+
+    A client that cannot elicit gets refused rather than waved through.
+    Failing open would leave exactly the hole this exists to close, and a
+    connector that cannot show an approval prompt has no business applying
+    changes that spend money.
+    """
+    message = (
+        "Approve this change to your Google Ads account?\n\n"
+        f"{plan.preview}\n\n"
+        "Nothing has been changed yet. This applies only if you accept."
+    )
+
+    try:
+        answer = await ctx.elicit(message, response_type=None)
+    except Exception as exc:  # noqa: BLE001 - any failure to ask is a refusal
+        logger.warning("could not ask for human approval: %s", exc)
+        raise ToolError(
+            "This change needs a person to approve it, and this client cannot "
+            "show an approval prompt. Nothing was changed. Use a client that "
+            "supports MCP elicitation, or have an administrator set "
+            "GADS_REQUIRE_HUMAN_CONFIRMATION=false if that is genuinely "
+            "intended."
+        ) from exc
+
+    if not isinstance(answer, AcceptedElicitation):
+        raise ToolError(
+            "The change was declined by the person asked to approve it. "
+            "Nothing was changed, and the plan is still open if they change "
+            "their mind."
+        )
+
+
 def register_confirm_tool(
     mcp: Any,
     *,
@@ -74,12 +116,13 @@ def register_confirm_tool(
     executor: Executor,
     plan_store: PlanStore,
     reader: AdsReader,
+    settings: Any,
     caller_provider: Callable[[], Any] = current_caller,
 ) -> None:
     """Define confirm_and_apply on `mcp`."""
 
     @mcp.tool
-    async def confirm_and_apply(plan_id: str) -> dict:
+    async def confirm_and_apply(plan_id: str, ctx: Context) -> dict:
         """Apply a previously drafted change. THIS ONE ACTUALLY CHANGES THINGS.
 
         Takes the plan_id returned by a draft tool such as pause_campaign.
@@ -187,7 +230,14 @@ def register_confirm_tool(
                 "Nothing was changed."
             )
 
-        # --- 6. claim it, before anything is applied -------------------
+        # --- 6. ask a person, and stop unless they say yes -------------
+        # Deliberately AFTER the gate, so nobody is asked to approve a change
+        # that policy would refuse anyway, and BEFORE the plan is consumed,
+        # so declining leaves the plan open rather than burning it.
+        if getattr(settings, "require_human_confirmation", True):
+            await _require_human_approval(ctx, plan)
+
+        # --- 7. claim it, before anything is applied -------------------
         try:
             plan = plan_store.consume(plan_id, caller_email=caller.email)
         except PlanError as exc:
