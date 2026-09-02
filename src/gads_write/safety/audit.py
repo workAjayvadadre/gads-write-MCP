@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -174,16 +174,58 @@ def local_date_for(moment: datetime, account_timezone: str) -> str:
     return moment.astimezone(zone).date().isoformat()
 
 
-class AuditLog:
-    """Append-only JSONL writer and reader."""
+# How long audit files are kept before the log deletes them itself.
+#
+# Long enough to answer "who changed this last year", short enough that the
+# disk cannot fill. This is deliberately handled IN the application rather
+# than by logrotate: the daily spend ceiling is derived from these files, so
+# an external rotation rule written by someone who does not know that would
+# silently reset every user's allowance.
+DEFAULT_RETENTION_DAYS = 400
 
-    def __init__(self, path: Path) -> None:
+
+class AuditLog:
+    """Append-only JSONL, partitioned by local date, self-pruning.
+
+    Files are named `<stem>-YYYY-MM-DD<suffix>` beside the configured path,
+    so `logs/audit.jsonl` becomes `logs/audit-2026-08-31.jsonl`. Two reasons:
+
+      The ceiling only ever needs today. Rebuilding a user's daily total
+      means opening one small file instead of parsing every line ever
+      written, which otherwise gets slower every single day.
+
+      Retention becomes a file delete. No parsing, no rewriting, and no
+      chance of truncating the file the ceiling is counting.
+
+    A pre-existing single `audit.jsonl` from before this change is still
+    read, so deploying it does not lose history or hand everyone a fresh
+    daily allowance. It is never written to again and never pruned.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        retention_days: int = DEFAULT_RETENTION_DAYS,
+        clock: Callable[[], datetime] = lambda: datetime.now(dt_timezone.utc),
+    ) -> None:
         self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._directory = self._path.parent
+        self._stem = self._path.stem
+        self._suffix = self._path.suffix or ".jsonl"
+        self._retention_days = max(1, int(retention_days))
+        self._clock = clock
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self._last_written_date: str | None = None
+        self.prune()
 
     @property
     def path(self) -> Path:
+        """The configured base path. Records live in dated files beside it."""
         return self._path
+
+    def file_for(self, local_date: str) -> Path:
+        return self._directory / f"{self._stem}-{local_date}{self._suffix}"
 
     def append(self, record: AuditRecord) -> None:
         """Write one line and flush it.
@@ -193,10 +235,41 @@ class AuditLog:
         is worse than a refused one, because nobody can find it afterwards.
         The caller decides how to surface that.
         """
+        local_date = record.local_date
+        if local_date != self._last_written_date:
+            # The date rolled over (or this is the first write). Cheap moment
+            # to tidy up, and it means pruning needs no scheduler.
+            self.prune()
+            self._last_written_date = local_date
+
         line = record.to_json_line()
-        with self._path.open("a", encoding="utf-8") as handle:
+        with self.file_for(local_date).open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
+
+    def prune(self) -> int:
+        """Delete audit files older than the retention window. Returns the count.
+
+        Called automatically; exposed so it can be tested and so an operator
+        can run it by hand without inventing a procedure.
+        """
+        cutoff = (
+            self._clock().date() - timedelta(days=self._retention_days)
+        ).isoformat()
+        removed = 0
+        for candidate in self._directory.glob(f"{self._stem}-*{self._suffix}"):
+            stamp = candidate.name[len(self._stem) + 1 : -len(self._suffix)]
+            if len(stamp) != 10 or stamp >= cutoff:
+                continue
+            try:
+                candidate.unlink()
+            except OSError:  # pragma: no cover - a locked file is not fatal
+                logger.warning("could not prune audit file %s", candidate)
+                continue
+            removed += 1
+        if removed:
+            logger.info("pruned %d audit file(s) older than %s", removed, cutoff)
+        return removed
 
     def iter_records(self, *, local_date: str | None = None) -> Iterator[dict[str, Any]]:
         """Read records back, optionally filtered to one local date.
@@ -205,10 +278,26 @@ class AuditLog:
         process killed mid-write can leave a truncated final line, and that
         must not stop the daily ceiling from being rebuilt.
         """
-        if not self._path.exists():
-            return
+        for path in self._files_to_read(local_date):
+            yield from self._read_file(path, local_date)
 
-        with self._path.open("r", encoding="utf-8") as handle:
+    def _files_to_read(self, local_date: str | None) -> list[Path]:
+        files: list[Path] = []
+        # The pre-partition file, if this deploy inherited one.
+        if self._path.exists() and self._path.is_file():
+            files.append(self._path)
+        if local_date is None:
+            files.extend(sorted(self._directory.glob(f"{self._stem}-*{self._suffix}")))
+        else:
+            dated = self.file_for(local_date)
+            if dated.exists():
+                files.append(dated)
+        return files
+
+    def _read_file(
+        self, path: Path, local_date: str | None
+    ) -> Iterator[dict[str, Any]]:
+        with path.open("r", encoding="utf-8") as handle:
             for number, line in enumerate(handle, start=1):
                 text = line.strip()
                 if not text:
@@ -216,9 +305,7 @@ class AuditLog:
                 try:
                     record = json.loads(text)
                 except json.JSONDecodeError:
-                    logger.warning(
-                        "skipping malformed audit line %s:%d", self._path, number
-                    )
+                    logger.warning("skipping malformed audit line %s:%d", path, number)
                     continue
                 if local_date is None or record.get("local_date") == local_date:
                     yield record

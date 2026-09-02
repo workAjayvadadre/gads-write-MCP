@@ -202,9 +202,8 @@ async def _call(mcp, tool, args) -> dict:
 
 
 def _audit(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    """Read through the log's own interface, not the file layout."""
+    return list(AuditLog(path).iter_records())
 
 
 # ===========================================================================

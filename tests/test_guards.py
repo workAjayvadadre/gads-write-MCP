@@ -90,6 +90,7 @@ def _guard(
     write_enabled: bool = True,
     raises: bool = False,
     policy_patch: dict | None = None,
+    ledger=None,
 ) -> tuple[Guard, AuditLog, PolicyStore]:
     from gads_write.settings import Settings
 
@@ -115,10 +116,29 @@ def _guard(
         policy_store=store,
         tier_resolver=FakeTierResolver(tier, raises=raises),
         audit_log=audit,
-        spend_ledger=DailySpendLedger(audit),
+        spend_ledger=ledger if ledger is not None else DailySpendLedger(audit),
         now=lambda: NOW,
     )
     return guard, audit, store
+
+
+class CountingLedger:
+    """The real ledger, counting how often the gate consults it.
+
+    `spend_ledger` is a constructor argument of Guard, so this is a stand-in
+    at a declared seam rather than a reach into internals.
+    """
+
+    def __init__(self, inner: DailySpendLedger) -> None:
+        self._inner = inner
+        self.reads = 0
+
+    def total_increase_units(self, **kwargs):
+        self.reads += 1
+        return self._inner.total_increase_units(**kwargs)
+
+    def snapshot(self, **kwargs):
+        return self._inner.snapshot(**kwargs)
 
 
 def _budget_evaluator(current: object, new: object):
@@ -469,6 +489,46 @@ async def test_refusals_are_logged_not_just_successes(tmp_path, write_policy) ->
     assert line["denied_reasons"]
 
 
+async def test_the_spend_ledger_is_not_read_when_no_rule_needs_it(
+    tmp_path, write_policy
+) -> None:
+    """A read must not pay for the daily spend ceiling.
+
+    The ceiling is rebuilt from the audit log, so consulting it on every
+    single gate check made every tool call - including reads, which have no
+    spend to check - slower every day the log grew.
+    """
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    ledger = CountingLedger(DailySpendLedger(audit))
+    guard, _, _ = _guard(tmp_path, write_policy, ledger=ledger)
+
+    decision = await guard.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+
+    assert decision.allowed
+    assert ledger.reads == 0
+
+
+async def test_the_spend_ledger_is_read_when_a_rule_does_need_it(
+    tmp_path, write_policy
+) -> None:
+    """The other half: a budget change still gets its running daily total."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    ledger = CountingLedger(DailySpendLedger(audit))
+    guard, _, _ = _guard(tmp_path, write_policy, ledger=ledger)
+
+    decision = await guard.check(
+        tool="update_campaign_budget",
+        caller=FakeCaller("a@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=_budget_evaluator(100, 110),
+    )
+
+    assert decision.allowed
+    assert ledger.reads == 1
+
+
 async def test_audit_arguments_are_redacted_by_the_gate(tmp_path, write_policy) -> None:
     guard, audit, _ = _guard(tmp_path, write_policy)
     await guard.check(
@@ -477,9 +537,11 @@ async def test_audit_arguments_are_redacted_by_the_gate(tmp_path, write_policy) 
         customer_id=ACCOUNT,
         arguments={"access_token": "ya29.live", "campaign_id": "111"},
     )
-    raw = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
-    assert "ya29.live" not in raw
-    assert json.loads(raw.splitlines()[0])["arguments"]["campaign_id"] == "111"
+    records = _lines(audit)
+    # Re-serialise what was actually persisted: if the token survived
+    # anywhere in the record, it shows up here.
+    assert "ya29.live" not in json.dumps(records)
+    assert records[0]["arguments"]["campaign_id"] == "111"
 
 
 async def test_a_denied_decision_raises_when_asked(tmp_path, write_policy) -> None:

@@ -176,7 +176,11 @@ try:
         policy_store=POLICY_STORE,
         reader=READER,
     )
-    AUDIT_LOG = AuditLog(SETTINGS.audit_log_path)
+    # Prunes itself: no cron, no logrotate, nothing to remember. See
+    # safety/audit.py for why rotation is in-process rather than in ops.
+    AUDIT_LOG = AuditLog(
+        SETTINGS.audit_log_path, retention_days=SETTINGS.audit_retention_days
+    )
     SPEND_LEDGER = DailySpendLedger(AUDIT_LOG)
     PLAN_STORE = PlanStore()
 

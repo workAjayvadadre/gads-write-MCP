@@ -62,6 +62,12 @@ class Settings:
     # 0 disables caching and pays a Google round trip on every call.
     tier_cache_seconds: int = 60
 
+    # How many days of audit files the log keeps before deleting them itself.
+    # Rotation is done in-process on purpose: the daily spend ceiling is
+    # derived from these files, so an external logrotate rule would silently
+    # reset everyone's allowance. See safety/audit.py.
+    audit_retention_days: int = 400
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"
@@ -234,6 +240,19 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         problems.append(str(exc))
         write_enabled = False
 
+    raw_retention = _env("GADS_AUDIT_RETENTION_DAYS", "400") or "400"
+    audit_retention_days = 400
+    try:
+        audit_retention_days = int(raw_retention)
+        if audit_retention_days < 1:
+            raise ValueError
+    except ValueError:
+        problems.append(
+            f"GADS_AUDIT_RETENTION_DAYS must be a whole number of days, at least 1, "
+            f"got {raw_retention!r}. The audit log is the daily spend ceiling's only "
+            "evidence, so it cannot be set to keep nothing."
+        )
+
     policy_path = _resolve(_env("GADS_POLICY_PATH", "config/policy.yaml") or "config/policy.yaml")
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
@@ -262,4 +281,5 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         roles_path=roles_path,
         audit_log_path=audit_log_path,
         tier_cache_seconds=tier_cache_seconds,
+        audit_retention_days=audit_retention_days,
     )
