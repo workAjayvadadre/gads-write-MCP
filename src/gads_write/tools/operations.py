@@ -49,7 +49,7 @@ from ..safety.policy import (
     evaluate_budget_change,
     evaluate_match_type_against_bidding,
 )
-from ..safety.units import MoneyError, coerce_units
+from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
     ValidationResult,
     validate_customer_id,
@@ -82,7 +82,14 @@ class Validate(Protocol):
 
 
 class Recheck(Protocol):
-    """The policy rules. Needs the tier, the account state and the ledger."""
+    """The policy rules. Needs the tier, the account state and the ledger.
+
+    `payload` is what will actually be sent to Google. It is here because a
+    rule has to be able to compare the thing being CHECKED against the thing
+    being CHANGED: policy is evaluated from `current`, but the mutation is
+    addressed to the resource named in the payload, and those two can drift
+    apart between drafting a plan and confirming it.
+    """
 
     def __call__(
         self,
@@ -91,8 +98,23 @@ class Recheck(Protocol):
         tier: Tier,
         arguments: dict[str, Any],
         current: Any,
+        payload: dict[str, Any],
         spend_today: Decimal,
     ) -> PolicyVerdict: ...
+
+
+class SpendDelta(Protocol):
+    """How much this change raises daily spend by, in currency units.
+
+    None means "nothing to charge against the ceiling" - a decrease, or a
+    change that moves no money. Computed from the CURRENT state at both
+    steps, never carried over from the plan: the ceiling is derived from the
+    audit log, so a stale figure written there is a permanent hole in it.
+    """
+
+    def __call__(
+        self, arguments: dict[str, Any], current: Any
+    ) -> Decimal | None: ...
 
 
 @dataclass(frozen=True)
@@ -105,6 +127,8 @@ class OperationChecks:
     reads: ReadKind = ReadKind.NONE
     # Which argument carries the id of the entity named by `reads`.
     id_argument: str = ""
+    # None when the tool cannot raise daily spend.
+    spend_delta: SpendDelta | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -200,12 +224,50 @@ def _units_from(arguments: dict[str, Any], field: str) -> Decimal | None:
         return None
 
 
+def units_from_micros(micros: object) -> Decimal:
+    """Exact micros -> units, with no rounding.
+
+    Deliberately not `safety/units.from_micros`, which quantizes to two
+    decimal places for DISPLAY. A limit comparison has to use the exact
+    value, or a change could round its way under a cap it is actually over.
+    """
+    return Decimal(int(micros or 0)) / Decimal(MICROS_PER_UNIT)
+
+
+def shared_budget_verdict(current: Any) -> PolicyVerdict:
+    """Refuse any budget that is not used by exactly one campaign.
+
+    A budget feeding several campaigns changes all of their spending, while
+    the preview a human approves names one. A misleading preview breaks the
+    entire approval model, which is worth more than the convenience.
+
+    Checked at BOTH steps. A budget that picks up a second campaign between
+    drafting and confirming is precisely what a draft-time-only check misses.
+    """
+    count = int(getattr(current, "budget_reference_count", 0) or 0)
+    if count == 1:
+        return PolicyVerdict.allow()
+    if count > 1:
+        return PolicyVerdict.deny(
+            f"this campaign uses a SHARED budget - {count} campaigns draw on "
+            "it, so changing it would change their spending too, and this "
+            "preview can only describe one campaign. Change it in the Google "
+            "Ads UI, or give this campaign its own budget."
+        )
+    return PolicyVerdict.deny(
+        "Google did not report how many campaigns use this budget, so we "
+        "cannot tell whether changing it would affect campaigns this preview "
+        "does not name. Refusing rather than guessing."
+    )
+
+
 def recheck_budget(
     policy: Policy,
     *,
     tier: Tier,
     arguments: dict[str, Any],
     current: Any,
+    payload: dict[str, Any],
     spend_today: Decimal,
 ) -> PolicyVerdict:
     """Tier limits and the per-user daily ceiling, against the CURRENT budget."""
@@ -220,14 +282,41 @@ def recheck_budget(
             "the campaign's current budget could not be established, so a "
             "percentage limit cannot be applied to this change."
         )
-    current_units = Decimal(current.daily_budget_micros) / Decimal(1_000_000)
+
+    shared = shared_budget_verdict(current)
+    if not shared.allowed:
+        return shared
+
+    # The limits below are evaluated from `current`, but the mutation is
+    # addressed to the resource named in the payload. If the campaign has
+    # been moved onto a different budget since this was drafted, those are
+    # two different resources: we would check one and change the other.
+    target = str(payload.get("budget_resource_name") or "")
+    actual = str(getattr(current, "budget_resource_name", "") or "")
+    if target and actual and target != actual:
+        return PolicyVerdict.deny(
+            "this campaign no longer uses the budget this change was drafted "
+            f"against ({target}); it now uses {actual}. The limits would be "
+            "checked against one budget and the change applied to another, so "
+            "this plan is refused. Draft it again."
+        )
+
     return evaluate_budget_change(
         policy,
         tier=tier,
-        current_units=current_units,
+        current_units=units_from_micros(current.daily_budget_micros),
         new_units=new_units,
         already_increased_today_units=spend_today,
     )
+
+
+def budget_spend_delta(arguments: dict[str, Any], current: Any) -> Decimal | None:
+    """The increase this change makes, or None if it does not raise spend."""
+    new_units = _units_from(arguments, "new_daily_budget")
+    if new_units is None or current is None:
+        return None
+    delta = new_units - units_from_micros(current.daily_budget_micros)
+    return delta if delta > 0 else None
 
 
 def recheck_bid(
@@ -236,6 +325,7 @@ def recheck_bid(
     tier: Tier,
     arguments: dict[str, Any],
     current: Any,
+    payload: dict[str, Any],
     spend_today: Decimal,
 ) -> PolicyVerdict:
     """Max CPC and the percentage cap, against the CURRENT bid."""
@@ -250,9 +340,11 @@ def recheck_bid(
             "the ad group's current bid could not be established, so a "
             "percentage limit cannot be applied to this change."
         )
-    current_units = Decimal(current.cpc_bid_micros) / Decimal(1_000_000)
     return evaluate_bid_change(
-        policy, tier=tier, current_units=current_units, new_units=new_units
+        policy,
+        tier=tier,
+        current_units=units_from_micros(current.cpc_bid_micros),
+        new_units=new_units,
     )
 
 
@@ -262,6 +354,7 @@ def recheck_keyword(
     tier: Tier,
     arguments: dict[str, Any],
     current: Any,
+    payload: dict[str, Any],
     spend_today: Decimal,
 ) -> PolicyVerdict:
     """Broad match under manual CPC is the classic way to burn money.
@@ -298,6 +391,7 @@ OPERATIONS: dict[str, OperationChecks] = {
         recheck=recheck_budget,
         reads=ReadKind.CAMPAIGN,
         id_argument="campaign_id",
+        spend_delta=budget_spend_delta,
     ),
     "add_negative_keyword": OperationChecks(validate=validate_negative_keyword_args),
     "add_keyword": OperationChecks(
@@ -339,6 +433,10 @@ async def read_current(
 
 __all__ = [
     "OPERATIONS",
+    "SpendDelta",
+    "budget_spend_delta",
+    "shared_budget_verdict",
+    "units_from_micros",
     "OperationChecks",
     "ReadKind",
     "Recheck",

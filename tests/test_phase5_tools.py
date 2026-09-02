@@ -75,7 +75,13 @@ class MutableTier:
 class FakeReader:
     def __init__(self) -> None:
         self.budget_micros = 100_000_000          # 100 units
-        self.budget_is_shared = False
+        # How many campaigns use this budget. 1 is the only safe value:
+        # 2+ means changing it affects campaigns the preview does not name,
+        # and 0 means Google did not tell us, which is not the same as safe.
+        self.budget_reference_count = 1
+        # Which budget resource the campaign points at. A campaign can be
+        # moved onto a different budget in the Google Ads UI at any time.
+        self.budget_resource_name = BUDGET_RESOURCE
         self.bidding_strategy = "MANUAL_CPC"
         self.cpc_bid_micros = 50_000_000          # 50 units
         self.campaign_missing = False
@@ -94,9 +100,9 @@ class FakeReader:
             status="ENABLED",
             channel_type="SEARCH",
             daily_budget_micros=self.budget_micros,
-            budget_resource_name=BUDGET_RESOURCE,
+            budget_resource_name=self.budget_resource_name,
             budget_id="777",
-            budget_is_shared=self.budget_is_shared,
+            budget_reference_count=self.budget_reference_count,
             bidding_strategy_type=self.bidding_strategy,
         )
 
@@ -234,7 +240,7 @@ async def test_a_shared_budget_is_refused(linked) -> None:
     """A shared budget affects other campaigns, so a preview naming one
     campaign would be actively misleading."""
     h = linked(Tier.OPERATOR)
-    h.reader.budget_is_shared = True
+    h.reader.budget_reference_count = 3
     with pytest.raises(Exception) as caught:
         await _call(
             h.mcp, "update_campaign_budget",
@@ -242,6 +248,89 @@ async def test_a_shared_budget_is_refused(linked) -> None:
         )
     assert "SHARED budget" in str(caught.value)
     assert h.executor.applied == []
+
+
+@pytest.mark.parametrize("reference_count", [0, 2, 7])
+async def test_a_budget_is_refused_unless_exactly_one_campaign_uses_it(
+    linked, reference_count
+) -> None:
+    """`reference_count` is the fact; `explicitly_shared` was only ever an
+    intention recorded at creation time, and Google defaults it to true.
+
+    Zero refuses too. It means Google did not tell us how many campaigns use
+    this budget, and not knowing is not the same as knowing it is safe.
+    """
+    h = linked(Tier.OPERATOR)
+    h.reader.budget_reference_count = reference_count
+    with pytest.raises(Exception) as caught:
+        await _call(
+            h.mcp, "update_campaign_budget",
+            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+        )
+    assert "SHARED budget" in str(caught.value) or "how many campaigns" in str(caught.value)
+    assert h.executor.applied == []
+
+
+async def test_a_budget_shared_after_drafting_is_refused_at_confirm(linked) -> None:
+    """The preview named one campaign. If the budget picks up a second one
+    before confirm, applying it would change spend on a campaign nobody
+    approved a change to."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+    )
+
+    h.reader.budget_reference_count = 2   # attached to another campaign in the UI
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+    assert "shared" in str(caught.value).lower()
+    assert h.executor.applied == []
+
+
+async def test_a_campaign_repointed_to_another_budget_is_refused_at_confirm(
+    linked,
+) -> None:
+    """Policy is evaluated against the budget the campaign uses NOW, but the
+    mutation is addressed to the budget captured at draft time. If those are
+    different resources, the check and the change are about different things
+    and the plan must not apply."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+    )
+
+    h.reader.budget_resource_name = f"customers/{ACCOUNT}/campaignBudgets/999"
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+    assert "budget" in str(caught.value).lower()
+    assert h.executor.applied == []
+
+
+async def test_the_audit_records_the_increase_that_was_actually_approved(
+    linked,
+) -> None:
+    """The daily ceiling is derived from the audit log, so the number written
+    there has to be the real increase - not the one computed at draft time
+    against a budget that has since moved."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+    )
+    # Drafted as 100 -> 110, an increase of 10. Someone then lowers it to 95,
+    # so confirming the same plan is really an increase of 15.
+    h.reader.budget_micros = 95_000_000
+
+    await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    from decimal import Decimal
+    applied = [line for line in _audit(h.audit_path) if line.get("applied") is True]
+    assert len(applied) == 1
+    assert Decimal(applied[0]["spend_delta_units"]) == Decimal("15")
 
 
 async def test_a_budget_above_the_tier_ceiling_is_refused(linked) -> None:
@@ -648,6 +737,73 @@ async def test_a_bid_plan_is_refused_once_the_max_cpc_is_tightened(linked) -> No
 
     assert "55" in str(caught.value)
     assert h.executor.applied == []
+
+
+async def test_an_operator_cannot_confirm_a_lead_drafted_plan(linked) -> None:
+    """The confirm step checks the tier of the tool that DRAFTED the plan,
+    not its own. Otherwise a lead-only change could be drafted by a lead and
+    applied by an operator, and the tier on every lead tool would be
+    decorative.
+
+    The demotion is lead -> operator on purpose. Every other demotion test
+    drops to readonly, which TierMiddleware refuses before confirm_and_apply
+    ever runs - so none of them reach this check.
+    """
+    h = linked(Tier.LEAD)
+    draft = await _call(
+        h.mcp, "update_ad_group_bid",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 60},
+    )
+
+    h.tiers.tier = Tier.OPERATOR   # demoted in Google Ads between the steps
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    message = str(caught.value).lower()
+    assert "lead" in message and "operator" in message
+    assert h.executor.applied == []
+
+
+async def test_an_operator_cannot_confirm_a_lead_drafted_ad(linked) -> None:
+    """The same property, on a tool whose rules are absolute.
+
+    Deliberately an RSA and not a bid. A bid re-reads the ad group, so it is
+    refused by the earlier authorise step; only a tool with nothing to
+    re-read reaches the main gate, which is where the tier of the drafting
+    tool is actually enforced. Without this test that gate could be changed
+    to check confirm_and_apply's own tier and nothing would notice.
+    """
+    h = linked(Tier.LEAD)
+    draft = await _call(
+        h.mcp, "create_responsive_search_ad",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "headlines": HEADLINES,
+         "descriptions": DESCRIPTIONS, "final_urls": URLS},
+    )
+
+    h.tiers.tier = Tier.OPERATOR   # demoted in Google Ads between the steps
+
+    with pytest.raises(Exception) as caught:
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    message = str(caught.value).lower()
+    assert "lead" in message and "operator" in message
+    assert h.executor.applied == []
+
+
+async def test_an_operator_can_still_confirm_an_operator_tier_plan(linked) -> None:
+    """The control for the test above: operator reaches confirm_and_apply
+    fine, so the refusal there is about the drafting tool's tier and not
+    about being blocked at the door."""
+    h = linked(Tier.OPERATOR)
+    draft = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 110},
+    )
+    applied = await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert applied["applied"] is True
+    assert len(h.executor.applied) == 1
 
 
 async def test_an_operator_cannot_change_bids(linked) -> None:

@@ -55,9 +55,12 @@ from ..safety.units import MoneyError, coerce_units, format_micros, format_units
 from ..safety.validators import ValidationResult
 from .operations import (
     OPERATIONS,
+    budget_spend_delta,
     recheck_bid,
     recheck_budget,
     recheck_keyword,
+    shared_budget_verdict,
+    units_from_micros,
     validate_campaign_status_args,
 )
 
@@ -257,13 +260,18 @@ def register_write_tools(
         return lambda policy: validate(policy, arguments)
 
     def _evaluator(
-        recheck: Any, arguments: dict[str, Any], *, current: Any
+        recheck: Any,
+        arguments: dict[str, Any],
+        *,
+        current: Any,
+        payload: dict[str, Any] | None = None,
     ) -> Callable[[Policy, Any, Decimal], Any]:
         return lambda policy, tier, spend_today: recheck(
             policy,
             tier=tier,
             arguments=arguments,
             current=current,
+            payload=dict(payload or {}),
             spend_today=spend_today,
         )
 
@@ -359,17 +367,14 @@ def register_write_tools(
         caller, _ = await _authorise("update_campaign_budget", customer_id, arguments)
         campaign = await _campaign_or_fail(customer_id, campaign_id)
 
-        if campaign.budget_is_shared:
-            # A shared budget is used by several campaigns, so changing it
-            # would affect all of them while the preview names only one.
-            # A misleading preview breaks the entire approval model, so this
-            # is refused rather than warned about.
+        # Refused here as well as inside the recheck, so whoever is drafting
+        # gets the explanation before a plan_id exists rather than a bare
+        # policy denial. Same function confirm runs, so the two cannot drift.
+        shared = shared_budget_verdict(campaign)
+        if not shared.allowed:
             raise ToolError(
-                f"Campaign {campaign.name!r} uses a SHARED budget "
-                f"({campaign.budget_resource_name}), which other campaigns also "
-                "use. Changing it would affect them too, and this preview can "
-                "only describe one campaign. Change it in the Google Ads UI, or "
-                "give this campaign its own budget. Nothing was changed."
+                f"Campaign {campaign.name!r}: {' '.join(shared.reasons)} "
+                "Nothing was changed."
             )
         if not campaign.budget_resource_name:
             raise ToolError(
@@ -377,16 +382,24 @@ def register_write_tools(
                 "Nothing was changed."
             )
 
-        current_units = Decimal(campaign.daily_budget_micros) / Decimal(1_000_000)
+        current_units = units_from_micros(campaign.daily_budget_micros)
         try:
             new_units = coerce_units(new_daily_budget, field="new_daily_budget")
         except MoneyError as exc:
             raise ToolError(f"{exc}. Nothing was changed.") from exc
 
         delta = new_units - current_units
-        spend_delta = delta if delta > 0 else None
+        # Built BEFORE the gate, because the recheck has to compare the
+        # resource we would change against the one the campaign actually
+        # uses. Confirm rebuilds neither: it re-reads the campaign and runs
+        # the same comparison against the payload stored on the plan.
+        payload = {
+            "budget_resource_name": campaign.budget_resource_name,
+            "amount_micros": int(to_micros(new_units)),
+        }
+        spend_delta = budget_spend_delta(arguments, campaign)
 
-        # The same two functions tools/confirm.py will re-run, against the
+        # The same functions tools/confirm.py will re-run, against the
         # campaign as it is right now. `campaign` is what makes the percentage
         # limits meaningful; confirm re-reads it rather than trusting this one.
         decision = await _decide(
@@ -394,7 +407,9 @@ def register_write_tools(
             customer_id,
             arguments,
             validate=_validator("update_campaign_budget", arguments),
-            evaluate=_evaluator(recheck_budget, arguments, current=campaign),
+            evaluate=_evaluator(
+                recheck_budget, arguments, current=campaign, payload=payload
+            ),
             spend_delta_units=spend_delta,
         )
         policy = decision.policy or policy_store.current()
@@ -426,10 +441,9 @@ def register_write_tools(
                 "campaign_name": campaign.name,
                 "current_budget_micros": campaign.daily_budget_micros,
                 "operation": "update_campaign_budget",
-                "payload": {
-                    "budget_resource_name": campaign.budget_resource_name,
-                    "amount_micros": int(to_micros(new_units)),
-                },
+                # The same object the gate just judged, not a second one built
+                # from the same variables. Two derivations can drift.
+                "payload": payload,
             },
             extra={
                 "campaign_id": campaign.campaign_id,
@@ -638,7 +652,7 @@ def register_write_tools(
         caller, _ = await _authorise("update_ad_group_bid", customer_id, arguments)
         ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
 
-        current_units = Decimal(ad_group.cpc_bid_micros) / Decimal(1_000_000)
+        current_units = units_from_micros(ad_group.cpc_bid_micros)
         try:
             new_units = coerce_units(new_max_cpc, field="new_max_cpc")
         except MoneyError as exc:

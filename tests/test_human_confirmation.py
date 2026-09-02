@@ -66,7 +66,7 @@ class FakeReader:
             campaign_id=campaign_id, name="Brand - Exact", status="ENABLED",
             channel_type="SEARCH", daily_budget_micros=100_000_000,
             budget_resource_name=f"customers/{ACCOUNT}/campaignBudgets/777",
-            budget_id="777", budget_is_shared=False,
+            budget_id="777", budget_reference_count=1,
             bidding_strategy_type="MANUAL_CPC",
         )
 

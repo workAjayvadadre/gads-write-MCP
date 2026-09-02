@@ -162,6 +162,11 @@ def register_confirm_tool(
 
         # A budget increase has to reach the audit log, or the per-user daily
         # ceiling - which is derived from that log - would never accumulate.
+        # The plan's figure is only a fallback: anything whose delta depends
+        # on current state is recomputed below, once that state has been
+        # re-read. Recording the draft-time figure when the two disagree
+        # writes a number nobody approved into the ledger the ceiling is
+        # built from, which is a permanent hole in the ceiling.
         spend_delta = _decimal_or_none(plan.spend_delta_units)
 
         # --- 3 & 4. authorise, then re-read the CURRENT state ----------
@@ -200,6 +205,12 @@ def register_confirm_tool(
                     "Nothing was changed; try again in a moment."
                 ) from exc
 
+        # Recomputed from the state just re-read, so the ledger records the
+        # increase that was actually approved rather than the one the preview
+        # happened to be built from.
+        if checks.spend_delta is not None:
+            spend_delta = checks.spend_delta(plan.arguments, current)
+
         def recheck(policy: Any, tier: Any, spend_today: Decimal) -> Any:
             # Same function the draft ran, with the state as it is NOW.
             return checks.recheck(
@@ -207,6 +218,7 @@ def register_confirm_tool(
                 tier=tier,
                 arguments=plan.arguments,
                 current=current,
+                payload=dict(payload),
                 spend_today=spend_today,
             )
 

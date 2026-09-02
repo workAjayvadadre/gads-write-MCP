@@ -168,11 +168,18 @@ class CampaignSummary:
     # a budget means mutating CampaignBudget, not Campaign.
     budget_resource_name: str = ""
     budget_id: str = ""
-    # True when this budget is shared by more than one campaign. Changing a
-    # shared budget affects every campaign using it, which would make a
-    # preview naming one campaign actively misleading. tools/writes.py
-    # refuses these.
-    budget_is_shared: bool = False
+    # How many campaigns are actively using this budget. Anything but 1 is
+    # refused: 2 or more means a change would affect campaigns the preview
+    # does not name, and 0 means Google did not report a count, which is not
+    # the same as knowing the budget is unshared.
+    #
+    # This is deliberately NOT campaign_budget.explicitly_shared. That field
+    # records what someone INTENDED when the budget was created - Google's
+    # own definition says it "defaults to true if unspecified in a create
+    # operation" - so it is true for most budgets made through the API and
+    # can be false on a budget three campaigns are drawing from today.
+    # reference_count is the fact.
+    budget_reference_count: int = 0
     # Needed for rules.block_broad_match_with_manual_cpc.
     bidding_strategy_type: str = ""
 
@@ -439,7 +446,7 @@ class GoogleAdsReader(AdsReader):
             "SELECT campaign.id, campaign.name, campaign.status, "
             "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
             "campaign_budget.resource_name, campaign_budget.id, "
-            "campaign_budget.amount_micros, campaign_budget.explicitly_shared "
+            "campaign_budget.amount_micros, campaign_budget.reference_count "
             "FROM campaign "
             f"WHERE campaign.id = {safe_campaign} "
             "LIMIT 1"
@@ -457,7 +464,7 @@ class GoogleAdsReader(AdsReader):
             daily_budget_micros=int(row.campaign_budget.amount_micros or 0),
             budget_resource_name=row.campaign_budget.resource_name or "",
             budget_id=str(row.campaign_budget.id or ""),
-            budget_is_shared=bool(row.campaign_budget.explicitly_shared),
+            budget_reference_count=int(row.campaign_budget.reference_count or 0),
             bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
         )
 
