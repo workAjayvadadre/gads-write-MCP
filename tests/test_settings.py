@@ -168,6 +168,20 @@ def test_invalid_policy_yaml_is_rejected(env, tmp_path: Path) -> None:
         _load(tmp_path)
 
 
+def test_a_mis_shaped_policy_block_is_rejected_at_boot(
+    env, tmp_path: Path, write_policy
+) -> None:
+    """Valid YAML, wrong shape. Boot must refuse with the same readable
+    message as any other bad config, not a raw traceback."""
+    env.setenv(
+        "GADS_POLICY_PATH",
+        str(write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})),
+    )
+    with pytest.raises(ConfigError) as caught:
+        _load(tmp_path)
+    assert "budget" in str(caught.value)
+
+
 def test_roles_in_file_mode_without_a_lead_is_rejected(
     env, tmp_path: Path, write_roles
 ) -> None:

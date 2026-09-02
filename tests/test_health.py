@@ -97,6 +97,38 @@ async def test_healthz_reports_a_refused_config_reload(
     assert body["policy_reload_error"]
 
 
+async def test_healthz_reports_a_mis_shaped_config_edit(
+    tmp_path, write_policy, write_roles
+) -> None:
+    """The quietest version of the failure this endpoint exists for.
+
+    A `budget:` block left empty is valid YAML, so the edit looks fine to
+    whoever saved it. It used to raise a TypeError past PolicyStore's safety
+    net: every tool call 500ed, last_error stayed unset, and this endpoint
+    went on answering 200 ok. Alive-but-broken must read as degraded.
+    """
+    policy_path = write_policy()
+    roles_path = write_roles()
+    policy_store = PolicyStore(policy_path)
+    role_store = RoleStore(roles_path)
+    assert policy_store.current() is not None
+
+    write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})
+    policy_store.current()
+
+    mcp = FastMCP(name="test")
+    register_health_route(
+        mcp,
+        settings=_settings(tmp_path, policy_path, roles_path),
+        policy_store=policy_store,
+        role_store=role_store,
+    )
+    response = await _get(mcp, "/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
+
+
 async def test_healthz_leaks_nothing_sensitive(
     tmp_path, write_policy, write_roles
 ) -> None:

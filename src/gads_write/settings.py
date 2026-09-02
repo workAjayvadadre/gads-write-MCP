@@ -128,17 +128,21 @@ def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
     boot-time checks and runtime checks can never drift apart. Imports are
     local to this function to keep module import order simple.
     """
-    from .auth.roles import RoleConfigError, RoleTable
-    from .safety.policy import PolicyError, load_policy_file
+    from .auth.roles import RoleTable
+    from .safety.policy import load_policy_file
 
     problems: list[str] = []
 
+    # Both blocks catch Exception rather than the parsers' own error types.
+    # A config file that breaks in a shape the parser did not anticipate
+    # must still be reported as a configuration problem, in the same
+    # readable list as every other one - not as a raw traceback at boot.
     if not policy_path.is_file():
         problems.append(f"policy file not found at {policy_path}")
     else:
         try:
             load_policy_file(policy_path)
-        except PolicyError as exc:
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             problems.append(str(exc))
 
     if not roles_path.is_file():
@@ -146,7 +150,7 @@ def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
     else:
         try:
             RoleTable.load(roles_path)
-        except RoleConfigError as exc:
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             problems.append(str(exc))
 
     return problems
