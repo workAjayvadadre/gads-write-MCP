@@ -13,7 +13,7 @@ no tool touches a Google Ads service object. A tool that grew its own logic
 would be a tool that could grow its own bypass.
 
 These are reads, so nothing here can spend money - but they still go through
-the full gate. That is on purpose. The account allowlist has to hold for
+the full gate. That is on purpose. The managed-account check has to hold for
 reads too, or this becomes a way to read any Google Ads account the caller
 happens to have on their personal login, through our developer token and our
 audit log. And every read is audited, which is what lets you answer "who
@@ -41,6 +41,7 @@ from fastmcp.exceptions import ToolError
 from ..ads.reads import AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..auth.tiers import Tier
+from ..safety.accounts import AccountLookupError, ManagedAccountStore
 from ..safety.audit import local_date_for
 from ..safety.policy import Policy, PolicyStore
 from ..safety.units import format_micros
@@ -56,7 +57,7 @@ from ..safety.validators import (
 logger = logging.getLogger(__name__)
 
 # How many accounts list_accounts will describe in one call. There is no
-# silent truncation: if the allowlist is longer than this, the response says
+# silent truncation: if the manager holds more than this, the response says
 # so explicitly.
 MAX_ACCOUNTS_LISTED = 50
 
@@ -91,6 +92,7 @@ def register_read_tools(
     guard: Any,
     reader: AdsReader,
     policy_store: PolicyStore,
+    managed_accounts: ManagedAccountStore,
     caller_provider: Callable[[], Any] = current_caller,
 ) -> None:
     """Define the read tools on `mcp`, closed over their dependencies."""
@@ -129,16 +131,28 @@ def register_read_tools(
     async def list_accounts() -> dict:
         """List the Google Ads accounts you may work with, and your access on each.
 
-        Shows only accounts on this server's allowlist, never everything your
-        Google login can reach. Start here to find the customer_id that the
-        other tools need.
+        Shows only accounts under this server's manager account, never
+        everything your Google login can reach. Start here to find the
+        customer_id that the other tools need.
         """
         decision = await _gate(tool="list_accounts", customer_id=None, arguments={})
-        policy = policy_store.current()
 
-        allowlist = sorted(policy.allowed_customer_ids)
-        shown = allowlist[:MAX_ACCOUNTS_LISTED]
-        omitted = len(allowlist) - len(shown)
+        # The canonical list comes from the manager account, not a config
+        # file. `account_summary` is still called per account below because
+        # that runs on the CALLER's credential: the MCC listing says what
+        # this server manages, the per-account read says what this person can
+        # actually reach.
+        try:
+            managed = await managed_accounts.all()
+        except AccountLookupError as exc:
+            raise ToolError(
+                f"could not list the accounts this server manages: {exc}. "
+                "Nothing was changed."
+            ) from exc
+
+        all_ids = [account.customer_id for account in managed]
+        shown = all_ids[:MAX_ACCOUNTS_LISTED]
+        omitted = len(all_ids) - len(shown)
 
         accounts: list[dict] = []
         for customer_id in shown:
@@ -179,7 +193,7 @@ def register_read_tools(
         if omitted > 0:
             # No silent caps. If we did not show everything, say so.
             result["note"] = (
-                f"{omitted} further allowlisted account(s) were not listed; "
+                f"{omitted} further managed account(s) were not listed; "
                 f"this tool describes at most {MAX_ACCOUNTS_LISTED} per call."
             )
         return result
@@ -222,7 +236,7 @@ def register_read_tools(
             result.extend(validate_row_limit(limit, maximum=MAX_REPORT_ROWS))
             return result
 
-        await _gate(
+        decision = await _gate(
             tool="get_campaign_performance",
             customer_id=str(customer_id).strip(),
             arguments=arguments,
@@ -236,7 +250,10 @@ def register_read_tools(
             limit=limit,
         )
 
-        currency = policy.currency_code
+        # From the gate's decision, not `policy_store.current()`: the gate
+        # stamped the ACCOUNT's own currency onto its snapshot, and this
+        # report may well be for an account in a different one.
+        currency = decision.policy.currency_code
         return {
             "ok": True,
             "customer_id": str(customer_id).strip(),
@@ -305,7 +322,7 @@ def register_read_tools(
                 )
             return result
 
-        await _gate(
+        decision = await _gate(
             tool="get_search_terms",
             customer_id=str(customer_id).strip(),
             arguments=arguments,
@@ -320,7 +337,7 @@ def register_read_tools(
             campaign_id=None if campaign_id is None else str(campaign_id).strip(),
         )
 
-        currency = policy.currency_code
+        currency = decision.policy.currency_code
         return {
             "ok": True,
             "customer_id": str(customer_id).strip(),

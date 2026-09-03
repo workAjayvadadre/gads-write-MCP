@@ -201,7 +201,7 @@ def register_write_tools(
     # know the CURRENT value, and we must not read an account before the gate
     # has authorised it. So these tools gate twice:
     #
-    #   1. authorise  tier, kill switch, account allowlist, argument shape.
+    #   1. authorise  tier, kill switch, managed account, argument shape.
     #                 Marked dry_run so the audit line reads as "looked",
     #                 not "changed".
     #   2. decide     the same chain again, now with the numbers, running
@@ -209,7 +209,7 @@ def register_write_tools(
     #
     # Two audit lines per draft is deliberate. They record two genuinely
     # different checkpoints, and the alternative - reading the account before
-    # the allowlist has been checked - is the thing the allowlist exists to
+    # the account has been checked - is the thing that check exists to
     # prevent.
 
     async def _authorise(

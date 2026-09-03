@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 import yaml
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
@@ -175,6 +177,7 @@ def linked(tmp_path, write_policy):
         guard = Guard(
             settings=settings, policy_store=policy_store, tier_resolver=tiers,
             audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=FakeManagedAccounts(),
         )
         caller = CallerBox()
         reader = FakeReader()
@@ -933,7 +936,8 @@ async def test_the_kill_switch_hides_every_phase5_tool(tmp_path, write_policy) -
     audit_log = AuditLog(settings.audit_log_path)
     tiers = MutableTier(Tier.LEAD)
     guard = Guard(settings=settings, policy_store=policy_store, tier_resolver=tiers,
-                  audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log))
+                  audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
+                  managed_accounts=FakeManagedAccounts())
     caller = CallerBox()
     mcp = FastMCP(name="test")
     mcp.add_middleware(

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 
 from gads_write.ads.reads import AccountSummary, AdsReadError, CampaignRow, SearchTermRow
@@ -129,7 +131,13 @@ def _settings(tmp_path: Path, policy_path: Path) -> Settings:
 def harness(tmp_path, write_policy):
     """A real server with fake Google and a fixed tier."""
 
-    def _build(tier: Tier = Tier.READONLY, *, reader: FakeReader | None = None):
+    def _build(
+        tier: Tier = Tier.READONLY,
+        *,
+        reader: FakeReader | None = None,
+        accounts: FakeManagedAccounts | None = None,
+    ):
+        accounts = accounts or FakeManagedAccounts()
         policy_path = write_policy()
         settings = _settings(tmp_path, policy_path)
         policy_store = PolicyStore(policy_path)
@@ -141,6 +149,7 @@ def harness(tmp_path, write_policy):
             tier_resolver=resolver,
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=accounts,
         )
 
         ads_reader = reader or FakeReader()
@@ -157,6 +166,7 @@ def harness(tmp_path, write_policy):
             guard=guard,
             reader=ads_reader,
             policy_store=policy_store,
+            managed_accounts=accounts,
             caller_provider=FakeCaller,
         )
         return mcp, ads_reader, settings.audit_log_path

@@ -88,14 +88,18 @@ class Rules:
 @dataclass(frozen=True)
 class Policy:
     version: int
-    allowed_customer_ids: frozenset[str]
-    currency_code: str
-    timezone: str
     rules: Rules
     blocked_operations: frozenset[str]
     plan_ttl_seconds: int
     plan_single_use: bool
     _limits_by_tier: dict[str, TierLimits]
+    # Not configured. Both are properties of the ACCOUNT being changed, and
+    # the guard stamps them on per request via `for_account`. The defaults
+    # below apply only to decisions that name no account at all - a refusal
+    # at the kill switch, say - where no money is in play and the values are
+    # never used for a comparison.
+    currency_code: str = ""
+    timezone: str = "UTC"
 
     def limits_for(self, tier: Tier) -> TierLimits:
         """Limits for a tier, with defaults already merged in."""
@@ -104,8 +108,20 @@ class Policy:
         except KeyError as exc:  # pragma: no cover - guarded at load time
             raise PolicyError(f"no limits configured for tier {tier.value!r}") from exc
 
-    def allows_customer(self, customer_id: str) -> bool:
-        return str(customer_id).strip() in self.allowed_customer_ids
+    def for_account(self, *, currency_code: str, timezone: str) -> "Policy":
+        """This policy, stamped with one account's currency and timezone.
+
+        The seam that let `currency_code` and `timezone` leave policy.yaml.
+        Every downstream evaluator already reads them off the snapshot, so
+        rebinding them here means no evaluator signature had to change - and
+        an account in a different currency can no longer be compared against
+        a limit expressed in someone else's.
+        """
+        return replace(
+            self,
+            currency_code=(currency_code or "").strip() or self.currency_code,
+            timezone=(timezone or "").strip() or self.timezone,
+        )
 
     def blocks_operation(self, operation: str) -> bool:
         return str(operation).strip() in self.blocked_operations
@@ -216,22 +232,6 @@ def parse_policy(raw: Any, *, source: str = "policy") -> Policy:
             f"{SUPPORTED_VERSION}. Refusing to guess at the structure."
         )
 
-    customer_ids = _require(raw, "allowed_customer_ids", source)
-    if not isinstance(customer_ids, list) or not customer_ids:
-        raise PolicyError(
-            f"{source}.allowed_customer_ids: must be a non-empty list. "
-            "There is no wildcard."
-        )
-    normalised_ids: set[str] = set()
-    for entry in customer_ids:
-        text = str(entry).strip()
-        if not text.isdigit() or len(text) != 10:
-            raise PolicyError(
-                f"{source}.allowed_customer_ids: {entry!r} is not a 10-digit "
-                "customer ID (digits only, no dashes)"
-            )
-        normalised_ids.add(text)
-
     limits_raw = _require(raw, "limits", source)
     defaults_raw = _require(limits_raw, "defaults", f"{source}.limits")
     if not isinstance(defaults_raw, dict):
@@ -310,9 +310,6 @@ def parse_policy(raw: Any, *, source: str = "policy") -> Policy:
 
     return Policy(
         version=int(version),
-        allowed_customer_ids=frozenset(normalised_ids),
-        currency_code=str(_require(raw, "currency_code", source)).strip(),
-        timezone=str(raw.get("timezone", "UTC")).strip() or "UTC",
         rules=rules,
         blocked_operations=frozenset(str(op).strip() for op in blocked),
         plan_ttl_seconds=ttl_seconds,
@@ -384,7 +381,7 @@ class PolicyStore:
                 # say - for the exception to reach a live request while
                 # last_error stays empty and /healthz reports a healthy
                 # server. The rule is about the OUTCOME, not the exception
-                # type: whatever goes wrong, keep serving the last good
+                # class: whatever goes wrong, keep serving the last good
                 # policy and make the failure visible.
                 self._last_error = str(exc)
                 self._stamp = stamp  # avoid re-parsing the same broken file
@@ -560,15 +557,6 @@ def evaluate_bid_change(
                 )
 
     return PolicyVerdict.deny(*reasons) if reasons else PolicyVerdict.allow()
-
-
-def evaluate_customer(policy: Policy, customer_id: str) -> PolicyVerdict:
-    if not policy.allows_customer(customer_id):
-        return PolicyVerdict.deny(
-            f"account {customer_id} is not on the allowlist in policy.yaml. "
-            "There is no wildcard; add it deliberately if it belongs."
-        )
-    return PolicyVerdict.allow()
 
 
 def evaluate_operation(policy: Policy, operation: str) -> PolicyVerdict:

@@ -60,6 +60,15 @@ class FakeReader:
 
 
 MCC = "9999999999"
+def _managed(ids):
+    """The managed-account set, as the async callable the resolver expects."""
+
+    async def _get() -> frozenset[str]:
+        return frozenset(ids)
+
+    return _get
+
+
 ACCOUNT = "1111111111"
 OTHER = "2222222222"
 
@@ -73,7 +82,7 @@ def _resolver(
     return GoogleAdsTierResolver(
         reader=reader,
         login_customer_id=MCC,
-        allowed_customer_ids=lambda: frozenset(allowed or {ACCOUNT}),
+        managed_customer_ids=_managed(allowed or {ACCOUNT}),
         cache=TierCache(ttl),
     )
 
@@ -252,7 +261,7 @@ async def test_a_cached_tier_avoids_a_second_lookup() -> None:
     resolver = GoogleAdsTierResolver(
         reader=reader,
         login_customer_id=MCC,
-        allowed_customer_ids=lambda: frozenset({ACCOUNT}),
+        managed_customer_ids=_managed({ACCOUNT}),
         cache=TierCache(60, clock=clock),
     )
 
@@ -271,7 +280,7 @@ async def test_a_demotion_lands_once_the_ttl_expires() -> None:
     resolver = GoogleAdsTierResolver(
         reader=reader,
         login_customer_id=MCC,
-        allowed_customer_ids=lambda: frozenset({ACCOUNT}),
+        managed_customer_ids=_managed({ACCOUNT}),
         cache=TierCache(60, clock=clock),
     )
 
@@ -301,7 +310,7 @@ async def test_an_outage_is_never_cached() -> None:
     resolver = GoogleAdsTierResolver(
         reader=reader,
         login_customer_id=MCC,
-        allowed_customer_ids=lambda: frozenset({ACCOUNT}),
+        managed_customer_ids=_managed({ACCOUNT}),
         cache=TierCache(60, clock=clock),
     )
 

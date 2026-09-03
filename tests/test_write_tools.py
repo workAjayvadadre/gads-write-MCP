@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 import yaml
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
@@ -165,6 +167,7 @@ def harness(tmp_path, write_policy):
             tier_resolver=tiers,
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=FakeManagedAccounts(),
         )
         clock = StepClock()
         plan_store = PlanStore(clock=clock)

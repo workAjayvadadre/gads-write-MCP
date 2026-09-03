@@ -10,24 +10,6 @@
 version: 2
 
 # ---------------------------------------------------------------------
-# Which accounts this server may touch at all.
-# There is no wildcard. An account not listed here cannot be read or
-# written, regardless of what the caller's Google permissions allow.
-# Digits only, no dashes.
-# ---------------------------------------------------------------------
-allowed_customer_ids:
-  - "0000000000"   # PLACEHOLDER: replace with the real test account before
-                   # GADS_WRITE_ENABLED is ever set to true. Nothing can be
-                   # read or written until this is a real ID.
-
-currency_code: "INR"
-
-# Timezone used to decide when "today" rolls over for the per-user daily
-# spend ceiling. Should match the timezone configured on the Ads accounts,
-# otherwise the cap resets at the wrong hour.
-timezone: "Asia/Kolkata"
-
-# ---------------------------------------------------------------------
 # Limits. All amounts are in whole currency units (rupees), NOT micros.
 #
 # The rule these encode: NOTHING GOES ABOVE 50, NOTHING BELOW 10.

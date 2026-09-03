@@ -61,7 +61,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..ads.reads import AdsReader, AdsReadError
@@ -190,12 +190,15 @@ class GoogleAdsTierResolver(TierResolver):
         *,
         reader: AdsReader,
         login_customer_id: str,
-        allowed_customer_ids: Callable[[], frozenset[str]],
+        managed_customer_ids: Callable[[], Awaitable[frozenset[str]]],
         cache: TierCache | None = None,
     ) -> None:
         self._reader = reader
         self._login_customer_id = login_customer_id
-        self._allowed_customer_ids = allowed_customer_ids
+        # Async because the managed set is now derived from the manager
+        # account rather than read out of a config file. See
+        # safety/accounts.py.
+        self._managed_customer_ids = managed_customer_ids
         self._cache = cache or TierCache(0)
 
     # -- interface --------------------------------------------------------
@@ -217,10 +220,10 @@ class GoogleAdsTierResolver(TierResolver):
     async def visible_tier(self, caller) -> Tier:  # noqa: ANN001
         """Highest tier this caller holds on any account WE MANAGE.
 
-        The allowlist intersection is a real security control, not tidiness.
-        Someone may be ADMIN on a personal Google Ads account that has
-        nothing to do with this company; without the intersection that would
-        light up every `lead` tool in their menu.
+        Intersecting with the managed set is a real security control, not
+        tidiness. Someone may be ADMIN on a personal Google Ads account that
+        has nothing to do with this company; without the intersection that
+        would light up every `lead` tool in their menu.
         """
         email = (getattr(caller, "email", "") or "").strip().lower()
         if not email:
@@ -230,10 +233,10 @@ class GoogleAdsTierResolver(TierResolver):
         if cached is not None:
             return cached
 
-        accounts = sorted(self._allowed_customer_ids())
+        accounts = sorted(await self._managed_customer_ids())
         if not accounts:
-            # No managed accounts configured. Nobody can do anything, which
-            # is the correct reading of an empty allowlist.
+            # A readable but empty manager account. Nobody can do anything,
+            # which is the correct reading of "we manage nothing".
             return Tier.NONE
 
         found: list[Tier] = []
@@ -324,7 +327,7 @@ class OverridingTierResolver(TierResolver):
     an API call fails.
 
     An override can only be *consulted*; it is still subject to every other
-    check in the gate, including the account allowlist and the kill switch.
+    check in the gate, including the managed-account check and the kill switch.
     """
 
     def __init__(self, *, overrides: RoleStore, primary: TierResolver) -> None:

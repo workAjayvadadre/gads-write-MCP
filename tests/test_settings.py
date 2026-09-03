@@ -154,12 +154,6 @@ def test_missing_policy_file_fails_at_boot(env, tmp_path: Path) -> None:
         _load(tmp_path)
 
 
-def test_empty_customer_allowlist_is_rejected(env, tmp_path: Path, write_policy) -> None:
-    env.setenv("GADS_POLICY_PATH", str(write_policy({"allowed_customer_ids": []})))
-    with pytest.raises(ConfigError, match="no wildcard"):
-        _load(tmp_path)
-
-
 def test_invalid_policy_yaml_is_rejected(env, tmp_path: Path) -> None:
     broken = tmp_path / "broken.yaml"
     broken.write_text("not: valid: yaml: [\n", encoding="utf-8")

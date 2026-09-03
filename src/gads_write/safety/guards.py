@@ -9,7 +9,7 @@ The order is deliberate, cheapest and most absolute first:
   1  kill switch        an if on a boolean already in memory
   2  identity           who is asking, per Google, not per arguments
   3  tier               what they may do TO THIS ACCOUNT
-  4  account allowlist  refuse unmanaged accounts before inspecting anything
+  4  managed account    refuse accounts outside our MCC before inspecting them
   5  blocked operation  irreversible operations, refused outright
   6  field validation   shape of the input
   7  policy limits      per-tier caps on the actual numbers
@@ -20,9 +20,10 @@ Why that order and not another:
   - The kill switch reads a boolean. There is no reason to resolve a tier or
     touch an API to discover the server is switched off.
   - Identity precedes tier because tier resolution needs an email.
-  - The allowlist precedes validation so that a request naming an account we
-    do not manage never has its contents inspected, expanded into an API
-    call, or written to the audit log in detail.
+  - The managed-account check precedes validation so that a request naming
+    an account we do not manage never has its contents inspected, expanded
+    into an API call, or written to the audit log in detail. It also yields
+    the account's currency and timezone, which every money check below needs.
   - The daily ceiling is last because it is the only check that reads a
     file. Everything cheaper has already had its chance to refuse.
 
@@ -52,8 +53,9 @@ from ..auth.identity import AuthError
 from ..auth.tiers import Tier, TierLookupError, TierResolver, tier_at_least
 from ..settings import Settings
 from ..tools.registry import ToolSpec, is_registered, spec_for
+from .accounts import AccountLookupError, ManagedAccountStore
 from .audit import AuditLog, AuditRecord, local_date_for
-from .policy import Policy, PolicyStore, PolicyVerdict, evaluate_customer, evaluate_operation
+from .policy import Policy, PolicyStore, PolicyVerdict, evaluate_operation
 from .spend import DailySpendLedger
 from .validators import ValidationResult
 
@@ -113,6 +115,7 @@ class Guard:
         tier_resolver: TierResolver,
         audit_log: AuditLog,
         spend_ledger: DailySpendLedger,
+        managed_accounts: ManagedAccountStore,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._settings = settings
@@ -120,6 +123,7 @@ class Guard:
         self._tiers = tier_resolver
         self._audit = audit_log
         self._spend = spend_ledger
+        self._accounts = managed_accounts
         self._now = now
 
     async def check(
@@ -223,11 +227,13 @@ class Guard:
 
         # Everything past this point knows the real tier, so rebuild `deny`
         # to carry it into the audit line.
-        def deny_with_tier(check: str, *reasons: str) -> GuardDecision:
+        def deny_with_tier_verdict(
+            check: str, *reasons: str, verdict: str
+        ) -> GuardDecision:
             decision = GuardDecision(
                 allowed=False,
                 tool=tool,
-                verdict=VERDICT_DENIED,
+                verdict=verdict,
                 tier=tier,
                 caller_email=email,
                 customer_id=customer_id,
@@ -240,11 +246,49 @@ class Guard:
             self._write_audit(decision, arguments, plan_id, dry_run, moment, policy)
             return decision
 
-        # --- 4. account allowlist --------------------------------------------
+        def deny_with_tier(check: str, *reasons: str) -> GuardDecision:
+            return deny_with_tier_verdict(check, *reasons, verdict=VERDICT_DENIED)
+
+        # --- 4. is this account ours? ----------------------------------------
+        # Derived from the manager account, not a hand-written list, so a new
+        # sub-account works the moment it is linked in Google Ads. See
+        # safety/accounts.py for why the set is the MCC's subtree and not
+        # "anything the caller can reach".
+        #
+        # The lookup also returns the account's currency and timezone, which
+        # is why it is one call and not two: every check below this line
+        # needs them, and reading them off the account rather than a config
+        # file is what stops a limit being compared against the wrong unit.
         if customer_id is not None:
-            verdict = evaluate_customer(policy, customer_id)
-            if not verdict.allowed:
-                return deny_with_tier("account_allowlist", *verdict.reasons)
+            try:
+                account = await self._accounts.get(customer_id)
+            except AccountLookupError as exc:
+                # Not the same as "not ours", and must never be recorded as
+                # one. Same distinction as a failed tier lookup above.
+                return deny_with_tier_verdict(
+                    "managed_account_lookup",
+                    f"could not determine whether account {customer_id} is "
+                    f"managed by this server: {exc}. Nothing was changed. "
+                    "Try again in a moment.",
+                    verdict=VERDICT_LOOKUP_FAILED,
+                )
+
+            if account is None:
+                return deny_with_tier(
+                    "managed_account",
+                    f"account {customer_id} is not under this server's manager "
+                    "account, so it cannot be read or changed here. Link it in "
+                    "Google Ads if it belongs.",
+                )
+
+            # Rebinding these two is what carries the account's own currency
+            # and timezone into every check and every audit line below. Both
+            # closures read them from this scope, so nothing else has to be
+            # rebuilt.
+            policy = policy.for_account(
+                currency_code=account.currency_code, timezone=account.timezone
+            )
+            local_date = local_date_for(moment, policy.timezone)
 
         # --- 5. blocked operation --------------------------------------------
         if spec.operation:

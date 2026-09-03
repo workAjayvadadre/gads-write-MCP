@@ -12,9 +12,6 @@ import yaml
 
 BASE_POLICY: dict = {
     "version": 2,
-    "allowed_customer_ids": ["1234567890"],
-    "currency_code": "INR",
-    "timezone": "Asia/Kolkata",
     "limits": {
         "defaults": {
             "budget": {
@@ -113,3 +110,66 @@ class FakeClock:
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+# ---------------------------------------------------------------------------
+# managed accounts
+# ---------------------------------------------------------------------------
+# The set of accounts under the MCC used to be `allowed_customer_ids` in
+# policy.yaml. It is now derived from Google, so tests inject this stand-in
+# at the same seam the server injects ManagedAccountStore.
+
+DEFAULT_TEST_ACCOUNTS: dict = {"1234567890": ("INR", "Asia/Kolkata")}
+
+
+class FakeManagedAccounts:
+    """Mirrors ManagedAccountStore: None means "not ours", raising means
+    "we could not find out"."""
+
+    def __init__(self, accounts: dict | None = None, *, raises: bool = False) -> None:
+        self._accounts = (
+            DEFAULT_TEST_ACCOUNTS if accounts is None else dict(accounts)
+        )
+        self._raises = raises
+        self.calls = 0
+
+    async def get(self, customer_id: str):
+        from gads_write.safety.accounts import AccountLookupError, ManagedAccount
+
+        self.calls += 1
+        if self._raises:
+            raise AccountLookupError("Google Ads API timed out")
+        entry = self._accounts.get(str(customer_id).strip())
+        if entry is None:
+            return None
+        currency, tz = entry
+        return ManagedAccount(
+            customer_id=str(customer_id).strip(),
+            currency_code=currency,
+            timezone=tz,
+            descriptive_name=f"Account {customer_id}",
+            is_manager=False,
+        )
+
+    async def all(self):
+        from gads_write.safety.accounts import ManagedAccount
+
+        if self._raises:
+            from gads_write.safety.accounts import AccountLookupError
+
+            raise AccountLookupError("Google Ads API timed out")
+        return tuple(
+            ManagedAccount(
+                customer_id=cid,
+                currency_code=cur,
+                timezone=tz,
+                descriptive_name=f"Account {cid}",
+                is_manager=False,
+            )
+            for cid, (cur, tz) in sorted(self._accounts.items())
+        )
+
+
+@pytest.fixture
+def managed_accounts() -> FakeManagedAccounts:
+    return FakeManagedAccounts()

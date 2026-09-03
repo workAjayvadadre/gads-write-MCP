@@ -19,6 +19,7 @@ from gads_write.safety.guards import (
     Guard,
     GuardDenied,
 )
+from gads_write.safety.accounts import AccountLookupError, ManagedAccount
 from gads_write.safety.policy import PolicyStore, evaluate_budget_change
 from gads_write.safety.spend import DailySpendLedger
 from gads_write.safety.validators import ValidationResult
@@ -63,6 +64,49 @@ class FakeTierResolver:
         return "fake"
 
 
+class FakeAccounts:
+    """The managed-account set, without Google.
+
+    Mirrors ManagedAccountStore: `None` means "not ours", an exception means
+    "we could not find out".
+    """
+
+    def __init__(self, accounts=None, *, raises: bool = False) -> None:
+        if accounts is None:
+            accounts = {ACCOUNT: ("INR", "Asia/Kolkata")}
+        self._accounts = accounts
+        self._raises = raises
+        self.calls = 0
+
+    async def get(self, customer_id: str):
+        self.calls += 1
+        if self._raises:
+            raise AccountLookupError("Google Ads API timed out")
+        entry = self._accounts.get(str(customer_id).strip())
+        if entry is None:
+            return None
+        currency, tz = entry
+        return ManagedAccount(
+            customer_id=str(customer_id).strip(),
+            currency_code=currency,
+            timezone=tz,
+            descriptive_name="Test Account",
+            is_manager=False,
+        )
+
+    async def all(self):
+        return tuple(
+            ManagedAccount(
+                customer_id=cid,
+                currency_code=cur,
+                timezone=tz,
+                descriptive_name="Test Account",
+                is_manager=False,
+            )
+            for cid, (cur, tz) in sorted(self._accounts.items())
+        )
+
+
 @pytest.fixture(autouse=True)
 def _tools():
     """A tool set to gate. Restored after every test."""
@@ -91,6 +135,7 @@ def _guard(
     raises: bool = False,
     policy_patch: dict | None = None,
     ledger=None,
+    accounts=None,
 ) -> tuple[Guard, AuditLog, PolicyStore]:
     from gads_write.settings import Settings
 
@@ -117,6 +162,7 @@ def _guard(
         tier_resolver=FakeTierResolver(tier, raises=raises),
         audit_log=audit,
         spend_ledger=ledger if ledger is not None else DailySpendLedger(audit),
+        managed_accounts=accounts if accounts is not None else FakeAccounts(),
         now=lambda: NOW,
     )
     return guard, audit, store
@@ -239,7 +285,7 @@ async def test_tier_is_resolved_for_the_specific_account(tmp_path, write_policy)
     """Per-account, not global. The decision you approved."""
     from gads_write.settings import Settings
 
-    store = PolicyStore(write_policy({"allowed_customer_ids": [ACCOUNT, OTHER_ACCOUNT]}))
+    store = PolicyStore(write_policy())
     audit = AuditLog(tmp_path / "audit.jsonl")
     resolver = FakeTierResolver({ACCOUNT: Tier.OPERATOR, OTHER_ACCOUNT: Tier.READONLY})
     settings = Settings(
@@ -251,7 +297,11 @@ async def test_tier_is_resolved_for_the_specific_account(tmp_path, write_policy)
     )
     guard = Guard(
         settings=settings, policy_store=store, tier_resolver=resolver,
-        audit_log=audit, spend_ledger=DailySpendLedger(audit), now=lambda: NOW,
+        audit_log=audit, spend_ledger=DailySpendLedger(audit),
+        managed_accounts=FakeAccounts(
+            {ACCOUNT: ("INR", "Asia/Kolkata"), OTHER_ACCOUNT: ("INR", "Asia/Kolkata")}
+        ),
+        now=lambda: NOW,
     )
     caller = FakeCaller("a@x.com")
 
@@ -287,16 +337,16 @@ async def test_an_indeterminate_lookup_fails_closed(tmp_path, write_policy) -> N
 # 4 and 5. allowlist, blocked operations
 # ---------------------------------------------------------------------------
 
-async def test_account_not_on_the_allowlist_is_refused(tmp_path, write_policy) -> None:
+async def test_an_account_outside_the_manager_is_refused(tmp_path, write_policy) -> None:
     guard, _, _ = _guard(tmp_path, write_policy)
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=OTHER_ACCOUNT
     )
-    assert decision.failed_check == "account_allowlist"
-    assert "no wildcard" in decision.reason_text
+    assert decision.failed_check == "managed_account"
+    assert OTHER_ACCOUNT in decision.reason_text
 
 
-async def test_allowlist_is_checked_before_validation(tmp_path, write_policy) -> None:
+async def test_membership_is_checked_before_validation(tmp_path, write_policy) -> None:
     # An unmanaged account must not have its contents inspected at all.
     guard, _, _ = _guard(tmp_path, write_policy)
 
@@ -309,7 +359,78 @@ async def test_allowlist_is_checked_before_validation(tmp_path, write_policy) ->
         customer_id=OTHER_ACCOUNT,
         validate=validate,
     )
-    assert decision.failed_check == "account_allowlist"
+    assert decision.failed_check == "managed_account"
+
+
+async def test_an_indeterminate_account_lookup_fails_closed(tmp_path, write_policy) -> None:
+    """Distinct from "not ours", exactly as a failed tier lookup is.
+
+    If a Google outage produced an ordinary denial, the audit log could not
+    tell an outage apart from a wave of correct refusals.
+    """
+    guard, audit, _ = _guard(
+        tmp_path, write_policy, accounts=FakeAccounts(raises=True)
+    )
+    decision = await guard.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+    assert not decision.allowed
+    assert decision.failed_check == "managed_account_lookup"
+    assert decision.verdict == VERDICT_LOOKUP_FAILED
+
+
+async def test_the_account_currency_reaches_the_policy_message(
+    tmp_path, write_policy
+) -> None:
+    """Currency is per account now, not one value for the whole server."""
+    guard, _, _ = _guard(
+        tmp_path,
+        write_policy,
+        accounts=FakeAccounts({ACCOUNT: ("USD", "America/New_York")}),
+    )
+
+    seen: dict = {}
+
+    def evaluate(policy, tier, spend_today):
+        seen["currency"] = policy.currency_code
+        return evaluate_budget_change(
+            policy, tier=tier, current_units=100, new_units=100_000
+        )
+
+    decision = await guard.check(
+        tool="update_campaign_budget",
+        caller=FakeCaller("a@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=evaluate,
+    )
+    assert seen["currency"] == "USD"
+    assert "USD" in decision.reason_text
+
+
+async def test_the_audit_date_uses_the_account_timezone(tmp_path, write_policy) -> None:
+    """The daily ceiling groups by this date, so it must follow the account.
+
+    NOW is 04:00 UTC on the 15th - already the 15th in Kolkata, still the
+    14th in New York.
+    """
+    guard_kolkata, _, _ = _guard(
+        tmp_path, write_policy, accounts=FakeAccounts({ACCOUNT: ("INR", "Asia/Kolkata")})
+    )
+    guard_ny, _, _ = _guard(
+        tmp_path,
+        write_policy,
+        accounts=FakeAccounts({ACCOUNT: ("USD", "America/New_York")}),
+    )
+
+    kolkata = await guard_kolkata.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+    new_york = await guard_ny.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+
+    assert kolkata.local_date == "2026-01-15"
+    assert new_york.local_date == "2026-01-14"
 
 
 async def test_blocked_operation_is_refused(tmp_path, write_policy) -> None:

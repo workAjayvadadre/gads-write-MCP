@@ -40,6 +40,7 @@ from .auth.roles import FileTierResolver, RoleStore
 from .auth.tiers import Tier, TierResolver
 from .health import register_health_route
 from .mcp_middleware import TierMiddleware
+from .safety.accounts import AccountLookupError, ManagedAccountStore
 from .safety.audit import AuditLog
 from .safety.guards import Guard
 from .safety.plans import PlanStore
@@ -113,7 +114,7 @@ def _build_tier_resolver(
     *,
     settings: Settings,
     role_store: RoleStore,
-    policy_store: PolicyStore,
+    managed_accounts: ManagedAccountStore,
     reader: GoogleAdsReader,
 ) -> TierResolver:
     """Pick the tier backing named by roles.yaml `mode`.
@@ -126,10 +127,18 @@ def _build_tier_resolver(
                   own Google Ads access role, and roles.yaml `users` becomes
                   a break-glass override that is normally empty.
 
-    The allowlist is passed as a callable, not a value, so that editing
-    policy.yaml changes which accounts count towards a user's visible tier
-    without a restart - the same hot-reload behaviour as everything else.
+    The managed set is passed as a callable rather than a value so that
+    linking a new account in Google Ads changes which accounts count towards
+    a user's visible tier without a restart - the same live behaviour as
+    everything else here, now that the set comes from the MCC rather than a
+    file.
     """
+
+    async def managed_customer_ids() -> frozenset[str]:
+        return frozenset(
+            account.customer_id for account in await managed_accounts.all()
+        )
+
     mode = role_store.current().mode
 
     if mode == "file":
@@ -139,7 +148,7 @@ def _build_tier_resolver(
         primary = GoogleAdsTierResolver(
             reader=reader,
             login_customer_id=settings.login_customer_id,
-            allowed_customer_ids=lambda: policy_store.current().allowed_customer_ids,
+            managed_customer_ids=managed_customer_ids,
             cache=TierCache(settings.tier_cache_seconds),
         )
         return OverridingTierResolver(overrides=role_store, primary=primary)
@@ -171,10 +180,17 @@ try:
         settings=SETTINGS, token_provider=google_access_token
     )
 
+    # Which accounts this server may touch, derived from the MCC instead of
+    # a hand-written list. Built before the tier resolver because
+    # `visible_tier` intersects with it.
+    MANAGED_ACCOUNTS = ManagedAccountStore(
+        reader=READER, login_customer_id=SETTINGS.login_customer_id
+    )
+
     TIER_RESOLVER: TierResolver = _build_tier_resolver(
         settings=SETTINGS,
         role_store=ROLE_STORE,
-        policy_store=POLICY_STORE,
+        managed_accounts=MANAGED_ACCOUNTS,
         reader=READER,
     )
     # Prunes itself: no cron, no logrotate, nothing to remember. See
@@ -191,6 +207,7 @@ try:
         tier_resolver=TIER_RESOLVER,
         audit_log=AUDIT_LOG,
         spend_ledger=SPEND_LEDGER,
+        managed_accounts=MANAGED_ACCOUNTS,
     )
 except ConfigError as exc:
     print(f"\n{exc}\n", file=sys.stderr)
@@ -221,6 +238,7 @@ register_read_tools(
     guard=GUARD,
     reader=READER,
     policy_store=POLICY_STORE,
+    managed_accounts=MANAGED_ACCOUNTS,
 )
 
 # Phase 4 writes. These draft plans and apply them; they are hidden and
@@ -270,6 +288,16 @@ async def health_check() -> dict:
 
     policy = POLICY_STORE.current()
 
+    # Derived from the MCC, so this is a live Google call. health_check must
+    # still answer when Google is unreachable - reporting the failure IS the
+    # useful answer - so it is caught rather than raised.
+    try:
+        managed_count: int | None = len(await MANAGED_ACCOUNTS.all())
+        managed_error = None
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        managed_count = None
+        managed_error = str(exc)
+
     return {
         "ok": True,
         "you": {
@@ -290,7 +318,9 @@ async def health_check() -> dict:
             # The kill switch. False means every write is refused at the
             # gate, regardless of tier, regardless of policy.
             "write_enabled": SETTINGS.write_enabled,
-            "managed_accounts": len(policy.allowed_customer_ids),
+            "managed_accounts": managed_count,
+            "managed_accounts_error": managed_error,
+            "manager_customer_id": SETTINGS.login_customer_id,
             "open_plans": PLAN_STORE.open_count(),
             # How long a demotion in the Google Ads UI can take to bite.
             "tier_cache_seconds": SETTINGS.tier_cache_seconds,
@@ -319,16 +349,19 @@ async def health_check() -> dict:
 
 
 def main() -> None:
+    # The managed-account count is deliberately NOT logged here: it would
+    # mean a Google round trip during boot, and the process must start even
+    # when Google is unreachable. health_check reports it instead.
     logger.info(
         "starting gads-write-mcp env=%s host=%s port=%s base_url=%s "
-        "write_enabled=%s tiers=%s accounts=%d",
+        "write_enabled=%s tiers=%s manager=%s",
         SETTINGS.env,
         SETTINGS.host,
         SETTINGS.port,
         SETTINGS.base_url,
         SETTINGS.write_enabled,
         TIER_RESOLVER.source,
-        len(POLICY_STORE.current().allowed_customer_ids),
+        SETTINGS.login_customer_id,
     )
     if SETTINGS.write_enabled:
         logger.warning("GADS_WRITE_ENABLED is true - this server can mutate accounts.")

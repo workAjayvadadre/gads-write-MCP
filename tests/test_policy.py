@@ -19,7 +19,6 @@ from gads_write.safety.policy import (
     PolicyStore,
     evaluate_bid_change,
     evaluate_budget_change,
-    evaluate_customer,
     evaluate_match_type_against_bidding,
     evaluate_operation,
     load_policy_file,
@@ -61,7 +60,6 @@ def test_the_shipped_policy_file_actually_loads() -> None:
     shipped = Path(__file__).resolve().parents[1] / "config" / "policy.yaml"
     policy = load_policy_file(shipped)
     assert policy.version == 2
-    assert policy.allowed_customer_ids
     # and the non-writing tiers are pinned to zero regardless of the file
     assert policy.limits_for(Tier.READONLY).budget.max_daily_units == Decimal(0)
     assert policy.limits_for(Tier.NONE).budget.max_daily_units == Decimal(0)
@@ -70,11 +68,6 @@ def test_the_shipped_policy_file_actually_loads() -> None:
 def test_unknown_version_is_refused(write_policy) -> None:
     with pytest.raises(PolicyError, match="version"):
         load_policy_file(write_policy({"version": 99}))
-
-
-def test_empty_allowlist_is_refused(write_policy) -> None:
-    with pytest.raises(PolicyError, match="no wildcard"):
-        load_policy_file(write_policy({"allowed_customer_ids": []}))
 
 
 def test_unknown_tier_name_is_refused(write_policy) -> None:
@@ -93,15 +86,29 @@ def test_min_above_max_is_refused(write_policy) -> None:
 
 
 # ---------------------------------------------------------------------------
-# account allowlist
+# per-account currency and timezone
 # ---------------------------------------------------------------------------
 
-def test_account_allowlist(write_policy) -> None:
+def test_for_account_stamps_the_accounts_own_currency_and_timezone(
+    write_policy,
+) -> None:
+    """Neither value is configured any more; both ride in from the account."""
     policy = load_policy_file(write_policy())
-    assert evaluate_customer(policy, "1234567890").allowed
-    verdict = evaluate_customer(policy, "9999999999")
-    assert not verdict.allowed
-    assert "not on the allowlist" in verdict.describe()
+    stamped = policy.for_account(currency_code="USD", timezone="America/New_York")
+
+    assert (stamped.currency_code, stamped.timezone) == ("USD", "America/New_York")
+    # and the original snapshot is untouched
+    assert policy.currency_code == ""
+
+
+def test_for_account_keeps_the_previous_value_when_google_returns_nothing(
+    write_policy,
+) -> None:
+    policy = load_policy_file(write_policy()).for_account(
+        currency_code="INR", timezone="Asia/Kolkata"
+    )
+    stamped = policy.for_account(currency_code="", timezone="")
+    assert (stamped.currency_code, stamped.timezone) == ("INR", "Asia/Kolkata")
 
 
 def test_blocked_operation(write_policy) -> None:
@@ -314,12 +321,12 @@ def test_invalid_edit_keeps_the_last_good_policy(write_policy) -> None:
 
 
 def test_structurally_invalid_edit_is_also_refused(write_policy) -> None:
-    # Parses as YAML, but the allowlist is now empty. Must not be adopted.
+    # Parses as YAML, but `limits` is gone. Must not be adopted.
     path = write_policy()
     store = PolicyStore(path)
-    write_policy({"allowed_customer_ids": []})
+    path.write_text("version: 2" + chr(10), encoding="utf-8")
 
-    assert store.current().allows_customer("1234567890")
+    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
     assert store.last_error is not None
 
 
