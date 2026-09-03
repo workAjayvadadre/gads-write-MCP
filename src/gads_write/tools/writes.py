@@ -245,6 +245,9 @@ def register_write_tools(
             validate=validate,
             evaluate=evaluate,
             spend_delta_units=spend_delta_units,
+            # Read from the SAME table confirm reads, so a draft can never ask
+            # for a different set of inputs than the re-check will.
+            needs_account_total=OPERATIONS[tool].needs_account_total,
         )
         if not decision.allowed:
             raise ToolError(f"{decision.reason_text}. Nothing was changed.")

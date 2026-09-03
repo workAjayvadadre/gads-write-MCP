@@ -22,7 +22,11 @@ from gads_write.safety.guards import (
     GuardDenied,
 )
 from gads_write.safety.accounts import AccountLookupError, ManagedAccount
-from gads_write.safety.policy import PolicyStore, evaluate_budget_change
+from gads_write.safety.policy import (
+    PolicyStore,
+    evaluate_bid_change,
+    evaluate_budget_change,
+)
 from gads_write.safety.spend import DailySpendLedger
 from gads_write.safety.validators import ValidationResult
 from gads_write.tools.registry import ToolSpec, register, reset_for_tests
@@ -480,7 +484,7 @@ async def test_policy_limit_is_enforced_at_the_gate(tmp_path) -> None:
         tool="update_campaign_budget",
         caller=FakeCaller("a@x.com"),
         customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 5000),  # way over operator's 20%
+        evaluate=_budget_evaluator(1000, 5000), needs_account_total=True,  # way over operator's 20%
     )
     assert decision.failed_check == "policy"
 
@@ -491,7 +495,7 @@ async def test_a_change_within_every_limit_is_allowed(tmp_path) -> None:
         tool="update_campaign_budget",
         caller=FakeCaller("a@x.com"),
         customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),
+        evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
         spend_delta_units=Decimal(200),
     )
     assert decision.allowed
@@ -507,7 +511,7 @@ async def test_the_daily_ceiling_reaches_the_gate(tmp_path) -> None:
     # so 1,000. Record 900 of it as already applied.
     decision = await guard.check(
         tool="update_campaign_budget", caller=caller, customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),
+        evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
     )
     guard.record_application(
         decision, arguments={}, plan_id=None, resource_names=[],
@@ -516,7 +520,7 @@ async def test_the_daily_ceiling_reaches_the_gate(tmp_path) -> None:
 
     blocked = await guard.check(
         tool="update_campaign_budget", caller=caller, customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),  # +200 -> 1100, over the ceiling
+        evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,  # +200 -> 1100, over the ceiling
     )
     assert not blocked.allowed
     assert "ceiling" in blocked.reason_text
@@ -529,7 +533,7 @@ async def test_another_users_spending_does_not_count_against_you(
 
     other = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("other@x.com"),
-        customer_id=ACCOUNT, evaluate=_budget_evaluator(1000, 1200),
+        customer_id=ACCOUNT, evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
     )
     guard.record_application(
         other, arguments={}, plan_id=None, resource_names=[],
@@ -538,7 +542,7 @@ async def test_another_users_spending_does_not_count_against_you(
 
     mine = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("me@x.com"),
-        customer_id=ACCOUNT, evaluate=_budget_evaluator(1000, 1200),
+        customer_id=ACCOUNT, evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
     )
     assert mine.allowed
 
@@ -619,7 +623,7 @@ async def test_the_spend_ledger_is_read_when_a_rule_does_need_it(
         tool="update_campaign_budget",
         caller=FakeCaller("a@x.com"),
         customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(100, 110),
+        evaluate=_budget_evaluator(100, 110), needs_account_total=True,
     )
 
     assert decision.allowed
@@ -654,7 +658,7 @@ async def test_record_application_marks_the_line_applied(tmp_path) -> None:
     guard, audit, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),
+        evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
     )
     guard.record_application(
         decision,
@@ -677,10 +681,85 @@ async def test_a_failed_application_is_not_counted_as_applied(
     guard, audit, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),
+        evaluate=_budget_evaluator(1000, 1200), needs_account_total=True,
     )
     guard.record_application(
         decision, arguments={}, plan_id="p", resource_names=[],
         spend_delta_units=Decimal(200), error="RESOURCE_EXHAUSTED",
     )
     assert not any(line["applied"] for line in _lines(audit))
+
+
+# ---------------------------------------------------------------------------
+# the daily-ceiling base is fetched only when a rule measures against it
+# ---------------------------------------------------------------------------
+
+async def test_the_account_total_is_not_read_when_no_rule_needs_it(tmp_path) -> None:
+    """A read has no spend to check and must not pay for a Google round trip
+    to discover that. Same principle as the spend ledger above."""
+    budgets = FakeBudgetReader()
+    guard, _, _ = _guard(tmp_path, budget_reader=budgets)
+
+    await guard.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+
+    assert budgets.calls == 0
+
+
+async def test_a_bid_change_does_not_read_the_account_total(tmp_path) -> None:
+    """Bids have no daily ceiling behind them, so the base is meaningless to
+    them. It used to be fetched for every `evaluate`, which meant a bid paid
+    for a round trip it could not use AND had an Ads read failure swallowed
+    to a warning while the change went ahead.
+    """
+    budgets = FakeBudgetReader(raises=True)
+    guard, _, _ = _guard(tmp_path, tier=Tier.LEAD, budget_reader=budgets)
+
+    def evaluate(policy, tier, spend_today):
+        return evaluate_bid_change(
+            policy, tier=tier, current_units=100, new_units=150
+        )
+
+    decision = await guard.check(
+        tool="update_ad_group_bid",
+        caller=FakeCaller("lead@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=evaluate,
+        # no needs_account_total: the OPERATIONS table does not set it for bids
+    )
+
+    assert decision.allowed
+    assert budgets.calls == 0
+
+
+async def test_a_budget_change_does_read_the_account_total(tmp_path) -> None:
+    budgets = FakeBudgetReader()
+    guard, _, _ = _guard(tmp_path, budget_reader=budgets)
+
+    await guard.check(
+        tool="update_campaign_budget",
+        caller=FakeCaller("a@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=_budget_evaluator(1000, 1100),
+        needs_account_total=True,
+    )
+
+    assert budgets.calls == 1
+
+
+async def test_a_failed_account_total_read_refuses_the_budget_change(tmp_path) -> None:
+    """Stamped as None, and evaluate_budget_change refuses on None. Not
+    knowing the base is a reason to stop, not a reason to skip the ceiling."""
+    guard, _, _ = _guard(tmp_path, budget_reader=FakeBudgetReader(raises=True))
+
+    decision = await guard.check(
+        tool="update_campaign_budget",
+        caller=FakeCaller("a@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=_budget_evaluator(1000, 1100),
+        needs_account_total=True,
+    )
+
+    assert not decision.allowed
+    assert "could not be established" in decision.reason_text

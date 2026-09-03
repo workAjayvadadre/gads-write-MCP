@@ -16,7 +16,10 @@ alwaysApply: true
 - No remove/delete tools for campaigns, ad groups, keywords,
   conversion actions, or budgets. Pausing is reversible; removal is not.
 - No hardcoded customer IDs, budgets, limits, or emails in Python.
-  All of that lives in config/policy.yaml and config/roles.yaml.
+  Accounts come from the MCC, tiers from Google Ads, and the two
+  deployment-specific values from .env. The spend RULES live in
+  safety/policy.py, deliberately: they are relative percentages, not
+  amounts, so they are code rather than config. There is no policy.yaml.
 - No wildcard account access. Customer IDs must be on the allowlist.
 
 ## Credentials

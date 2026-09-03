@@ -65,6 +65,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..ads.reads import AdsReader, AdsReadError
+from ..safety.accounts import AccountLookupError
 from .roles import RoleStore
 from .tiers import Tier, TierLookupError, TierResolver, highest
 
@@ -233,7 +234,20 @@ class GoogleAdsTierResolver(TierResolver):
         if cached is not None:
             return cached
 
-        accounts = sorted(await self._managed_customer_ids())
+        # The managed set is derived from the manager account now, so unlike
+        # the config list it replaced, asking for it can FAIL. Everything
+        # upstream - the middleware's tools/list hook and the gate's step 3 -
+        # catches TierLookupError and only that, so an AccountLookupError
+        # escaping raw would crash tool listing and would skip the gate's
+        # audit line, leaving an outage with no `lookup_failed` record.
+        try:
+            accounts = sorted(await self._managed_customer_ids())
+        except AccountLookupError as exc:
+            raise TierLookupError(
+                f"could not determine which accounts this server manages, so "
+                f"your access level cannot be established: {exc}"
+            ) from exc
+
         if not accounts:
             # A readable but empty manager account. Nobody can do anything,
             # which is the correct reading of "we manage nothing".

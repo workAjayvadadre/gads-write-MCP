@@ -370,3 +370,35 @@ async def test_the_source_string_makes_break_glass_visible(write_roles) -> None:
         overrides=store, primary=_resolver(FakeReader({}))
     )
     assert "break-glass" in resolver.source
+
+
+# ---------------------------------------------------------------------------
+# an unreadable manager account
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unreadable_manager_becomes_a_tier_lookup_error() -> None:
+    """The managed set moved onto the visible_tier path when it stopped being
+    a config list, and it can now fail. It must fail as a TierLookupError.
+
+    Everything upstream - the middleware's tools/list handler and the gate's
+    step 3 - catches TierLookupError and only that. An AccountLookupError
+    escaping raw would crash tool listing and would skip the gate's audit
+    line entirely, so an outage would leave no `lookup_failed` record.
+    """
+    from gads_write.safety.accounts import AccountLookupError
+
+    async def _explode() -> frozenset[str]:
+        raise AccountLookupError("could not list the accounts under manager 999")
+
+    resolver = GoogleAdsTierResolver(
+        reader=FakeReader({}),
+        login_customer_id=MCC,
+        managed_customer_ids=_explode,
+        cache=TierCache(0),
+    )
+
+    with pytest.raises(TierLookupError) as caught:
+        await resolver.visible_tier(FakeCaller("someone@x.com"))
+
+    assert "manager" in str(caught.value)

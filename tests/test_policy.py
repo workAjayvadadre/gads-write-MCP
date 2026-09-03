@@ -96,10 +96,12 @@ def test_a_lead_has_more_daily_headroom_than_an_operator() -> None:
     )
 
 
-def test_the_store_has_no_error_to_report(tmp_path: Path) -> None:
-    """There is no edit left that could be refused, so /healthz can only be
-    degraded by roles.yaml now."""
-    assert PolicyStore(_settings(tmp_path)).last_error is None
+def test_the_store_exposes_no_reload_error(tmp_path: Path) -> None:
+    """There is no edit left that could be refused, so a `last_error` that
+    could only ever be None would be a standing invitation to believe this
+    still reloads. /healthz reports roles.yaml instead, which genuinely can
+    fail that way."""
+    assert not hasattr(PolicyStore(_settings(tmp_path)), "last_error")
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +272,28 @@ def test_an_unknown_account_total_refuses_rather_than_skipping_the_ceiling() -> 
     )
     assert not verdict.allowed
     assert "could not be established" in verdict.describe()
+
+
+def test_a_zero_account_total_is_zero_headroom_not_no_ceiling() -> None:
+    """The one fail-OPEN direction this rule could have had.
+
+    An account with no live budget has no base to measure a percentage
+    against. Skipping the ceiling would have permitted an increase of any
+    size; the correct reading is that there is no headroom at all.
+    """
+    policy = _policy(total=Decimal(0))
+    verdict = evaluate_budget_change(
+        policy, tier=Tier.LEAD, current_units="1000", new_units="1100"
+    )
+    assert not verdict.allowed
+    assert "no live daily budget" in verdict.describe()
+
+
+def test_a_zero_account_total_still_permits_a_decrease() -> None:
+    policy = _policy(total=Decimal(0))
+    assert evaluate_budget_change(
+        policy, tier=Tier.LEAD, current_units="1000", new_units="500"
+    ).allowed
 
 
 def test_an_unknown_account_total_still_permits_a_decrease() -> None:

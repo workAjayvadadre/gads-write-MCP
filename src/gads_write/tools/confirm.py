@@ -231,6 +231,7 @@ def register_confirm_tool(
             arguments=plan.arguments,
             validate=lambda policy: checks.validate(policy, plan.arguments),
             evaluate=recheck if checks.recheck is not None else None,
+            needs_account_total=checks.needs_account_total,
             spend_delta_units=spend_delta,
             plan_id=plan.plan_id,
         )

@@ -56,8 +56,6 @@ from .units import MoneyError, coerce_units, percent_change
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_VERSION = 2
-
 # Tiers that may never change anything, enforced in code rather than trusted
 # to config. See parse_policy.
 NON_WRITING_TIERS = (Tier.NONE, Tier.READONLY)
@@ -254,9 +252,10 @@ class PolicyStore:
     already reads through - removing it would have churned the whole codebase
     to express "there is nothing to reload".
 
-    `last_error` is kept, and is now always None. It feeds `health_check` and
-    `/healthz`, which still report a refused ROLES reload; there is simply no
-    longer any policy edit that can be refused.
+    It deliberately exposes no `last_error`: there is no edit left that could
+    be refused, so a field that could only ever be None would be a standing
+    invitation to believe this file still reloads. `/healthz` reports the
+    roles table instead, which genuinely can fail that way.
     """
 
     def __init__(self, settings: Any) -> None:
@@ -267,11 +266,6 @@ class PolicyStore:
 
     def current(self) -> Policy:
         return self._policy
-
-    @property
-    def last_error(self) -> str | None:
-        """Always None. There is no config edit left that could be refused."""
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +364,17 @@ def evaluate_budget_change(
             )
 
     account_total = policy.account_total_budget_units
+    if account_total is not None and account_total <= 0:
+        # Zero is a real answer, and it means zero headroom - NOT "no ceiling".
+        # Skipping the rule here would have been the one fail-open direction
+        # in an otherwise fail-closed check: an account with no live budgets
+        # would have permitted an increase of any size.
+        return PolicyVerdict.deny(
+            f"this account has no live daily budget to measure a ceiling "
+            f"against, so no increase can be authorised here. Set the budget "
+            f"in the Google Ads UI once, then adjust it from here."
+        )
+
     if account_total is None:
         # Refuse rather than skip. The ceiling is a real control, and "we could
         # not work out the base" is a reason to stop, not a reason to wave an
@@ -379,7 +384,7 @@ def evaluate_budget_change(
             "your daily increase ceiling cannot be applied. Nothing was "
             "changed; try again in a moment."
         )
-    elif account_total > 0:
+    else:
         ceiling = (
             account_total * limits.max_total_increase_percent_of_account
         ) / Decimal(100)

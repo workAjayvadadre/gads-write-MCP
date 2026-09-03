@@ -48,7 +48,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..ads.reads import AccountSummary, AdsReadError
+from ..ads.reads import AccountSummary, AdsReader, AdsReadError
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class ManagedAccountStore:
     def __init__(
         self,
         *,
-        reader: object,
+        reader: AdsReader,
         login_customer_id: str,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -141,7 +141,7 @@ class ManagedAccountStore:
                 return cached
 
             try:
-                summaries = await self._reader.managed_accounts(  # type: ignore[attr-defined]
+                summaries = await self._reader.managed_accounts(
                     manager_customer_id=self._manager_id
                 )
             except AdsReadError as exc:

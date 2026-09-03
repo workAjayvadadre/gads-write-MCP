@@ -391,3 +391,57 @@ async def test_a_non_numeric_campaign_filter_is_refused(harness) -> None:
                 {"customer_id": ACCOUNT, "campaign_id": "55 OR 1=1"},
             )
     assert reader.search_term_calls == []
+
+
+def test_a_derived_window_honours_the_timezone_it_is_given() -> None:
+    """Deterministic half of the timezone check.
+
+    Kiritimati is UTC+14 and Niue is UTC-11, twenty-five hours apart, so
+    their dates ALWAYS differ. That makes this fail whenever the zone
+    argument is ignored, rather than only when UTC happens to disagree.
+    """
+    from gads_write.tools.reads import _derived_window
+
+    _, ahead = _derived_window("Pacific/Kiritimati", 1)
+    _, behind = _derived_window("Pacific/Niue", 1)
+
+    assert ahead > behind
+
+
+async def test_the_report_window_uses_the_accounts_timezone_not_utc(harness) -> None:
+    """The window is derived AFTER the gate, on purpose.
+
+    The timezone belongs to the account and only the gate establishes it.
+    Deriving the window before the gate silently used the UTC fallback, which
+    shifts "today" by a day for part of every Asia/Kolkata day - a whole day
+    missing from a report, with nothing to show for it.
+    """
+    from gads_write.tools.reads import _today_in_timezone
+
+    zone = "Pacific/Kiritimati"
+    mcp, reader, _ = harness(
+        Tier.READONLY, accounts=FakeManagedAccounts({ACCOUNT: ("AUD", zone)})
+    )
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "get_campaign_performance", {"customer_id": ACCOUNT, "days": 1}
+        )
+
+    assert reader.campaign_calls[-1]["end_date"] == _today_in_timezone(zone).isoformat()
+
+
+async def test_an_explicit_range_is_passed_through_untouched(harness) -> None:
+    """An explicit range is the caller's own and needs no timezone at all."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "get_campaign_performance",
+            {
+                "customer_id": ACCOUNT,
+                "start_date": "2026-08-01",
+                "end_date": "2026-08-31",
+            },
+        )
+
+    call = reader.campaign_calls[-1]
+    assert (call["start_date"], call["end_date"]) == ("2026-08-01", "2026-08-31")

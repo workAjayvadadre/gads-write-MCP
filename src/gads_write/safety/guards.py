@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from ..ads.reads import AdsReader
 from ..auth.identity import AuthError
 from ..auth.tiers import Tier, TierLookupError, TierResolver, tier_at_least
 from ..settings import Settings
@@ -118,7 +119,7 @@ class Guard:
         audit_log: AuditLog,
         spend_ledger: DailySpendLedger,
         managed_accounts: ManagedAccountStore,
-        reader: Any,
+        reader: AdsReader,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._settings = settings
@@ -142,6 +143,7 @@ class Guard:
         validate: Callable[[Policy], ValidationResult] | None = None,
         evaluate: Callable[[Policy, Tier, Decimal], PolicyVerdict] | None = None,
         spend_delta_units: Decimal | None = None,
+        needs_account_total: bool = False,
         plan_id: str | None = None,
         dry_run: bool = False,
     ) -> GuardDecision:
@@ -320,15 +322,19 @@ class Guard:
                 user_email=email, local_date=local_date
             )
 
-            # The base for the daily increase ceiling, fetched HERE and only
-            # here: a read has no spend to check and must not pay for a Google
-            # round trip to discover that. Same reasoning as the ledger read
-            # immediately above.
+            # The base for the daily increase ceiling, fetched HERE, only
+            # here, and only for a rule that actually measures against it.
+            # `needs_account_total` comes from the OPERATIONS table, so a bid
+            # - which has no daily ceiling - pays for no round trip, and a
+            # read pays for none either.
             #
-            # A failure is not fatal by itself - it is stamped as None, and
-            # evaluate_budget_change refuses on that rather than silently
-            # dropping the ceiling. Bids have no ceiling and are unaffected.
-            if customer_id is not None:
+            # A failure is stamped as None rather than swallowed:
+            # evaluate_budget_change refuses on None instead of silently
+            # dropping the ceiling, so the caller is told, and the change does
+            # not proceed. That only holds for rules that read it, which is
+            # exactly why this is gated on the flag rather than on
+            # `evaluate is not None`.
+            if needs_account_total and customer_id is not None:
                 try:
                     total_micros = (
                         await self._reader.account_total_daily_budget_micros(

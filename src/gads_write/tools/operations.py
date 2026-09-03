@@ -128,6 +128,12 @@ class OperationChecks:
     id_argument: str = ""
     # None when the tool cannot raise daily spend.
     spend_delta: SpendDelta | None = None
+    # True only for rules measured against the ACCOUNT'S total daily budget -
+    # in practice, the per-user daily ceiling on budget changes. The gate
+    # fetches that total from Google, so declaring it here is what keeps the
+    # read off every other tool's path: a bid has no daily ceiling behind it
+    # and must not pay for a round trip it cannot use.
+    needs_account_total: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +397,7 @@ OPERATIONS: dict[str, OperationChecks] = {
         reads=ReadKind.CAMPAIGN,
         id_argument="campaign_id",
         spend_delta=budget_spend_delta,
+        needs_account_total=True,
     ),
     "add_negative_keyword": OperationChecks(validate=validate_negative_keyword_args),
     "add_keyword": OperationChecks(

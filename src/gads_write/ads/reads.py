@@ -402,6 +402,14 @@ class GoogleAdsReader(AdsReader):
         # shared budget is one row backing several campaigns: summing per
         # campaign would count it once per campaign and inflate the base the
         # daily ceiling is measured against.
+        #
+        # `status = 'ENABLED'` is the BUDGET's status, not the campaign's, so
+        # this total includes budgets attached to paused campaigns. That is
+        # deliberate: it measures the account's CONFIGURED daily budget, which
+        # is stable, rather than what happens to be running right now - which
+        # would make everyone's daily headroom shrink and grow as campaigns
+        # are paused and resumed. The trade-off is that a mostly-paused
+        # account gives a larger ceiling than its live spend justifies.
         query = (
             "SELECT campaign_budget.id, campaign_budget.amount_micros "
             "FROM campaign_budget "

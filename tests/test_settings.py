@@ -221,3 +221,19 @@ def test_secrets_are_not_in_repr(env, tmp_path: Path) -> None:
     assert "GOCSPX-secret" not in rendered
     assert "dev-token" not in rendered
     assert "a-stable-signing-key" not in rendered
+
+
+@pytest.mark.parametrize("hostile", ["inf", "Infinity", "-inf", "nan", "1e999"])
+def test_a_non_finite_increase_percent_is_refused(
+    env, tmp_path: Path, hostile: str
+) -> None:
+    """The nastiest single typo available in this file.
+
+    Decimal parses "inf" happily. Infinity is not negative, so a `< 0` check
+    passes it, and every `increase > limit` comparison is then False - one
+    character in .env silently disables the only money control left. NaN is
+    worse: it compares False in both directions.
+    """
+    env.setenv("GADS_MAX_INCREASE_PERCENT", hostile)
+    with pytest.raises(ConfigError, match="GADS_MAX_INCREASE_PERCENT"):
+        _load(tmp_path)

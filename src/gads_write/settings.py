@@ -132,6 +132,11 @@ def _resolve(path_str: str) -> Path:
 # validation
 # --------------------------------------------------------------------------
 
+# Above this, the per-change cap stops being a safety control. It is the
+# only money rule left, so an absurd value is refused rather than trusted.
+MAX_SANE_INCREASE_PERCENT = Decimal(1000)
+
+
 def _validate_config_files(roles_path: Path) -> list[str]:
     """Confirm roles.yaml exists and is fully valid.
 
@@ -284,14 +289,31 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
     max_increase_percent = Decimal(100)
     try:
         max_increase_percent = Decimal(raw_increase)
-        if max_increase_percent < 0:
+        # `is_finite()` is the check that matters, not `< 0`. Decimal happily
+        # parses "inf" and "nan": Infinity passes a negativity test, and then
+        # every `increase > limit` comparison is False, so a single typo in
+        # .env silently disables the only money control left. NaN is worse -
+        # it compares False both ways.
+        if not max_increase_percent.is_finite() or max_increase_percent < 0:
             raise ValueError
     except (ValueError, ArithmeticError):
         problems.append(
-            f"GADS_MAX_INCREASE_PERCENT must be a non-negative number, got "
-            f"{raw_increase!r}. It is a percentage: 100 means a change may at "
-            "most double a budget or a bid."
+            f"GADS_MAX_INCREASE_PERCENT must be a finite, non-negative number, "
+            f"got {raw_increase!r}. It is a percentage: 100 means a change may "
+            "at most double a budget or a bid."
         )
+    else:
+        if max_increase_percent > MAX_SANE_INCREASE_PERCENT:
+            # Same reasoning as the tier cache ceiling below: a number this
+            # large is not a loose limit, it is no limit, and it arrives by
+            # typo rather than by intent. 1000 already permits an elevenfold
+            # increase in a single change.
+            problems.append(
+                f"GADS_MAX_INCREASE_PERCENT is {max_increase_percent}, which "
+                f"is not a limit at all. The maximum accepted is "
+                f"{MAX_SANE_INCREASE_PERCENT}; 100 means a change may at most "
+                "double a budget or a bid."
+            )
 
     # Exact host match, comma separated. Empty is allowed and means no new ad
     # can be created - which is the right default for a server that has not

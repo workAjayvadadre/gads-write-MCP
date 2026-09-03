@@ -20,7 +20,7 @@
 # account under the manager. The Google Ads resolver is built and tested
 # (tests/test_google_ads_tiers.py) and boots in both modes - switch this one
 # word back to `google_ads` when credentials are in place.
-mode: google_ads
+mode: file
 
 # Tiers, lowest to highest:
 #   none      authenticated, but no tools beyond health_check

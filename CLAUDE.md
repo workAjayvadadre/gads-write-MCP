@@ -175,9 +175,14 @@ campaign A by 5000 would fund raising campaign B past the cap.
 leaves the plan burnt, forcing a human to look at the account rather than
 blindly retry when we cannot know whether the mutation landed.
 
-**A bad config edit keeps the last good version.** Both `PolicyStore` and
-`RoleStore` refuse an invalid reload rather than relaxing to defaults or
-crashing a live request. `last_error` is surfaced in `health_check`.
+**A bad `roles.yaml` edit keeps the last good version.** `RoleStore`
+refuses an invalid reload rather than relaxing to defaults or crashing a live
+request, and `last_error` is surfaced in `health_check` and `/healthz`.
+
+`roles.yaml` is the only file this can happen to now. `PolicyStore` holds a
+snapshot built from settings and code constants; it reloads nothing and
+exposes no `last_error`, deliberately, because a field that could only ever
+be None would invite the belief that the file still exists.
 
 **`AccessToken.token` is the real Google access token** under
 `GoogleProvider`, not the FastMCP JWT. Verified against fastmcp 3.4.7
@@ -289,10 +294,19 @@ changing is a reason to stop, not a reason to burn the plan.
 
 **Budgets gate twice, at draft and at confirm.** Policy cannot be evaluated
 without the CURRENT value, and the account must not be read before the
-allowlist has authorised it. So those tools run the chain once to authorise
-(marked `dry_run`, audited as a look) and again with the numbers. Two audit
-lines is deliberate, at both steps. Tools whose rules are absolute - negative
-keywords, RSAs, pause/enable - pay for neither the second line nor the read.
+managed-account check has authorised it. So those tools run the chain once to
+authorise (marked `dry_run`, audited as a look) and again with the numbers.
+Two audit lines is deliberate, at both steps. Tools whose rules need no
+account state - negative keywords, RSAs, pause/enable - pay for neither the
+second line nor the read.
+
+**The daily ceiling's base is fetched only for rules that measure against
+it.** `needs_account_total` on `OperationChecks` says so per operation, and
+both draft and confirm read it from that one table. It was briefly gated on
+`evaluate is not None`, which made every BID change pay for a Google round
+trip it could not use and, worse, swallowed a failed read to a warning while
+the change went ahead. A budget change refuses when the base is unknown; a
+bid never asks for it.
 
 **The audit log partitions by date and prunes itself, in-process.** Rotation
 is deliberately NOT a logrotate rule. The daily spend ceiling is rebuilt from
@@ -337,10 +351,17 @@ Google Ads, so an enable could never succeed. Catching it before a plan
 exists beats an opaque API rejection after a human has approved something.
 
 **Reads go through the full gate too.** They cannot spend money, but the
-account allowlist has to hold for them or this becomes a way to read any
+managed-account check has to hold for them or this becomes a way to read any
 account the caller has on their personal Google login, through our developer
 token. Every read is audited, which is what makes "who looked at this
 account, and when" answerable.
+
+**A report window is resolved AFTER the gate, never before.** "Last 7 days"
+needs a timezone, and the timezone belongs to the account, which only the
+gate establishes. Deriving the window first silently used the UTC fallback
+and shifted every window by a day for part of each Asia/Kolkata day. An
+explicit `start_date`/`end_date` pair is the caller's own and needs no
+timezone, so it is still validated at the gate.
 
 ## Open risks
 
