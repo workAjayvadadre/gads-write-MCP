@@ -13,7 +13,8 @@ The order is deliberate, cheapest and most absolute first:
   5  blocked operation  irreversible operations, refused outright
   6  field validation   shape of the input
   7  policy limits      per-tier caps on the actual numbers
-  8  daily ceiling      this user's running total for the day
+  8  daily ceiling      this user's running total for the day, against a
+                        percentage of the account's own total budget
 
 Why that order and not another:
 
@@ -57,6 +58,7 @@ from .accounts import AccountLookupError, ManagedAccountStore
 from .audit import AuditLog, AuditRecord, local_date_for
 from .policy import Policy, PolicyStore, PolicyVerdict, evaluate_operation
 from .spend import DailySpendLedger
+from .units import MICROS_PER_UNIT
 from .validators import ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,7 @@ class Guard:
         audit_log: AuditLog,
         spend_ledger: DailySpendLedger,
         managed_accounts: ManagedAccountStore,
+        reader: Any,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._settings = settings
@@ -124,6 +127,9 @@ class Guard:
         self._audit = audit_log
         self._spend = spend_ledger
         self._accounts = managed_accounts
+        # Only ever used for the daily-ceiling base, and only when a monetary
+        # rule is actually being evaluated.
+        self._reader = reader
         self._now = now
 
     async def check(
@@ -145,8 +151,8 @@ class Guard:
 
         # Read the policy snapshot ONCE, up front, and use this same object
         # for the whole evaluation. This is not a check; it is what stops a
-        # policy.yaml saved mid-evaluation producing a half-old, half-new
-        # verdict. It also gives us the account timezone for the audit line.
+        # per-account stamping below producing a half-old, half-new verdict.
+        # It also gives us the fallback timezone for the audit line.
         policy = self._policy_store.current()
         moment = self._now()
         local_date = local_date_for(moment, policy.timezone)
@@ -313,6 +319,33 @@ class Guard:
             spend_today = self._spend.total_increase_units(
                 user_email=email, local_date=local_date
             )
+
+            # The base for the daily increase ceiling, fetched HERE and only
+            # here: a read has no spend to check and must not pay for a Google
+            # round trip to discover that. Same reasoning as the ledger read
+            # immediately above.
+            #
+            # A failure is not fatal by itself - it is stamped as None, and
+            # evaluate_budget_change refuses on that rather than silently
+            # dropping the ceiling. Bids have no ceiling and are unaffected.
+            if customer_id is not None:
+                try:
+                    total_micros = (
+                        await self._reader.account_total_daily_budget_micros(
+                            customer_id
+                        )
+                    )
+                    policy = policy.with_account_budget(
+                        Decimal(total_micros) / MICROS_PER_UNIT
+                    )
+                except Exception as exc:  # noqa: BLE001 - surfaced by the rule
+                    logger.warning(
+                        "could not read the total daily budget for %s: %s",
+                        customer_id,
+                        exc,
+                    )
+                    policy = policy.with_account_budget(None)
+
             verdict = evaluate(policy, tier, spend_today)
             if not verdict.allowed:
                 return deny_with_tier("policy", *verdict.reasons)

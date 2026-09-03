@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeManagedAccounts
+from conftest import FakeBudgetReader, FakeManagedAccounts
 from fastmcp import Client, FastMCP
 
 from gads_write.ads.reads import AccountSummary, AdsReadError, CampaignRow, SearchTermRow
@@ -115,20 +115,19 @@ class FakeReader:
         )
 
 
-def _settings(tmp_path: Path, policy_path: Path) -> Settings:
+def _settings(tmp_path: Path) -> Settings:
     return Settings(
         env="test", host="127.0.0.1", port=8081, base_url="https://example.com",
         oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
         jwt_signing_key="k", developer_token="d", login_customer_id="9999999999",
         write_enabled=False,           # reads must work with writes switched off
-        policy_path=policy_path,
         roles_path=tmp_path / "roles.yaml",
         audit_log_path=tmp_path / "audit.jsonl",
     )
 
 
 @pytest.fixture
-def harness(tmp_path, write_policy):
+def harness(tmp_path):
     """A real server with fake Google and a fixed tier."""
 
     def _build(
@@ -138,9 +137,8 @@ def harness(tmp_path, write_policy):
         accounts: FakeManagedAccounts | None = None,
     ):
         accounts = accounts or FakeManagedAccounts()
-        policy_path = write_policy()
-        settings = _settings(tmp_path, policy_path)
-        policy_store = PolicyStore(policy_path)
+        settings = _settings(tmp_path)
+        policy_store = PolicyStore(settings)
         audit_log = AuditLog(settings.audit_log_path)
         resolver = FixedTierResolver(tier)
         guard = Guard(
@@ -150,6 +148,7 @@ def harness(tmp_path, write_policy):
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
             managed_accounts=accounts,
+            reader=FakeBudgetReader(),
         )
 
         ads_reader = reader or FakeReader()

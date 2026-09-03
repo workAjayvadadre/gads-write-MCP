@@ -1,9 +1,16 @@
-"""Policy parsing, per-tier merge, hot reload, and every rule at its boundary.
+"""The spending rules, and the pure functions that evaluate them.
 
-Boundary convention under test: limits are INCLUSIVE. Exactly at the limit
-is allowed; a hair over is not. Each rule is checked just-under, exactly-at,
-and just-over, because "<=" vs "<" is the single most likely bug in this file
-and it is invisible on inspection.
+There is no policy file, so there is nothing here about parsing, hot-reload,
+or a refused edit. What is left is the part that was always the point: given
+a snapshot and a proposed change, is it allowed, and exactly where is the
+boundary.
+
+The rules are now RELATIVE, which is what let the config file go. Both of
+them scale with the account rather than with a number somebody typed:
+
+    per change   the increase may not exceed max_increase_percent
+    per day      this user's total increases today may not exceed a
+                 percentage of the account's own total daily budget
 """
 
 from __future__ import annotations
@@ -13,415 +20,343 @@ from pathlib import Path
 
 import pytest
 
-from gads_write.auth.roles import Tier
+from gads_write.auth.tiers import Tier
 from gads_write.safety.policy import (
-    PolicyError,
+    DAILY_INCREASE_PERCENT_BY_TIER,
+    Policy,
     PolicyStore,
+    build_policy,
     evaluate_bid_change,
     evaluate_budget_change,
     evaluate_match_type_against_bidding,
     evaluate_operation,
-    load_policy_file,
 )
+from gads_write.settings import Settings
+
+# The account every case below is measured against: 10,000 total daily budget.
+# At the fixed tier percentages that makes the ceilings 1,000 for an operator
+# and 2,500 for a lead.
+ACCOUNT_TOTAL = Decimal(10_000)
+
+
+def _settings(tmp_path: Path, *, max_increase_percent: int = 100) -> Settings:
+    return Settings(
+        env="test",
+        host="127.0.0.1",
+        port=8081,
+        base_url="https://example.com",
+        oauth_client_id="x.apps.googleusercontent.com",
+        oauth_client_secret="s",
+        jwt_signing_key="k",
+        developer_token="d",
+        login_customer_id="9999999999",
+        write_enabled=True,
+        roles_path=tmp_path / "roles.yaml",
+        audit_log_path=tmp_path / "audit.jsonl",
+        max_increase_percent=Decimal(max_increase_percent),
+        allowed_url_domains=frozenset({"indiraivf.com"}),
+    )
+
+
+def _policy(*, max_increase_percent: int = 100, total=ACCOUNT_TOTAL) -> Policy:
+    policy = build_policy(
+        max_increase_percent=Decimal(max_increase_percent),
+        allowed_final_url_domains=frozenset({"indiraivf.com"}),
+    ).for_account(currency_code="INR", timezone="Asia/Kolkata")
+    return policy.with_account_budget(total)
 
 
 # ---------------------------------------------------------------------------
-# parsing and tier merge
+# assembly
 # ---------------------------------------------------------------------------
 
-def test_tier_override_merges_key_by_key(write_policy) -> None:
-    policy = load_policy_file(write_policy())
 
-    operator = policy.limits_for(Tier.OPERATOR).budget
-    lead = policy.limits_for(Tier.LEAD).budget
-
-    # operator overrides max_daily but not min_daily, which comes from defaults
-    assert operator.max_daily_units == Decimal(2000)
-    assert operator.min_daily_units == Decimal(50)
-    # lead has an empty override block, so it is pure defaults
-    assert lead.max_daily_units == Decimal(5000)
+def test_the_increase_percent_comes_from_settings(tmp_path: Path) -> None:
+    store = PolicyStore(_settings(tmp_path, max_increase_percent=25))
+    limits = store.current().limits_for(Tier.OPERATOR)
+    assert limits.budget.max_increase_percent == Decimal(25)
+    assert limits.bids.max_increase_percent == Decimal(25)
 
 
-def test_tier_none_gets_zeros_even_if_config_omits_it(write_policy) -> None:
-    # policy.yaml has no `none` block. It must not inherit the defaults.
-    policy = load_policy_file(write_policy())
-    limits = policy.limits_for(Tier.NONE)
-    assert limits.budget.max_daily_units == Decimal(0)
-    assert limits.bids.max_cpc_units == Decimal(0)
+@pytest.mark.parametrize("tier", [Tier.NONE, Tier.READONLY])
+def test_non_writing_tiers_are_pinned_to_zero_in_code(tier: Tier) -> None:
+    """Not trusted to any table. There is no file to omit their block now,
+    but pinning here is what makes the guarantee independent of how
+    DAILY_INCREASE_PERCENT_BY_TIER is edited."""
+    limits = _policy().limits_for(tier)
+    assert limits.budget.max_increase_percent == Decimal(0)
+    assert limits.budget.max_total_increase_percent_of_account == Decimal(0)
+    assert limits.bids.max_increase_percent == Decimal(0)
 
 
-def test_the_shipped_policy_file_actually_loads() -> None:
-    """Regression guard: the real config/policy.yaml must parse.
-
-    Every other test in this file builds its own policy, which means they
-    all passed while the shipped file was unloadable. Without this test the
-    first sign of that would have been the server refusing to boot on deploy.
-    """
-    shipped = Path(__file__).resolve().parents[1] / "config" / "policy.yaml"
-    policy = load_policy_file(shipped)
-    assert policy.version == 2
-    # and the non-writing tiers are pinned to zero regardless of the file
-    assert policy.limits_for(Tier.READONLY).budget.max_daily_units == Decimal(0)
-    assert policy.limits_for(Tier.NONE).budget.max_daily_units == Decimal(0)
+def test_a_lead_has_more_daily_headroom_than_an_operator() -> None:
+    assert (
+        DAILY_INCREASE_PERCENT_BY_TIER[Tier.LEAD]
+        > DAILY_INCREASE_PERCENT_BY_TIER[Tier.OPERATOR]
+    )
 
 
-def test_unknown_version_is_refused(write_policy) -> None:
-    with pytest.raises(PolicyError, match="version"):
-        load_policy_file(write_policy({"version": 99}))
-
-
-def test_unknown_tier_name_is_refused(write_policy) -> None:
-    # A typo like `oprator:` must break loudly, not silently do nothing.
-    with pytest.raises(PolicyError, match="not a known tier"):
-        load_policy_file(
-            write_policy({"limits": {"tiers": {"oprator": {"budget": {}}}}})
-        )
-
-
-def test_min_above_max_is_refused(write_policy) -> None:
-    with pytest.raises(PolicyError, match="would block every change"):
-        load_policy_file(
-            write_policy({"limits": {"defaults": {"budget": {"min_daily": 9000}}}})
-        )
+def test_the_store_has_no_error_to_report(tmp_path: Path) -> None:
+    """There is no edit left that could be refused, so /healthz can only be
+    degraded by roles.yaml now."""
+    assert PolicyStore(_settings(tmp_path)).last_error is None
 
 
 # ---------------------------------------------------------------------------
-# per-account currency and timezone
+# per-account stamping
 # ---------------------------------------------------------------------------
 
-def test_for_account_stamps_the_accounts_own_currency_and_timezone(
-    write_policy,
-) -> None:
-    """Neither value is configured any more; both ride in from the account."""
-    policy = load_policy_file(write_policy())
-    stamped = policy.for_account(currency_code="USD", timezone="America/New_York")
+
+def test_for_account_stamps_the_accounts_own_currency_and_timezone() -> None:
+    bare = build_policy(
+        max_increase_percent=Decimal(100), allowed_final_url_domains=frozenset()
+    )
+    stamped = bare.for_account(currency_code="USD", timezone="America/New_York")
 
     assert (stamped.currency_code, stamped.timezone) == ("USD", "America/New_York")
-    # and the original snapshot is untouched
-    assert policy.currency_code == ""
+    assert bare.currency_code == ""  # the original snapshot is untouched
 
 
-def test_for_account_keeps_the_previous_value_when_google_returns_nothing(
-    write_policy,
-) -> None:
-    policy = load_policy_file(write_policy()).for_account(
-        currency_code="INR", timezone="Asia/Kolkata"
-    )
-    stamped = policy.for_account(currency_code="", timezone="")
-    assert (stamped.currency_code, stamped.timezone) == ("INR", "Asia/Kolkata")
+def test_for_account_keeps_the_previous_value_when_google_returns_nothing() -> None:
+    policy = _policy().for_account(currency_code="", timezone="")
+    assert (policy.currency_code, policy.timezone) == ("INR", "Asia/Kolkata")
 
 
-def test_blocked_operation(write_policy) -> None:
-    policy = load_policy_file(write_policy())
+def test_blocked_operation() -> None:
+    policy = _policy()
     assert not evaluate_operation(policy, "remove_campaign").allowed
     assert evaluate_operation(policy, "pause_campaign").allowed
 
 
 # ---------------------------------------------------------------------------
-# budget: max daily, at the boundary
+# budget: the per-change percentage
 # ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    ("new_units", "allowed"),
-    [("1999.99", True), ("2000", True), ("2000.01", False)],
-)
-def test_operator_max_daily_boundary(write_policy, new_units: str, allowed: bool) -> None:
-    policy = load_policy_file(write_policy())
-    verdict = evaluate_budget_change(
-        policy, tier=Tier.OPERATOR, current_units=1900, new_units=new_units
-    )
-    assert verdict.allowed is allowed
 
 
 @pytest.mark.parametrize(
-    ("new_units", "allowed"),
-    [("50", True), ("49.99", False)],
-)
-def test_min_daily_boundary(write_policy, new_units: str, allowed: bool) -> None:
-    policy = load_policy_file(write_policy())
-    verdict = evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units=100, new_units=new_units
-    )
-    assert verdict.allowed is allowed
-
-
-# ---------------------------------------------------------------------------
-# budget: increase percent, at the boundary
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    ("new_units", "allowed"),
+    "new_units, allowed",
     [
-        ("1199", True),    # 19.9% - under the operator's 20%
-        ("1200", True),    # exactly 20%
-        ("1200.01", False),  # a hair over
+        ("2000", True),  # exactly +100%, inclusive
+        ("2000.01", False),  # a hair over
+        ("1500", True),
     ],
 )
-def test_operator_increase_percent_boundary(
-    write_policy, new_units: str, allowed: bool
-) -> None:
-    policy = load_policy_file(write_policy())
+def test_increase_percent_boundary(new_units: str, allowed: bool) -> None:
     verdict = evaluate_budget_change(
-        policy, tier=Tier.OPERATOR, current_units=1000, new_units=new_units
+        _policy(), tier=Tier.OPERATOR, current_units="1000", new_units=new_units
     )
     assert verdict.allowed is allowed
 
 
-def test_decrease_is_never_blocked_by_the_increase_limit(write_policy) -> None:
-    # Lowering a budget by 90% is a large change but not a risky one.
-    policy = load_policy_file(write_policy())
+def test_the_percentage_is_relative_so_it_holds_at_any_scale() -> None:
+    """The property that let the absolute caps go: one rule, correct for a
+    tiny campaign and a huge one, with nothing to configure."""
+    policy = _policy(total=Decimal(10_000_000))
     assert evaluate_budget_change(
-        policy, tier=Tier.OPERATOR, current_units=1000, new_units=100
+        policy, tier=Tier.LEAD, current_units="100", new_units="200"
+    ).allowed
+    assert evaluate_budget_change(
+        policy, tier=Tier.LEAD, current_units="100000", new_units="200000"
+    ).allowed
+    assert not evaluate_budget_change(
+        policy, tier=Tier.LEAD, current_units="100000", new_units="300000"
     ).allowed
 
 
-def test_raising_from_zero_is_refused_rather_than_treated_as_zero_percent(
-    write_policy,
-) -> None:
-    policy = load_policy_file(write_policy())
+def test_there_is_no_absolute_ceiling_on_a_single_budget() -> None:
+    """max_daily is gone. A large budget on a large account is ordinary, and
+    refusing it was refusing every real campaign this server manages."""
     verdict = evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units=0, new_units=500
+        _policy(total=Decimal(1_000_000)),
+        tier=Tier.LEAD,
+        current_units="50000",
+        new_units="60000",
+    )
+    assert verdict.allowed
+
+
+def test_a_decrease_is_never_blocked() -> None:
+    """There is no minimum any more. Lowering a budget is the one change that
+    can only ever reduce spend, so refusing it protected nothing."""
+    for new_units in ("1", "0.01", "500"):
+        verdict = evaluate_budget_change(
+            _policy(), tier=Tier.OPERATOR, current_units="1000", new_units=new_units
+        )
+        assert verdict.allowed, new_units
+
+
+def test_zero_is_still_refused() -> None:
+    assert not evaluate_budget_change(
+        _policy(), tier=Tier.OPERATOR, current_units="1000", new_units="0"
+    ).allowed
+
+
+def test_raising_from_zero_is_refused_rather_than_treated_as_zero_percent() -> None:
+    verdict = evaluate_budget_change(
+        _policy(), tier=Tier.OPERATOR, current_units="0", new_units="100"
     )
     assert not verdict.allowed
     assert "undefined" in verdict.describe()
 
 
 # ---------------------------------------------------------------------------
-# budget: per-user daily ceiling, at the boundary
+# budget: the daily ceiling
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
-    ("already_today", "allowed"),
+    "already_today, allowed",
     [
-        ("2799", True),   # +200 lands at 2999, under the operator's 3000
-        ("2800", True),   # +200 lands exactly on 3000
-        ("2800.01", False),  # a hair over
+        ("0", True),
+        ("900", True),  # 900 + 100 = 1000, exactly the operator ceiling
+        ("900.01", False),
     ],
 )
-def test_daily_ceiling_boundary(write_policy, already_today: str, allowed: bool) -> None:
-    policy = load_policy_file(write_policy())
+def test_daily_ceiling_boundary(already_today: str, allowed: bool) -> None:
     verdict = evaluate_budget_change(
-        policy,
+        _policy(),
         tier=Tier.OPERATOR,
-        current_units=1000,
-        new_units=1200,  # a +200 increase, within the 20% per-change limit
+        current_units="1000",
+        new_units="1100",  # +100
         already_increased_today_units=already_today,
     )
     assert verdict.allowed is allowed
 
 
-def test_daily_ceiling_counts_the_proposed_change_too(write_policy) -> None:
-    policy = load_policy_file(write_policy())
-    verdict = evaluate_budget_change(
-        policy,
+def test_the_ceiling_scales_with_the_account() -> None:
+    """The whole point of expressing it as a percentage: the same rule is
+    right for a small account and a large one, with nothing to update."""
+    small = evaluate_budget_change(
+        _policy(total=Decimal(1_000)),
         tier=Tier.OPERATOR,
-        current_units=1000,
-        new_units=1200,
-        already_increased_today_units=2900,
+        current_units="1000",
+        new_units="1200",  # +200, over 10% of 1,000
+    )
+    large = evaluate_budget_change(
+        _policy(total=Decimal(100_000)),
+        tier=Tier.OPERATOR,
+        current_units="1000",
+        new_units="1200",  # +200, well under 10% of 100,000
+    )
+    assert not small.allowed
+    assert large.allowed
+
+
+def test_the_ceiling_counts_the_proposed_change_too() -> None:
+    """Otherwise the last change of the day is always free."""
+    verdict = evaluate_budget_change(
+        _policy(),
+        tier=Tier.OPERATOR,
+        current_units="1000",
+        new_units="1600",  # +600
+        already_increased_today_units="600",  # 1,200 total, over 1,000
     )
     assert not verdict.allowed
-    assert "daily ceiling" in verdict.describe()
 
 
-def test_readonly_tier_is_refused_everything(write_policy) -> None:
-    policy = load_policy_file(write_policy())
-    assert not evaluate_budget_change(
-        policy, tier=Tier.READONLY, current_units=100, new_units=101
+def test_a_lead_has_a_higher_ceiling_than_an_operator() -> None:
+    # +1,500: over the operator's 1,000 ceiling, under the lead's 2,500.
+    change = dict(current_units="2000", new_units="3500", already_increased_today_units="0")
+    assert not evaluate_budget_change(_policy(), tier=Tier.OPERATOR, **change).allowed
+    assert evaluate_budget_change(_policy(), tier=Tier.LEAD, **change).allowed
+
+
+def test_an_unknown_account_total_refuses_rather_than_skipping_the_ceiling() -> None:
+    """`None` means the read failed. Skipping the rule would silently turn a
+    Google hiccup into an unbounded change."""
+    policy = _policy().with_account_budget(None)
+    verdict = evaluate_budget_change(
+        policy, tier=Tier.OPERATOR, current_units="1000", new_units="1100"
+    )
+    assert not verdict.allowed
+    assert "could not be established" in verdict.describe()
+
+
+def test_an_unknown_account_total_still_permits_a_decrease() -> None:
+    """A decrease returns before the ceiling is consulted, so a failed read
+    never blocks the one change that can only reduce spend."""
+    policy = _policy().with_account_budget(None)
+    assert evaluate_budget_change(
+        policy, tier=Tier.OPERATOR, current_units="1000", new_units="500"
     ).allowed
-    assert not evaluate_budget_change(
-        policy, tier=Tier.NONE, current_units=100, new_units=101
-    ).allowed
+
+
+def test_readonly_tier_is_refused_everything() -> None:
+    verdict = evaluate_budget_change(
+        _policy(), tier=Tier.READONLY, current_units="1000", new_units="1001"
+    )
+    assert not verdict.allowed
 
 
 # ---------------------------------------------------------------------------
 # bids
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
-    ("new_units", "allowed"),
-    [("99.99", True), ("100", True), ("100.01", False)],
+    "new_units, allowed",
+    [("100", True), ("200", True), ("200.01", False)],
 )
-def test_operator_max_cpc_boundary(write_policy, new_units: str, allowed: bool) -> None:
-    policy = load_policy_file(write_policy())
+def test_bid_increase_percent_boundary(new_units: str, allowed: bool) -> None:
     verdict = evaluate_bid_change(
-        policy, tier=Tier.OPERATOR, current_units=90, new_units=new_units
+        _policy(), tier=Tier.LEAD, current_units="100", new_units=new_units
     )
     assert verdict.allowed is allowed
 
 
-@pytest.mark.parametrize(
-    ("new_units", "allowed"),
-    [("12.9", True), ("13", True), ("13.01", False)],
-)
-def test_bid_increase_percent_boundary(
-    write_policy, new_units: str, allowed: bool
-) -> None:
-    # default max_increase_percent is 30; from 10 that allows up to 13.
-    policy = load_policy_file(write_policy())
+def test_there_is_no_absolute_max_cpc() -> None:
+    """Removed for the same reason as max_daily: the right number is entirely
+    account-specific, so any fixed one is wrong somewhere."""
+    assert evaluate_bid_change(
+        _policy(), tier=Tier.LEAD, current_units="5000", new_units="6000"
+    ).allowed
+
+
+def test_lowering_a_bid_is_always_allowed() -> None:
+    assert evaluate_bid_change(
+        _policy(), tier=Tier.LEAD, current_units="100", new_units="1"
+    ).allowed
+
+
+def test_a_bid_of_zero_is_refused() -> None:
+    assert not evaluate_bid_change(
+        _policy(), tier=Tier.LEAD, current_units="100", new_units="0"
+    ).allowed
+
+
+def test_raising_a_bid_from_zero_is_refused() -> None:
     verdict = evaluate_bid_change(
-        policy, tier=Tier.LEAD, current_units=10, new_units=new_units
+        _policy(), tier=Tier.LEAD, current_units="0", new_units="50"
     )
-    assert verdict.allowed is allowed
-
-
-# ---------------------------------------------------------------------------
-# broad match under manual CPC
-# ---------------------------------------------------------------------------
-
-def test_broad_match_blocked_on_manual_cpc(write_policy) -> None:
-    policy = load_policy_file(write_policy())
-    assert not evaluate_match_type_against_bidding(
-        policy, match_type="BROAD", bidding_strategy="MANUAL_CPC"
-    ).allowed
-    assert evaluate_match_type_against_bidding(
-        policy, match_type="PHRASE", bidding_strategy="MANUAL_CPC"
-    ).allowed
-    assert evaluate_match_type_against_bidding(
-        policy, match_type="BROAD", bidding_strategy="MAXIMIZE_CONVERSIONS"
-    ).allowed
-
-
-def test_broad_match_rule_can_be_turned_off_in_config(write_policy) -> None:
-    policy = load_policy_file(
-        write_policy({"rules": {"block_broad_match_with_manual_cpc": False}})
-    )
-    assert evaluate_match_type_against_bidding(
-        policy, match_type="BROAD", bidding_strategy="MANUAL_CPC"
-    ).allowed
-
-
-# ---------------------------------------------------------------------------
-# hot reload
-# ---------------------------------------------------------------------------
-
-def test_valid_edit_takes_effect_without_restart(write_policy, tmp_path: Path) -> None:
-    path = write_policy()
-    store = PolicyStore(path)
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-
-    write_policy({"limits": {"defaults": {"budget": {"max_daily": 7000}}}})
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(7000)
-    assert store.reload_count == 1
-    assert store.last_error is None
-
-
-def test_invalid_edit_keeps_the_last_good_policy(write_policy) -> None:
-    # The important property: a broken edit must not relax limits, and must
-    # not crash a request that is mid-flight.
-    path = write_policy()
-    store = PolicyStore(path)
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-
-    path.write_text("this: is: not: valid: yaml:\n  - [", encoding="utf-8")
-
-    still = store.current()
-    assert still.limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-    assert store.last_error is not None
-    assert store.reload_count == 0
-
-
-def test_structurally_invalid_edit_is_also_refused(write_policy) -> None:
-    # Parses as YAML, but `limits` is gone. Must not be adopted.
-    path = write_policy()
-    store = PolicyStore(path)
-    path.write_text("version: 2" + chr(10), encoding="utf-8")
-
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-    assert store.last_error is not None
-
-
-@pytest.mark.parametrize("broken_block", [None, 5, "daily"])
-def test_a_mis_shaped_tier_block_is_refused_rather_than_crashing(
-    write_policy, broken_block
-) -> None:
-    """Valid YAML, wrong shape.
-
-    `budget:` with nothing under it parses to None, and the tier merge
-    overwrites the defaults dict with it. The parser must name the problem
-    as a PolicyError like every other bad edit - anything else escapes the
-    store's safety net and reaches a live request.
-    """
-    with pytest.raises(PolicyError) as caught:
-        load_policy_file(
-            write_policy({"limits": {"tiers": {"operator": {"budget": broken_block}}}})
-        )
-    assert "budget" in str(caught.value)
-
-
-def test_a_mis_shaped_tier_block_keeps_the_last_good_policy(write_policy) -> None:
-    """The same edit, arriving as a hot reload rather than at boot."""
-    path = write_policy()
-    store = PolicyStore(path)
-    assert store.current().limits_for(Tier.OPERATOR).budget.max_daily_units == Decimal(2000)
-
-    write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})
-
-    still = store.current()
-    assert still.limits_for(Tier.OPERATOR).budget.max_daily_units == Decimal(2000)
-    assert store.last_error is not None
-    assert store.reload_count == 0
-
-
-def test_an_unexpected_reload_failure_still_keeps_the_last_good_policy(
-    write_policy, monkeypatch
-) -> None:
-    """The safety net, independent of any particular bad edit.
-
-    PolicyStore used to catch only PolicyError, so a parser bug that raised
-    anything else - a TypeError on a mis-shaped block, say - escaped into
-    the caller's request AND left last_error unset, so /healthz went on
-    reporting a healthy server. Whatever goes wrong, the rule is the same:
-    keep the last good policy, record it, never raise into a request.
-    """
-    import gads_write.safety.policy as policy_module
-
-    path = write_policy()
-    store = PolicyStore(path)
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-
-    def explode(_path):
-        raise RuntimeError("something nobody anticipated")
-
-    monkeypatch.setattr(policy_module, "load_policy_file", explode)
-    write_policy({"limits": {"defaults": {"budget": {"max_daily": 9999}}}})
-
-    still = store.current()
-    assert still.limits_for(Tier.LEAD).budget.max_daily_units == Decimal(5000)
-    assert store.last_error is not None
-    assert "something nobody anticipated" in store.last_error
-    assert store.reload_count == 0
-
-
-def test_a_bad_edit_followed_by_a_good_one_recovers(write_policy) -> None:
-    path = write_policy()
-    store = PolicyStore(path)
-
-    path.write_text("garbage: [", encoding="utf-8")
-    store.current()
-    assert store.last_error is not None
-
-    write_policy({"limits": {"defaults": {"budget": {"max_daily": 6000}}}})
-    assert store.current().limits_for(Tier.LEAD).budget.max_daily_units == Decimal(6000)
-    assert store.last_error is None
-
-
-def test_a_plan_drafted_under_old_limits_fails_once_they_are_tightened(
-    write_policy,
-) -> None:
-    """The gate condition, at the policy layer.
-
-    A change is drafted while the cap is 5000 and would be allowed. The cap
-    is then lowered to 1000. Re-evaluating the SAME change - which is what
-    guards.py does at confirm time - now refuses it.
-    """
-    path = write_policy()
-    store = PolicyStore(path)
-
-    drafted = dict(tier=Tier.LEAD, current_units=1000, new_units=1200)
-    assert evaluate_budget_change(store.current(), **drafted).allowed
-
-    write_policy({"limits": {"defaults": {"budget": {"max_daily": 1000}}}})
-
-    verdict = evaluate_budget_change(store.current(), **drafted)
     assert not verdict.allowed
-    assert "exceeds" in verdict.describe()
+    assert "undefined" in verdict.describe()
+
+
+# ---------------------------------------------------------------------------
+# structural rules
+# ---------------------------------------------------------------------------
+
+
+def test_broad_match_blocked_on_manual_cpc() -> None:
+    verdict = evaluate_match_type_against_bidding(
+        _policy(), match_type="BROAD", bidding_strategy="MANUAL_CPC"
+    )
+    assert not verdict.allowed
+
+
+@pytest.mark.parametrize(
+    "match_type, strategy",
+    [("PHRASE", "MANUAL_CPC"), ("EXACT", "MANUAL_CPC"), ("BROAD", "MAXIMIZE_CONVERSIONS")],
+)
+def test_other_combinations_are_permitted(match_type: str, strategy: str) -> None:
+    assert evaluate_match_type_against_bidding(
+        _policy(), match_type=match_type, bidding_strategy=strategy
+    ).allowed
+
+
+def test_the_structural_rules_are_fixed_rather_than_configurable() -> None:
+    """These used to be settings. A setting nobody should ever change is not
+    a setting - and "new keywords start ENABLED" is not a thing anyone wants."""
+    rules = _policy().rules
+    assert rules.new_entities_start_paused is True
+    assert rules.block_broad_match_with_manual_cpc is True

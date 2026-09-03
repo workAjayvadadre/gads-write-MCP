@@ -8,12 +8,11 @@ applied under rules it was never checked against.
 
 They used to be different code, and the gap was real. `REVALIDATORS` carried
 only the argument-shape validator, and confirm re-ran that faithfully. But
-the money rules - `max_daily`, `max_increase_percent`, `max_cpc`, broad match
-under manual CPC, and the per-user daily ceiling - lived in an `evaluate`
-closure inside each draft tool's body, reachable from nowhere else. Confirm
-never passed one, and `Guard.check` skips the whole policy evaluation when
-`evaluate is None`. So a plan drafted while the operator ceiling was 2000
-still applied after a lead dropped it to 60.
+the money rules - `max_increase_percent`, broad match under manual CPC, and
+the per-user daily ceiling - lived in an `evaluate` closure inside each draft
+tool's body, reachable from nowhere else. Confirm never passed one, and
+`Guard.check` skips the whole policy evaluation when `evaluate is None`. So a
+plan drafted while the ceiling was wide still applied after it narrowed.
 
 The other half of the same bug: budget and bid rules are RELATIVE. A plan
 stores an ABSOLUTE target (`amount_micros`), so re-checking one means

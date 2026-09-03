@@ -235,6 +235,15 @@ class AdsReader(Protocol):
 
     async def account_summary(self, customer_id: str) -> AccountSummary | None: ...
 
+    async def account_total_daily_budget_micros(self, customer_id: str) -> int:
+        """The account's total daily budget, summed across its live budgets.
+
+        The base the per-user daily increase ceiling is a percentage of. It
+        replaces a rupee figure in a config file, so that the ceiling scales
+        with the account instead of going stale.
+        """
+        ...
+
     async def managed_accounts(
         self, *, manager_customer_id: str
     ) -> tuple[AccountSummary, ...]:
@@ -386,6 +395,20 @@ class GoogleAdsReader(AdsReader):
             is_test_account=bool(customer.test_account),
             status=_enum_name(customer.status),
         )
+
+    async def account_total_daily_budget_micros(self, customer_id: str) -> int:
+        customer_id = _literal(customer_id, field="customer_id")
+        # Summed from campaign_budget rather than from campaigns, because a
+        # shared budget is one row backing several campaigns: summing per
+        # campaign would count it once per campaign and inflate the base the
+        # daily ceiling is measured against.
+        query = (
+            "SELECT campaign_budget.id, campaign_budget.amount_micros "
+            "FROM campaign_budget "
+            "WHERE campaign_budget.status = 'ENABLED'"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return sum(int(row.campaign_budget.amount_micros or 0) for row in rows)
 
     async def managed_accounts(
         self, *, manager_customer_id: str

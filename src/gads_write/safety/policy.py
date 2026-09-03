@@ -1,23 +1,42 @@
-"""Load, hot-reload, and evaluate config/policy.yaml.
+"""The spending rules, and the pure functions that evaluate them.
 
-Two responsibilities, deliberately kept apart:
+There is no policy FILE any more. Every value here is either derived from
+the account being changed, fixed in code, or set once at deploy in the
+environment - because a rupee limit in a YAML file was unmaintainable by
+construction. ₹50 means nothing without knowing the account: too high for a
+test campaign, absurdly low for a real one, and stale the moment budgets
+move. Somebody has to keep it current, and that somebody was a developer.
 
-  1. `PolicyStore` owns the file and its reloading. It is the only mutable
-     thing here.
-  2. `Policy` is an immutable snapshot, and the `evaluate_*` functions are
-     pure. Given the same snapshot and the same inputs they always return
-     the same verdict, which is what makes boundary testing meaningful.
+What replaced each thing, and why it is safe:
 
-Hot reload contract, which matters because your marketing lead edits this
-file on a live server:
+  min_daily / max_daily / max_cpc   REMOVED. They bounded nothing a human
+    could not already do in the Google Ads UI, and Google itself offers no
+    manager-set ceiling on a campaign budget for us to lean on. The error
+    they actually caught was an LLM turning "bump it a bit" into 50000, and
+    a RELATIVE cap catches that without knowing anything about the account.
+    `min_daily` was worse than useless: it blocked LOWERING a budget, which
+    is the safe direction.
 
-  - A valid edit takes effect on the next call. No restart.
-  - An INVALID edit is refused. The last known-good policy stays in force
-    and the error is logged. We never fall back to permissive defaults and
-    we never crash a request because someone mistyped YAML.
-  - A guard evaluation reads the snapshot ONCE and uses it throughout, so a
-    save that lands mid-evaluation cannot produce a half-old, half-new
-    verdict.
+  max_increase_percent             KEPT, and now the load-bearing control.
+    "Never more than double in one change" is correct for a ₹100 campaign
+    and a ₹100,000 one, never goes stale, and needs no setup.
+    GADS_MAX_INCREASE_PERCENT, default 100.
+
+  max_total_increase_per_user_per_day   KEPT, but expressed as a percentage
+    of the ACCOUNT'S OWN total daily budget rather than a rupee amount, so
+    it scales itself. It closes the incremental-creep hole that the
+    per-change cap cannot: ten changes each under the per-change limit still
+    compound. Still derived from the audit log, never a counter - see
+    safety/spend.py.
+
+  the structural rules             Fixed in code. Nobody was ever going to
+    want "new keywords start ENABLED" or "broad match on manual CPC is fine".
+    A setting nobody should change is not a setting.
+
+`PolicyStore` survives as the seam every caller already reads through, so
+that removing the file changed no call site downstream. It no longer reloads
+anything, and `last_error` is now always None - there is no longer any edit
+that can be refused.
 
 Python notes for a TypeScript reader:
   - `Decimal` again for money. Never float.
@@ -28,15 +47,9 @@ Python notes for a TypeScript reader:
 from __future__ import annotations
 
 import logging
-import os
-import threading
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 from ..auth.tiers import Tier
 from .units import MoneyError, coerce_units, percent_change
@@ -51,7 +64,7 @@ NON_WRITING_TIERS = (Tier.NONE, Tier.READONLY)
 
 
 class PolicyError(RuntimeError):
-    """Raised when policy.yaml cannot be interpreted."""
+    """Raised when the policy cannot be assembled or read."""
 
 
 # ---------------------------------------------------------------------------
@@ -60,15 +73,17 @@ class PolicyError(RuntimeError):
 
 @dataclass(frozen=True)
 class BudgetLimits:
-    min_daily_units: Decimal
-    max_daily_units: Decimal
+    # Per change. Relative, so it never needs tuning per account.
     max_increase_percent: Decimal
-    max_total_increase_per_user_per_day_units: Decimal
+    # Per user per day, as a percentage of the account's own total daily
+    # budget. Relative for the same reason, and it is what stops ten small
+    # increases compounding past what one large one would have been refused
+    # for.
+    max_total_increase_percent_of_account: Decimal
 
 
 @dataclass(frozen=True)
 class BidLimits:
-    max_cpc_units: Decimal
     max_increase_percent: Decimal
 
 
@@ -85,33 +100,123 @@ class Rules:
     allowed_final_url_domains: frozenset[str]
 
 
+# ---------------------------------------------------------------------------
+# fixed rules
+# ---------------------------------------------------------------------------
+# These were settings. They are constants now because there is no plausible
+# reason to want the other value: nobody wants a new keyword to start
+# spending before a human has seen it, and nobody wants broad match on a
+# manual-CPC campaign.
+NEW_ENTITIES_START_PAUSED = True
+BLOCK_BROAD_MATCH_WITH_MANUAL_CPC = True
+
+# A plan is a draft awaiting human approval. Ten minutes is long enough to
+# read a preview and short enough that an abandoned one cannot be applied
+# later by accident.
+PLAN_TTL_SECONDS = 600
+PLAN_SINGLE_USE = True
+
+# Second line of defence only: none of these tools exist. If one ever fires,
+# something regressed.
+BLOCKED_OPERATIONS = frozenset(
+    {
+        "remove_campaign",
+        "remove_ad_group",
+        "remove_keyword",
+        "remove_budget",
+        "remove_conversion_action",
+        "remove_ad",
+    }
+)
+
+# The daily ceiling, per tier, as a percentage of the account's total daily
+# budget. Fixed in code rather than configured, and deliberately different
+# per tier: it is the one place the operator/lead distinction still carries a
+# number. An operator may add a tenth of the account's daily spend in a day;
+# a lead a quarter.
+DAILY_INCREASE_PERCENT_BY_TIER: dict[Tier, Decimal] = {
+    Tier.OPERATOR: Decimal(10),
+    Tier.LEAD: Decimal(25),
+}
+
+
+def build_policy(
+    *,
+    max_increase_percent: Decimal,
+    allowed_final_url_domains: frozenset[str],
+) -> "Policy":
+    """Assemble the policy from settings and the constants above.
+
+    Replaces `parse_policy`. `none` and `readonly` are still pinned to zero
+    HERE, in code, for the same reason they always were: a config file that
+    omitted their block would have had them silently inherit the permissive
+    defaults, which is exactly the bug a test caught while this module was
+    first written. There is no file to omit anything now, but the pinning is
+    what makes that guarantee independent of how the table above is edited.
+    """
+    denied_everything = TierLimits(
+        budget=BudgetLimits(
+            max_increase_percent=Decimal(0),
+            max_total_increase_percent_of_account=Decimal(0),
+        ),
+        bids=BidLimits(max_increase_percent=Decimal(0)),
+    )
+
+    limits_by_tier: dict[str, TierLimits] = {}
+    for tier in Tier:
+        if tier in NON_WRITING_TIERS:
+            limits_by_tier[tier.value] = denied_everything
+            continue
+        limits_by_tier[tier.value] = TierLimits(
+            budget=BudgetLimits(
+                max_increase_percent=max_increase_percent,
+                max_total_increase_percent_of_account=(
+                    DAILY_INCREASE_PERCENT_BY_TIER[tier]
+                ),
+            ),
+            bids=BidLimits(max_increase_percent=max_increase_percent),
+        )
+
+    return Policy(
+        rules=Rules(
+            new_entities_start_paused=NEW_ENTITIES_START_PAUSED,
+            block_broad_match_with_manual_cpc=BLOCK_BROAD_MATCH_WITH_MANUAL_CPC,
+            allowed_final_url_domains=allowed_final_url_domains,
+        ),
+        blocked_operations=BLOCKED_OPERATIONS,
+        plan_ttl_seconds=PLAN_TTL_SECONDS,
+        plan_single_use=PLAN_SINGLE_USE,
+        _limits_by_tier=limits_by_tier,
+    )
+
+
 @dataclass(frozen=True)
 class Policy:
-    version: int
     rules: Rules
     blocked_operations: frozenset[str]
     plan_ttl_seconds: int
     plan_single_use: bool
     _limits_by_tier: dict[str, TierLimits]
-    # Not configured. Both are properties of the ACCOUNT being changed, and
-    # the guard stamps them on per request via `for_account`. The defaults
-    # below apply only to decisions that name no account at all - a refusal
-    # at the kill switch, say - where no money is in play and the values are
-    # never used for a comparison.
+    # Stamped on per request by the gate, from the account being changed.
+    # See `for_account` and `with_account_budget`.
     currency_code: str = ""
     timezone: str = "UTC"
+    # The account's total daily budget across its campaigns. `None` means it
+    # was never established, which is why the daily-ceiling rule refuses
+    # rather than assuming - see evaluate_budget_change.
+    account_total_budget_units: Decimal | None = None
 
     def limits_for(self, tier: Tier) -> TierLimits:
-        """Limits for a tier, with defaults already merged in."""
+        """Limits for a tier, with the non-writing tiers pinned to zero."""
         try:
             return self._limits_by_tier[tier.value]
-        except KeyError as exc:  # pragma: no cover - guarded at load time
+        except KeyError as exc:  # pragma: no cover - every Tier is populated
             raise PolicyError(f"no limits configured for tier {tier.value!r}") from exc
 
     def for_account(self, *, currency_code: str, timezone: str) -> "Policy":
         """This policy, stamped with one account's currency and timezone.
 
-        The seam that let `currency_code` and `timezone` leave policy.yaml.
+        The seam that let `currency_code` and `timezone` stop being config.
         Every downstream evaluator already reads them off the snapshot, so
         rebinding them here means no evaluator signature had to change - and
         an account in a different currency can no longer be compared against
@@ -123,297 +228,50 @@ class Policy:
             timezone=(timezone or "").strip() or self.timezone,
         )
 
+    def with_account_budget(self, total_units: Decimal | None) -> "Policy":
+        """This policy, stamped with the account's total daily budget.
+
+        Same seam, one step later: the gate fetches this ONLY when a rule
+        actually needs it, so a read - which has no spend to check - still
+        costs no Google round trip. See safety/guards.py step 7.
+        """
+        return replace(self, account_total_budget_units=total_units)
+
     def blocks_operation(self, operation: str) -> bool:
         return str(operation).strip() in self.blocked_operations
 
 
 # ---------------------------------------------------------------------------
-# parsing
-# ---------------------------------------------------------------------------
-
-def _require(mapping: Any, key: str, where: str) -> Any:
-    # The isinstance check is not defensive noise. A block written as
-    # `budget:` with nothing under it parses to None, and the tier merge
-    # below replaces the inherited defaults dict with that None. Without
-    # this, `key not in None` raises TypeError - which is not a PolicyError,
-    # so it escapes PolicyStore's safety net and reaches a live request while
-    # last_error stays empty and /healthz keeps answering "ok".
-    if not isinstance(mapping, Mapping):
-        raise PolicyError(
-            f"{where}: expected a mapping of settings, got "
-            f"{type(mapping).__name__} - a block left empty or set to a "
-            f"single value cannot be merged with the defaults"
-        )
-    if key not in mapping:
-        raise PolicyError(f"{where}: missing required key {key!r}")
-    return mapping[key]
-
-
-def _money(value: Any, where: str) -> Decimal:
-    try:
-        amount = coerce_units(value, field=where)
-    except MoneyError as exc:
-        raise PolicyError(str(exc)) from exc
-    if amount < 0:
-        raise PolicyError(f"{where}: must not be negative, got {amount}")
-    return amount
-
-
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Merge `override` onto `base`, key by key, recursing into dicts.
-
-    An override that names only `max_daily` leaves the other budget keys at
-    their default. That is what makes the tier blocks in policy.yaml short.
-    """
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _parse_tier_limits(raw: dict[str, Any], where: str) -> TierLimits:
-    # Each sub-block names itself in `where`, so a mis-shaped one says which
-    # block it was rather than only which tier.
-    budget_where = f"{where}.budget"
-    bids_where = f"{where}.bids"
-    budget_raw = _require(raw, "budget", where)
-    bids_raw = _require(raw, "bids", where)
-
-    budget = BudgetLimits(
-        min_daily_units=_money(
-            _require(budget_raw, "min_daily", budget_where), f"{budget_where}.min_daily"
-        ),
-        max_daily_units=_money(
-            _require(budget_raw, "max_daily", budget_where), f"{budget_where}.max_daily"
-        ),
-        max_increase_percent=_money(
-            _require(budget_raw, "max_increase_percent", budget_where),
-            f"{budget_where}.max_increase_percent",
-        ),
-        max_total_increase_per_user_per_day_units=_money(
-            _require(budget_raw, "max_total_increase_per_user_per_day", budget_where),
-            f"{budget_where}.max_total_increase_per_user_per_day",
-        ),
-    )
-    if budget.min_daily_units > budget.max_daily_units:
-        raise PolicyError(
-            f"{where}.budget: min_daily ({budget.min_daily_units}) is above "
-            f"max_daily ({budget.max_daily_units}), which would block every change"
-        )
-
-    bids = BidLimits(
-        max_cpc_units=_money(
-            _require(bids_raw, "max_cpc", bids_where), f"{bids_where}.max_cpc"
-        ),
-        max_increase_percent=_money(
-            _require(bids_raw, "max_increase_percent", bids_where),
-            f"{bids_where}.max_increase_percent",
-        ),
-    )
-    return TierLimits(budget=budget, bids=bids)
-
-
-def parse_policy(raw: Any, *, source: str = "policy") -> Policy:
-    """Turn parsed YAML into a validated, immutable Policy.
-
-    Every problem raises. A policy that is half-understood is more dangerous
-    than no policy, because it looks like it is protecting you.
-    """
-    if not isinstance(raw, dict):
-        raise PolicyError(f"{source}: must be a YAML mapping")
-
-    version = _require(raw, "version", source)
-    if version != SUPPORTED_VERSION:
-        raise PolicyError(
-            f"{source}: version is {version!r}, this code understands "
-            f"{SUPPORTED_VERSION}. Refusing to guess at the structure."
-        )
-
-    limits_raw = _require(raw, "limits", source)
-    defaults_raw = _require(limits_raw, "defaults", f"{source}.limits")
-    if not isinstance(defaults_raw, dict):
-        raise PolicyError(f"{source}.limits.defaults: must be a mapping")
-
-    tier_overrides = limits_raw.get("tiers") or {}
-    if not isinstance(tier_overrides, dict):
-        raise PolicyError(f"{source}.limits.tiers: must be a mapping")
-    for name in tier_overrides:
-        if name not in {t.value for t in Tier}:
-            raise PolicyError(
-                f"{source}.limits.tiers: {name!r} is not a known tier "
-                f"{sorted(t.value for t in Tier)}"
-            )
-
-    # `none` and `readonly` are pinned to zero below, in code. Their blocks
-    # in policy.yaml are documentation, so they are not parsed at all --
-    # otherwise a documentation-only block could fail boot on a rule that
-    # does not apply to it (a `max_daily: 0` override tripping the
-    # min-above-max check while min_daily was inherited from defaults).
-    limits_by_tier: dict[str, TierLimits] = {}
-    for tier in Tier:
-        if tier in NON_WRITING_TIERS:
-            continue
-        override = tier_overrides.get(tier.value) or {}
-        if not isinstance(override, dict):
-            raise PolicyError(f"{source}.limits.tiers.{tier.value}: must be a mapping")
-        merged = _deep_merge(defaults_raw, override)
-        limits_by_tier[tier.value] = _parse_tier_limits(
-            merged, f"{source}.limits[{tier.value}]"
-        )
-
-    # `none` and `readonly` must never permit a spend change, whatever the
-    # file says. This is enforced in CODE rather than trusted to config: a
-    # policy.yaml that simply omits these blocks would otherwise have them
-    # silently inherit the permissive defaults, which is precisely the
-    # failure a test caught while this module was being written.
-    #
-    # The blocks in config/policy.yaml are documentation. These lines are
-    # the enforcement.
-    denied_everything = TierLimits(
-        budget=BudgetLimits(
-            min_daily_units=Decimal(0),
-            max_daily_units=Decimal(0),
-            max_increase_percent=Decimal(0),
-            max_total_increase_per_user_per_day_units=Decimal(0),
-        ),
-        bids=BidLimits(max_cpc_units=Decimal(0), max_increase_percent=Decimal(0)),
-    )
-    for non_writing_tier in NON_WRITING_TIERS:
-        limits_by_tier[non_writing_tier.value] = denied_everything
-
-    rules_raw = _require(raw, "rules", source)
-    domains = rules_raw.get("allowed_final_url_domains") or []
-    if not isinstance(domains, list):
-        raise PolicyError(f"{source}.rules.allowed_final_url_domains: must be a list")
-
-    rules = Rules(
-        new_entities_start_paused=bool(
-            _require(rules_raw, "new_entities_start_paused", f"{source}.rules")
-        ),
-        block_broad_match_with_manual_cpc=bool(
-            _require(rules_raw, "block_broad_match_with_manual_cpc", f"{source}.rules")
-        ),
-        allowed_final_url_domains=frozenset(str(d).strip().lower() for d in domains),
-    )
-
-    plans_raw = _require(raw, "plans", source)
-    ttl_seconds = int(_require(plans_raw, "ttl_seconds", f"{source}.plans"))
-    if ttl_seconds <= 0:
-        raise PolicyError(f"{source}.plans.ttl_seconds: must be positive")
-
-    blocked = raw.get("blocked_operations") or []
-    if not isinstance(blocked, list):
-        raise PolicyError(f"{source}.blocked_operations: must be a list")
-
-    return Policy(
-        version=int(version),
-        rules=rules,
-        blocked_operations=frozenset(str(op).strip() for op in blocked),
-        plan_ttl_seconds=ttl_seconds,
-        plan_single_use=bool(plans_raw.get("single_use", True)),
-        _limits_by_tier=limits_by_tier,
-    )
-
-
-def load_policy_file(path: Path) -> Policy:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise PolicyError(f"cannot read policy file {path}: {exc}") from exc
-    try:
-        raw = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise PolicyError(f"policy file {path} is not valid YAML: {exc}") from exc
-    return parse_policy(raw, source=str(path))
-
-
-# ---------------------------------------------------------------------------
-# hot-reloading store
+# the snapshot holder
 # ---------------------------------------------------------------------------
 
 class PolicyStore:
-    """Holds the current policy and reloads it when the file changes.
+    """Holds the active policy.
 
-    Thread-safe. FastMCP serves concurrent requests, and a reload must not
-    be visible to a request halfway through evaluating a change.
+    This used to own a YAML file and hot-reload it. It no longer does, because
+    there is no file: every value is derived, fixed in code, or set once in
+    the environment. The class survives because it is the seam every caller
+    already reads through - removing it would have churned the whole codebase
+    to express "there is nothing to reload".
+
+    `last_error` is kept, and is now always None. It feeds `health_check` and
+    `/healthz`, which still report a refused ROLES reload; there is simply no
+    longer any policy edit that can be refused.
     """
 
-    def __init__(self, path: Path) -> None:
-        self._path = Path(path)
-        self._lock = threading.Lock()
-        # A load failure at construction is fatal: refusing to start beats
-        # starting with no limits.
-        self._policy = load_policy_file(self._path)
-        self._stamp = self._file_stamp()
-        self._last_error: str | None = None
-        self._reload_count = 0
-
-    def _file_stamp(self) -> tuple[int, int] | None:
-        """(mtime_ns, size). Size catches an edit within the same nanosecond."""
-        try:
-            stat = os.stat(self._path)
-        except OSError:
-            return None
-        return (stat.st_mtime_ns, stat.st_size)
+    def __init__(self, settings: Any) -> None:
+        self._policy = build_policy(
+            max_increase_percent=settings.max_increase_percent,
+            allowed_final_url_domains=settings.allowed_url_domains,
+        )
 
     def current(self) -> Policy:
-        """Return the active policy, reloading first if the file changed."""
-        stamp = self._file_stamp()
-        if stamp is None or stamp == self._stamp:
-            return self._policy
-
-        with self._lock:
-            # Re-check inside the lock: another thread may have just reloaded.
-            if stamp == self._stamp:
-                return self._policy
-            try:
-                policy = load_policy_file(self._path)
-            except Exception as exc:  # noqa: BLE001 - see below
-                # Keep the last good policy. Do NOT relax to defaults and do
-                # NOT raise into the caller's request.
-                #
-                # Deliberately broader than PolicyError. The parser aims to
-                # turn every bad edit into one, but it only takes one shape
-                # nobody anticipated - a mis-shaped block raising TypeError,
-                # say - for the exception to reach a live request while
-                # last_error stays empty and /healthz reports a healthy
-                # server. The rule is about the OUTCOME, not the exception
-                # class: whatever goes wrong, keep serving the last good
-                # policy and make the failure visible.
-                self._last_error = str(exc)
-                self._stamp = stamp  # avoid re-parsing the same broken file
-                logger.error(
-                    "policy reload REFUSED, keeping previous policy: %s", exc
-                )
-                return self._policy
-
-            self._policy = policy
-            self._stamp = stamp
-            self._last_error = None
-            self._reload_count += 1
-            logger.info(
-                "policy reloaded from %s (reload #%d)", self._path, self._reload_count
-            )
-            return self._policy
-
-    @property
-    def path(self) -> Path:
-        return self._path
+        return self._policy
 
     @property
     def last_error(self) -> str | None:
-        """The error from the most recent refused reload, if any.
-
-        Surfaced by health_check so a bad edit is visible without reading logs.
-        """
-        return self._last_error
-
-    @property
-    def reload_count(self) -> int:
-        return self._reload_count
+        """Always None. There is no config edit left that could be refused."""
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -454,11 +312,23 @@ def evaluate_budget_change(
     new_units: object,
     already_increased_today_units: object = 0,
 ) -> PolicyVerdict:
-    """Check one daily-budget change against the tier's limits.
+    """Check one daily-budget change against the tier's relative limits.
+
+    Two rules, both relative, neither needing to know anything about this
+    particular account in advance:
+
+      per change   the increase may not exceed max_increase_percent
+      per day      this user's TOTAL increases today, this one included, may
+                   not exceed a percentage of the account's total daily budget
+
+    The second is what the first cannot do. A 100% per-change cap still allows
+    100 -> 200 -> 400 -> 800 inside an afternoon; the daily ceiling bounds the
+    day.
 
     Boundaries are inclusive: exactly at a limit is allowed, a hair over is
-    not. `already_increased_today_units` is this user's running total for
-    the day, so the daily ceiling counts the change being proposed too.
+    not. Only INCREASES are constrained. There is deliberately no minimum any
+    more - refusing to lower a budget was refusing the one change that can
+    only ever reduce spend.
     """
     limits = policy.limits_for(tier).budget
     reasons: list[str] = []
@@ -471,47 +341,57 @@ def evaluate_budget_change(
     code = policy.currency_code
 
     if proposed <= 0:
-        reasons.append(f"a daily budget must be above zero, got {proposed} {code}")
-        return PolicyVerdict.deny(*reasons)
-
-    if proposed < limits.min_daily_units:
-        reasons.append(
-            f"{proposed} {code} is below the {tier.value} minimum of "
-            f"{limits.min_daily_units} {code}"
-        )
-    if proposed > limits.max_daily_units:
-        reasons.append(
-            f"{proposed} {code} exceeds the {tier.value} cap of "
-            f"{limits.max_daily_units} {code}"
+        return PolicyVerdict.deny(
+            f"a daily budget must be above zero, got {proposed} {code}"
         )
 
     delta = proposed - current
-    if delta > 0:
-        if current == 0:
-            # percent_change from zero is undefined. Treat any rise off a
-            # zero budget as unbounded and refuse it rather than inventing
-            # a percentage.
-            reasons.append(
-                "cannot raise a budget from zero through this server; "
-                "the percentage increase is undefined. Set it in the Google "
-                "Ads UI once, then adjust it here."
-            )
-        else:
-            increase_percent = percent_change(current, proposed)
-            if increase_percent > limits.max_increase_percent:
-                reasons.append(
-                    f"a {increase_percent}% increase exceeds the {tier.value} "
-                    f"limit of {limits.max_increase_percent}% per change "
-                    f"({current} -> {proposed} {code})"
-                )
+    if delta <= 0:
+        # A decrease. Nothing to check: it cannot raise spend, and it must not
+        # create headroom under the daily ceiling either - see safety/spend.py,
+        # which counts positive deltas only.
+        return PolicyVerdict.allow()
 
+    if current == 0:
+        # percent_change from zero is undefined. Treat any rise off a zero
+        # budget as unbounded and refuse it rather than invent a percentage.
+        reasons.append(
+            "cannot raise a budget from zero through this server; the "
+            "percentage increase is undefined. Set it in the Google Ads UI "
+            "once, then adjust it here."
+        )
+    else:
+        increase_percent = percent_change(current, proposed)
+        if increase_percent > limits.max_increase_percent:
+            reasons.append(
+                f"a {increase_percent}% increase exceeds the limit of "
+                f"{limits.max_increase_percent}% per change "
+                f"({current} -> {proposed} {code})"
+            )
+
+    account_total = policy.account_total_budget_units
+    if account_total is None:
+        # Refuse rather than skip. The ceiling is a real control, and "we could
+        # not work out the base" is a reason to stop, not a reason to wave an
+        # unbounded change through.
+        reasons.append(
+            "the account's total daily budget could not be established, so "
+            "your daily increase ceiling cannot be applied. Nothing was "
+            "changed; try again in a moment."
+        )
+    elif account_total > 0:
+        ceiling = (
+            account_total * limits.max_total_increase_percent_of_account
+        ) / Decimal(100)
         running_total = spent_today + delta
-        if running_total > limits.max_total_increase_per_user_per_day_units:
+        if running_total > ceiling:
             reasons.append(
                 f"this raises your total budget increases today to "
-                f"{running_total} {code}, over the {tier.value} daily ceiling of "
-                f"{limits.max_total_increase_per_user_per_day_units} {code} "
-                f"(already {spent_today} {code} today)"
+                f"{running_total} {code}, over your {tier.value} ceiling of "
+                f"{ceiling} {code} "
+                f"({limits.max_total_increase_percent_of_account}% of the "
+                f"account's {account_total} {code} total daily budget; "
+                f"already {spent_today} {code} today)"
             )
 
     return PolicyVerdict.deny(*reasons) if reasons else PolicyVerdict.allow()
@@ -524,7 +404,14 @@ def evaluate_bid_change(
     current_units: object,
     new_units: object,
 ) -> PolicyVerdict:
-    """Check one keyword bid change against the tier's limits."""
+    """Check one max-CPC change against the tier's relative limit.
+
+    There is no absolute max CPC any more, for the same reason there is no
+    absolute max budget: the right number depends entirely on the account, and
+    a wrong one either blocks every real change or protects nothing. A bid has
+    no daily ceiling behind it the way a budget does, which is why
+    `update_ad_group_bid` sits at `lead` in tools/registry.py.
+    """
     limits = policy.limits_for(tier).bids
     reasons: list[str] = []
 
@@ -535,24 +422,18 @@ def evaluate_bid_change(
     if proposed <= 0:
         return PolicyVerdict.deny(f"a bid must be above zero, got {proposed} {code}")
 
-    if proposed > limits.max_cpc_units:
-        reasons.append(
-            f"{proposed} {code} exceeds the {tier.value} max CPC of "
-            f"{limits.max_cpc_units} {code}"
-        )
-
     if proposed > current:
         if current == 0:
             reasons.append(
-                "cannot raise a bid from zero through this server; "
-                "the percentage increase is undefined"
+                "cannot raise a bid from zero through this server; the "
+                "percentage increase is undefined"
             )
         else:
             increase_percent = percent_change(current, proposed)
             if increase_percent > limits.max_increase_percent:
                 reasons.append(
-                    f"a {increase_percent}% increase exceeds the {tier.value} "
-                    f"limit of {limits.max_increase_percent}% per change "
+                    f"a {increase_percent}% increase exceeds the limit of "
+                    f"{limits.max_increase_percent}% per change "
                     f"({current} -> {proposed} {code})"
                 )
 
@@ -562,7 +443,8 @@ def evaluate_bid_change(
 def evaluate_operation(policy: Policy, operation: str) -> PolicyVerdict:
     if policy.blocks_operation(operation):
         return PolicyVerdict.deny(
-            f"operation {operation!r} is on the blocked list in policy.yaml"
+            f"operation {operation!r} is refused outright; there is no tool "
+            "for it and there will not be one"
         )
     return PolicyVerdict.allow()
 

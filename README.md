@@ -44,8 +44,12 @@ of them says no, nothing happens.
    read-only. One env change, one restart.
 3. **Role tier.** `config/roles.yaml` maps email to `readonly` / `operator` /
    `lead`. Unlisted people get `none`.
-4. **Policy.** `config/policy.yaml` holds the account allowlist and spend
-   limits, checked at draft time **and again** at confirm time.
+4. **Managed accounts and spend rules.** The accounts this server may touch
+   are derived from your MCC, not configured. The spend rules are relative
+   (never more than double in one change; a per-user daily ceiling set as a
+   percentage of the account's own total budget), so they scale with the
+   account and need no tuning. Checked at draft time **and again** at confirm
+   time.
 5. **Two-step confirm.** Writes return a preview and a `plan_id` and do
    nothing else. A separate call applies it.
 
@@ -72,9 +76,23 @@ Three files, and only these three, decide what this server can do:
 
 | File | Controls | Committed? |
 |---|---|---|
-| `.env` | credentials, port, kill switch | **no** |
-| `config/policy.yaml` | account allowlist, spend limits | yes |
-| `config/roles.yaml` | who has which tier | yes |
+| `.env` | credentials, port, kill switch, the two spend settings | **no** |
+| `config/roles.yaml` | break-glass tier overrides only | yes |
+
+There is no policy file. Everything it used to hold is now derived or fixed:
+
+| Was in `policy.yaml` | Now |
+|---|---|
+| `allowed_customer_ids` | every account under `GADS_LOGIN_CUSTOMER_ID` |
+| `currency_code`, `timezone` | read from each account |
+| `min_daily`, `max_daily`, `max_cpc` | **removed** — a rupee figure is wrong for some account, and always goes stale |
+| `max_increase_percent` | `GADS_MAX_INCREASE_PERCENT`, default 100 |
+| daily increase ceiling | a percentage of the account's own total daily budget, fixed per tier in code |
+| `allowed_final_url_domains` | `GADS_ALLOWED_URL_DOMAINS` |
+| structural rules, blocked ops, plan TTL | fixed in `safety/policy.py` |
+
+The point of that table: **deploy it, add people in Google Ads, hand over the
+URL.** Nobody edits a file to add an account or onboard a colleague.
 
 No customer ID, budget limit, or email address may be hardcoded in Python.
 
@@ -166,7 +184,7 @@ token ever leaving `auth/identity.py`.
 ## Where things live
 
 ```
-config/            policy.yaml, roles.yaml  — all limits and permissions
+config/            roles.yaml — break-glass tier overrides only
 src/gads_write/
   server.py        FastMCP app, tool registration
   settings.py      boot validation, fails fast

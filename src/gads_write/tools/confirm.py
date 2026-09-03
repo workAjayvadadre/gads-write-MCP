@@ -17,8 +17,9 @@ The order of operations is the point, and it is not arbitrary:
 
 Why 5 exists at all, given the draft already passed the gate: because time
 passed. Between draft and confirm, someone may have been demoted in Google
-Ads, the account may have been unlinked from the MCC, `policy.yaml` may
-have been tightened, or the kill switch may have been thrown. A plan carries
+Ads, the account may have been unlinked from the MCC, the account's own
+budgets may have moved under the daily ceiling, or the kill switch may have
+been thrown. A plan carries
 intent, never authority. Re-checking is what makes that true rather than
 merely stated.
 

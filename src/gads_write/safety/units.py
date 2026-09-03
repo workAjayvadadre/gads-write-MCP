@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 MICROS_PER_UNIT = 1_000_000
 
 # An absurdity backstop, NOT a policy limit. Policy limits live in
-# config/policy.yaml and are enforced in safety/policy.py. This exists only
+# settings and code constants, and are enforced in safety/policy.py. This exists only
 # to turn a catastrophic typo (a budget pasted with extra zeros, or a value
 # that was already in micros being converted a second time) into a loud
 # error rather than a very large number.

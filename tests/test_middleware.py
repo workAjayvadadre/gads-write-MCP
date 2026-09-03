@@ -51,8 +51,7 @@ def _settings(tmp_path, *, write_enabled: bool) -> Settings:
         env="test", host="127.0.0.1", port=8081, base_url="https://example.com",
         oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
         jwt_signing_key="k", developer_token="d", login_customer_id="1234567890",
-        write_enabled=write_enabled,
-        policy_path=tmp_path / "p.yaml", roles_path=tmp_path / "r.yaml",
+        write_enabled=write_enabled, roles_path=tmp_path / "r.yaml",
         audit_log_path=tmp_path / "audit.jsonl",
     )
 

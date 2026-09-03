@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,7 +53,6 @@ class Settings:
     write_enabled: bool
 
     # --- paths ---
-    policy_path: Path
     roles_path: Path
     audit_log_path: Path
 
@@ -75,6 +75,17 @@ class Settings:
     # enough to change anything. Defaults to true; turning it off is a
     # deliberate act, like the kill switch.
     require_human_confirmation: bool = True
+
+    # The one money rule left, and the only one that is tunable. Relative, so
+    # it is correct for a small campaign and a large one alike: 100 means
+    # "never more than double in a single change". There is no absolute rupee
+    # cap any more - see safety/policy.py for why one could not be maintained.
+    max_increase_percent: Decimal = Decimal(100)
+
+    # Hosts a new ad's final URL may point at. Deployment-specific and not
+    # derivable: Google cannot tell us which domains are yours. Exact host
+    # match, so list the www variant separately.
+    allowed_url_domains: frozenset[str] = frozenset()
 
     @property
     def is_production(self) -> bool:
@@ -121,29 +132,20 @@ def _resolve(path_str: str) -> Path:
 # validation
 # --------------------------------------------------------------------------
 
-def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
-    """Confirm both YAML files exist and are fully valid.
+def _validate_config_files(roles_path: Path) -> list[str]:
+    """Confirm roles.yaml exists and is fully valid.
 
-    Validation is delegated to the same parsers the running server uses, so
-    boot-time checks and runtime checks can never drift apart. Imports are
-    local to this function to keep module import order simple.
+    Validation is delegated to the same parser the running server uses, so
+    boot-time checks and runtime checks can never drift apart.
+
+    There is no policy file to check any more: the spending rules are derived
+    from the account, fixed in code, or read from the environment, so the
+    class of "the server started on a policy nobody meant" bug this guarded
+    against no longer exists.
     """
     from .auth.roles import RoleTable
-    from .safety.policy import load_policy_file
 
     problems: list[str] = []
-
-    # Both blocks catch Exception rather than the parsers' own error types.
-    # A config file that breaks in a shape the parser did not anticipate
-    # must still be reported as a configuration problem, in the same
-    # readable list as every other one - not as a raw traceback at boot.
-    if not policy_path.is_file():
-        problems.append(f"policy file not found at {policy_path}")
-    else:
-        try:
-            load_policy_file(policy_path)
-        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-            problems.append(str(exc))
 
     if not roles_path.is_file():
         problems.append(f"roles file not found at {roles_path}")
@@ -273,11 +275,33 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
             "evidence, so it cannot be set to keep nothing."
         )
 
-    policy_path = _resolve(_env("GADS_POLICY_PATH", "config/policy.yaml") or "config/policy.yaml")
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
 
-    problems.extend(_validate_config_files(policy_path, roles_path))
+    # The one remaining money rule. Relative, so it needs no knowledge of any
+    # account; see safety/policy.py for why the absolute caps were removed.
+    raw_increase = _env("GADS_MAX_INCREASE_PERCENT", "100") or "100"
+    max_increase_percent = Decimal(100)
+    try:
+        max_increase_percent = Decimal(raw_increase)
+        if max_increase_percent < 0:
+            raise ValueError
+    except (ValueError, ArithmeticError):
+        problems.append(
+            f"GADS_MAX_INCREASE_PERCENT must be a non-negative number, got "
+            f"{raw_increase!r}. It is a percentage: 100 means a change may at "
+            "most double a budget or a bid."
+        )
+
+    # Exact host match, comma separated. Empty is allowed and means no new ad
+    # can be created - which is the right default for a server that has not
+    # been told which domains belong to it.
+    raw_domains = _env("GADS_ALLOWED_URL_DOMAINS", "") or ""
+    allowed_url_domains = frozenset(
+        part.strip().lower() for part in raw_domains.split(",") if part.strip()
+    )
+
+    problems.extend(_validate_config_files(roles_path))
 
     if problems:
         bullets = "\n".join(f"  - {p}" for p in problems)
@@ -297,9 +321,10 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         developer_token=developer_token,  # type: ignore[arg-type]
         login_customer_id=login_customer_id,  # type: ignore[arg-type]
         write_enabled=write_enabled,
-        policy_path=policy_path,
         roles_path=roles_path,
         audit_log_path=audit_log_path,
+        max_increase_percent=max_increase_percent,
+        allowed_url_domains=allowed_url_domains,
         tier_cache_seconds=tier_cache_seconds,
         audit_retention_days=audit_retention_days,
         require_human_confirmation=require_human_confirmation,

@@ -164,7 +164,7 @@ try:
     _configure_logging(SETTINGS)
 
     ROLE_STORE = RoleStore(SETTINGS.roles_path)
-    POLICY_STORE = PolicyStore(SETTINGS.policy_path)
+    POLICY_STORE = PolicyStore(SETTINGS)
 
     # Holds no credential. `google_access_token` is called per request and
     # reads the current caller's token from the request context, so one
@@ -208,6 +208,7 @@ try:
         audit_log=AUDIT_LOG,
         spend_ledger=SPEND_LEDGER,
         managed_accounts=MANAGED_ACCOUNTS,
+        reader=READER,
     )
 except ConfigError as exc:
     print(f"\n{exc}\n", file=sys.stderr)
@@ -226,7 +227,6 @@ mcp.add_middleware(
 register_health_route(
     mcp,
     settings=SETTINGS,
-    policy_store=POLICY_STORE,
     role_store=ROLE_STORE,
 )
 
@@ -326,7 +326,6 @@ async def health_check() -> dict:
             "tier_cache_seconds": SETTINGS.tier_cache_seconds,
             # Surfaced so a bad config edit is visible here rather than only
             # in the logs. Both should be null.
-            "policy_reload_error": POLICY_STORE.last_error,
             "roles_reload_error": ROLE_STORE.last_error,
         },
         "credentials": {

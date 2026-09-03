@@ -1,6 +1,8 @@
-"""Shared fixtures. Tests build their own policy files rather than reading
-config/policy.yaml, so that changing a real business limit never breaks the
-test suite and a passing suite never implies the real limits are sane.
+"""Shared fixtures.
+
+There is no policy file any more, so there is no policy fixture. The spending
+rules come from Settings and code constants; tests that care about a limit set
+it on the Settings object they build.
 """
 
 from __future__ import annotations
@@ -10,40 +12,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-BASE_POLICY: dict = {
-    "version": 2,
-    "limits": {
-        "defaults": {
-            "budget": {
-                "min_daily": 50,
-                "max_daily": 5000,
-                "max_increase_percent": 25,
-                "max_total_increase_per_user_per_day": 10000,
-            },
-            "bids": {"max_cpc": 200, "max_increase_percent": 30},
-        },
-        "tiers": {
-            "operator": {
-                "budget": {
-                    "max_daily": 2000,
-                    "max_increase_percent": 20,
-                    "max_total_increase_per_user_per_day": 3000,
-                },
-                "bids": {"max_cpc": 100},
-            },
-            "lead": {},
-        },
-    },
-    "rules": {
-        "new_entities_start_paused": True,
-        "block_broad_match_with_manual_cpc": True,
-        "allowed_final_url_domains": ["indiraivf.com", "www.indiraivf.com"],
-    },
-    "blocked_operations": ["remove_campaign"],
-    "plans": {"ttl_seconds": 600, "single_use": True},
-}
-
-
 def _deep_update(base: dict, patch: dict) -> dict:
     out = dict(base)
     for key, value in patch.items():
@@ -52,19 +20,6 @@ def _deep_update(base: dict, patch: dict) -> dict:
         else:
             out[key] = value
     return out
-
-
-@pytest.fixture
-def write_policy(tmp_path: Path):
-    """Write a policy file, optionally patched. Returns its path."""
-
-    def _write(patch: dict | None = None, *, name: str = "policy.yaml") -> Path:
-        data = _deep_update(BASE_POLICY, patch or {})
-        path = tmp_path / name
-        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-        return path
-
-    return _write
 
 
 BASE_ROLES: dict = {
@@ -173,3 +128,38 @@ class FakeManagedAccounts:
 @pytest.fixture
 def managed_accounts() -> FakeManagedAccounts:
     return FakeManagedAccounts()
+
+
+# ---------------------------------------------------------------------------
+# the daily-ceiling base
+# ---------------------------------------------------------------------------
+# The per-user daily ceiling is now a percentage of the account's own total
+# daily budget rather than a rupee figure in a file, so the gate reads that
+# total when - and only when - a monetary rule is being evaluated.
+
+DEFAULT_ACCOUNT_TOTAL_UNITS = 10_000
+
+
+class FakeBudgetReader:
+    """Supplies the account total the daily ceiling is measured against."""
+
+    def __init__(self, total_units: int | None = None, *, raises: bool = False) -> None:
+        self._total_units = (
+            DEFAULT_ACCOUNT_TOTAL_UNITS if total_units is None else total_units
+        )
+        self._raises = raises
+        self.calls = 0
+
+    def set_total_units(self, total_units: int) -> None:
+        """Change the account's total, the way editing budgets in the Google
+        Ads UI would. The daily ceiling is a percentage of this, so lowering
+        it tightens the rule between a draft and its confirm."""
+        self._total_units = total_units
+
+    async def account_total_daily_budget_micros(self, customer_id: str) -> int:
+        self.calls += 1
+        if self._raises:
+            from gads_write.ads.reads import AdsReadError
+
+            raise AdsReadError("Google Ads API timed out")
+        return int(self._total_units) * 1_000_000
