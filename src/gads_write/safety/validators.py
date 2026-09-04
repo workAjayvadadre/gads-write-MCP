@@ -2,7 +2,7 @@
 
 The constants here are *Google Ads API structural limits*, not business
 policy. That distinction matters: spend limits and account allowlists are
-config (config/policy.yaml) because your marketing lead changes them; an RSA
+settings because they are deployment-specific; an RSA
 headline being 30 characters is a fact about the API and belongs in code.
 
 Verified against Google's documentation:
@@ -55,7 +55,7 @@ VALID_MATCH_TYPES = frozenset({"EXACT", "PHRASE", "BROAD"})
 
 # CampaignStatusEnum / AdGroupStatusEnum values we permit as input.
 # REMOVED is excluded on purpose: removal is irreversible and out of scope
-# for v1. See config/policy.yaml blocked_operations.
+# for v1. See BLOCKED_OPERATIONS in safety/policy.py.
 VALID_STATUSES = frozenset({"ENABLED", "PAUSED"})
 
 
@@ -242,7 +242,8 @@ def validate_final_url(
         result.add(
             field_name,
             f"host {host!r} is not in the allowed domain list "
-            f"{sorted(allowed_domains)}. Add it to policy.yaml if it is legitimate.",
+            f"{sorted(allowed_domains)}. Add it to GADS_ALLOWED_URL_DOMAINS if "
+            "it is legitimate.",
         )
 
     return result

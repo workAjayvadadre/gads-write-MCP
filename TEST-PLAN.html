@@ -1,0 +1,457 @@
+<title>gads-write-mcp Test Plan</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground:#f7f7fa; --surface:#fff; --sunken:#eeeef4; --ink:#15161d; --muted:#5f6274;
+    --hairline:#dcdce6; --accent:#4338a8; --accent-soft:#eceafa;
+    --pass:#136c48; --pass-soft:#e8f4ef; --gap:#a03323; --gap-soft:#fbeeec;
+    --warn:#8a5a06; --warn-soft:#fbf3e4;
+    --sans:"Archivo","Segoe UI",system-ui,sans-serif;
+    --serif:"Source Serif 4",Georgia,serif;
+    --mono:"JetBrains Mono","Cascadia Mono",Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+    --ground:#101017; --surface:#181822; --sunken:#13131b; --ink:#e7e7ee; --muted:#9b9db1;
+    --hairline:#2a2a38; --accent:#a49bf5; --accent-soft:#1d1a38;
+    --pass:#5ec79c; --pass-soft:#12241d; --gap:#f0897b; --gap-soft:#2a1817;
+    --warn:#dda43c; --warn-soft:#2a2114;
+  }}
+  :root[data-theme="dark"]{
+    --ground:#101017; --surface:#181822; --sunken:#13131b; --ink:#e7e7ee; --muted:#9b9db1;
+    --hairline:#2a2a38; --accent:#a49bf5; --accent-soft:#1d1a38;
+    --pass:#5ec79c; --pass-soft:#12241d; --gap:#f0897b; --gap-soft:#2a1817;
+    --warn:#dda43c; --warn-soft:#2a2114;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--ground);color:var(--ink);font-family:var(--serif);
+       font-size:17px;line-height:1.62;margin:0;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:53rem;margin:0 auto;padding:3.5rem 1.5rem 6rem;
+        display:flex;flex-direction:column;gap:3.25rem}
+  h1,h2,h3,h4,.lbl,th,.chip,.tid{font-family:var(--sans)}
+  h1,h2,h3,h4{margin:0;text-wrap:balance;font-weight:600}
+  h1{font-size:2.45rem;line-height:1.1;letter-spacing:-.025em;font-weight:700}
+  h2{font-size:1.55rem;letter-spacing:-.015em}
+  h3{font-size:1.08rem}
+  p,ul,ol{margin:0} ul,ol{padding-left:1.15rem;display:flex;flex-direction:column;gap:.35rem}
+  code,.mono{font-family:var(--mono);font-size:.85em}
+  code{background:var(--sunken);padding:.1em .35em;border-radius:3px;word-break:break-word}
+  pre{background:var(--sunken);border:1px solid var(--hairline);border-radius:5px;
+      padding:.9rem 1.1rem;overflow-x:auto;margin:0;font-family:var(--mono);
+      font-size:.78rem;line-height:1.6}
+  pre code{background:none;padding:0}
+  a{color:var(--accent);text-underline-offset:2px}
+  a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px}
+  .lbl{font-size:.67rem;text-transform:uppercase;letter-spacing:.14em;font-weight:600;color:var(--muted)}
+  .rule{height:3px;width:3rem;background:var(--accent)}
+  section{display:flex;flex-direction:column;gap:1.35rem;scroll-margin-top:1.5rem}
+  .lede{color:var(--muted)}
+  header .meta{display:flex;flex-wrap:wrap;gap:.35rem 1.2rem;font-family:var(--mono);
+               font-size:.75rem;color:var(--muted)}
+  .note{border-left:3px solid var(--accent);background:var(--accent-soft);padding:.95rem 1.1rem;
+        border-radius:0 4px 4px 0;display:flex;flex-direction:column;gap:.45rem}
+  .alert{border-left:3px solid var(--gap);background:var(--gap-soft);padding:.95rem 1.1rem;
+         border-radius:0 4px 4px 0;display:flex;flex-direction:column;gap:.45rem}
+  .warnbox{border-left:3px solid var(--warn);background:var(--warn-soft);padding:.95rem 1.1rem;
+        border-radius:0 4px 4px 0;display:flex;flex-direction:column;gap:.45rem}
+  .note .lbl{color:var(--accent)} .alert .lbl{color:var(--gap)} .warnbox .lbl{color:var(--warn)}
+  .scroller{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:.89rem}
+  th,td{text-align:left;padding:.6rem .85rem .6rem 0;border-bottom:1px solid var(--hairline);vertical-align:top}
+  th{font-size:.66rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:600}
+  /* test case */
+  .cases{display:flex;flex-direction:column;gap:1.1rem}
+  .case{background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
+        padding:1.1rem 1.25rem;display:flex;flex-direction:column;gap:.6rem}
+  .chead{display:flex;flex-wrap:wrap;gap:.6rem;align-items:baseline}
+  .tid{font-family:var(--mono);font-size:.78rem;font-weight:500;color:var(--accent)}
+  .case h4{font-size:.98rem;flex:1 1 16rem}
+  .chip{font-size:.63rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+        padding:.16rem .5rem;border-radius:99px;border:1px solid currentColor;white-space:nowrap}
+  .c-hi{color:var(--gap);background:var(--gap-soft)}
+  .c-md{color:var(--warn);background:var(--warn-soft)}
+  .c-lo{color:var(--muted)}
+  .c-live{color:var(--accent);background:var(--accent-soft)}
+  .case dl{margin:0;display:grid;grid-template-columns:4.6rem 1fr;gap:.3rem .8rem;font-size:.93rem}
+  .case dt{font-family:var(--sans);font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;
+           color:var(--muted);font-weight:600;padding-top:.28rem}
+  .case dd{margin:0}
+  .toc{background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
+       padding:1.15rem 1.4rem;display:grid;gap:.4rem 2rem;
+       grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));font-size:.88rem;font-family:var(--sans)}
+  .toc a{text-decoration:none;display:flex;gap:.65rem}
+  .toc a:hover{text-decoration:underline}
+  .toc span:first-child{color:var(--muted);font-variant-numeric:tabular-nums}
+  footer{border-top:1px solid var(--hairline);padding-top:1.4rem;color:var(--muted);font-size:.88rem;
+         display:flex;flex-direction:column;gap:.6rem}
+  @media(max-width:34rem){
+    body{font-size:16px} h1{font-size:1.9rem} h2{font-size:1.3rem}
+    .wrap{padding-top:2.25rem;gap:2.4rem}
+    .case dl{grid-template-columns:1fr;gap:.15rem}
+    .case dt{padding-top:.4rem}
+  }
+</style>
+
+<div class="wrap">
+
+<header style="display:flex;flex-direction:column;gap:1rem">
+  <div class="rule"></div>
+  <h1>gads-write-mcp Test Plan</h1>
+  <p class="lede">What the 422 existing tests already prove, what they do not, and the cases worth adding before this server is allowed to spend money. Written against commit <code>bc11c0c</code>.</p>
+  <div class="meta"><span>422 tests collected</span><span>0 concurrency tests</span><span>0 live API calls, ever</span><span>3 Sep 2026</span></div>
+</header>
+
+<nav class="toc">
+  <a href="#stands"><span>01</span><span>Where the suite stands</span></a>
+  <a href="#concurrency"><span>02</span><span>Concurrency — the big hole</span></a>
+  <a href="#time"><span>03</span><span>Time and timezone</span></a>
+  <a href="#money"><span>04</span><span>Money edge values</span></a>
+  <a href="#preview"><span>05</span><span>Preview vs what applies</span></a>
+  <a href="#failure"><span>06</span><span>Failure modes</span></a>
+  <a href="#accounts"><span>07</span><span>Accounts and permissions</span></a>
+  <a href="#quality"><span>08</span><span>Tests that need repairing</span></a>
+  <a href="#live"><span>09</span><span>Live-account tests</span></a>
+  <a href="#habit"><span>10</span><span>The habit that matters most</span></a>
+</nav>
+
+<section id="stands">
+  <h2>01 &nbsp; Where the suite stands</h2>
+  <p>422 tests, no network, no credentials. Genuinely well pinned, and worth <em>not</em> re-testing:</p>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:34%">Property</th><th>How it is pinned</th></tr></thead>
+    <tbody>
+      <tr><td>Micros conversion</td><td>Literal expected values, not recomputed the way the code does — so the tests can actually disagree with the implementation</td></tr>
+      <tr><td>Fail-closed behaviour</td><td>Unregistered tool, unknown enum, lookup outage, missing email, unreadable MCC — each has a test</td></tr>
+      <tr><td>Plan lifecycle</td><td>Ownership, expiry (including the exact boundary), single-use, replay, unguessable IDs</td></tr>
+      <tr><td>Kill switch</td><td>Hides tools, refuses calls, checked before the tier lookup, does not block reads</td></tr>
+      <tr><td>Audit</td><td>Exactly one line per decision, refusals logged too, arguments redacted, account timezone used</td></tr>
+      <tr><td>Human approval</td><td>Required, and a client that cannot elicit is refused rather than waved through</td></tr>
+      <tr><td>Query fields</td><td>Every SELECT clause parsed and checked against the pinned v25 protos</td></tr>
+      <tr><td>Hostile percentages</td><td><code>inf</code>, <code>Infinity</code>, <code>nan</code>, <code>1e999</code> all refused at boot</td></tr>
+    </tbody>
+  </table></div>
+  <div class="alert">
+    <span class="lbl">What a green suite does not mean</span>
+    <p>Twice in the last week this suite was green while a real defect was live: a plan could be applied under limits it was never checked against, and a config typo could take the server down while <code>/healthz</code> reported healthy. Both were found by reading, not by testing. Everything below is chosen because no existing test would catch it.</p>
+  </div>
+</section>
+
+<section id="concurrency">
+  <h2>02 &nbsp; Concurrency — the big hole</h2>
+  <p>There is not one <code>asyncio.gather</code>, thread, or concurrent task anywhere in <code>tests/</code>. Every shared, mutable thing in this server is therefore tested only single-file.</p>
+
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">C-1</span><h4>Two confirms race the same plan</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>One drafted plan. Two <code>confirm_and_apply</code> calls on the same <code>plan_id</code>, launched together with <code>asyncio.gather</code>, both approving at the elicitation prompt.</dd>
+        <dt>Expect</dt><dd>Exactly one succeeds. The other fails with <em>already used</em>. <code>executor.applied</code> has length 1 — never 2.</dd>
+        <dt>Why</dt><dd>This is the single most expensive possible bug: the same budget change applied twice. The consume step is a compare-and-swap under a lock and should hold, but nothing proves it.</dd>
+      </dl>
+    </div>
+
+    <div class="case">
+      <div class="chead"><span class="tid">C-2</span><h4>Two plans confirmed across the approval wait</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Two separate budget plans by the same person. Call confirm on both, and hold both elicitation prompts open before approving either.</dd>
+        <dt>Expect</dt><dd>Decide what you want here first — see the note below. At minimum, the audit log must record both real increases, and the preview each person approved must reflect what was actually applied.</dd>
+        <dt>Why</dt><dd>The gate reads state, then waits an unbounded time for a human, then applies. Anything read before that wait is stale by the time it matters.</dd>
+      </dl>
+    </div>
+
+    <div class="case">
+      <div class="chead"><span class="tid">C-3</span><h4>Interleaved audit writes stay parseable</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Fire 50 concurrent gate checks. Then read the log back through <code>AuditLog.iter_records</code>.</dd>
+        <dt>Expect</dt><dd>50 well-formed lines, none truncated or interleaved mid-line.</dd>
+        <dt>Why</dt><dd>The daily spend total is derived from this file. A torn line is silently skipped, and skipping means handing back allowance.</dd>
+      </dl>
+    </div>
+
+    <div class="case">
+      <div class="chead"><span class="tid">C-4</span><h4>Caches under simultaneous first use</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Cold <code>TierCache</code> and <code>ManagedAccountStore</code>. Ten concurrent callers, with the underlying lookup counting how many times it is actually invoked.</dd>
+        <dt>Expect</dt><dd>A consistent answer for all ten, and no cached failure if the lookup raises.</dd>
+        <dt>Why</dt><dd>A stampede is a performance problem; a cached failure is a correctness one. Only the second really matters, and only a concurrent test shows it.</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="note">
+    <span class="lbl">A decision to make before writing C-2</span>
+    <p>The per-user daily total is no longer a refusal — it is shown on the preview so the person approving can judge. That is a deliberate choice, and it means "two confirms exceed the cap" is no longer a bug by definition. What is still worth pinning is that the <em>number shown</em> and the <em>number recorded</em> are both true. Write the test against that, not against a cap that no longer exists.</p>
+  </div>
+</section>
+
+<section id="time">
+  <h2>03 &nbsp; Time and timezone</h2>
+  <p>Now sharper than before: the timezone is no longer configured, it is read from each account. Two accounts in one request path can legitimately be on different days.</p>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">T-1</span><h4>Spend rolls over at the account's midnight, not UTC's</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Account on <code>Asia/Kolkata</code>. Drive the clock to 18:45 UTC — which is 00:15 the next day locally. Apply a budget increase before and after.</dd>
+        <dt>Expect</dt><dd>The two land in different dated audit files, and today's running total resets at local midnight.</dd>
+        <dt>Why</dt><dd>UTC and IST differ by 5:30, so for over five hours a day the "today" total is wrong if the wrong clock is used.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">T-2</span><h4>Two accounts, two timezones, one person</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>One caller changing budgets on an <code>Asia/Kolkata</code> account and a <code>America/New_York</code> account within the same hour.</dd>
+        <dt>Expect</dt><dd>Each change is dated by its own account's timezone. Define and assert what "today's total" means for a person spanning both.</dd>
+        <dt>Why</dt><dd>This became possible the moment the timezone stopped being one server-wide setting.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">T-3</span><h4>A plan drafted before midnight, confirmed after</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Draft at 23:58 local, advance past midnight, confirm at 00:03.</dd>
+        <dt>Expect</dt><dd>No crash; the audit line lands on the day it was applied.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">T-4</span><h4>Retention pruning never deletes a day still in use</h4><span class="chip c-lo">Low</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Retention of 1 day, with files for today, yesterday and last week.</dd>
+        <dt>Expect</dt><dd>Today survives. Always. Prune uses a UTC date while files are named by local date, so check the boundary explicitly.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="money">
+  <h2>04 &nbsp; Money edge values</h2>
+  <p>The rule set shrank deliberately — one relative backstop instead of absolute bands. Fewer rules means each remaining one carries more weight.</p>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">M-1</span><h4>The backstop at its exact boundary</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>With the backstop at 100%: raise 100 → 200 (exactly 100%), then 100 → 200.01.</dd>
+        <dt>Expect</dt><dd>The first is allowed, the second refused. Inclusive, and stated as such.</dd>
+        <dt>Why</dt><dd><code>&lt;=</code> versus <code>&lt;</code> is invisible on inspection and is the likeliest bug in any limit.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">M-2</span><h4>Zero, negative, and rises from zero</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Budgets of <code>0</code>, <code>-1</code>, <code>0.0001</code>; and a rise from a current budget of exactly 0.</dd>
+        <dt>Expect</dt><dd>Zero and negative refused. A rise from zero refused with the "percentage is undefined" message, not a division error.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">M-3</span><h4>Sub-currency-unit amounts</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd><code>new_daily_budget = 100.005</code>, which is 100,005,000 micros.</dd>
+        <dt>Expect</dt><dd>Decide the behaviour, then pin it. Google rejects amounts that are not a multiple of the currency's minimum unit — and it does so <em>after</em> the plan is consumed and a human has approved. Refusing at draft is friendlier.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">M-4</span><h4>Very large and precision-losing values</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>A budget at the sanity ceiling, one just over, and a float like <code>0.1 + 0.2</code> arriving through the tool interface.</dd>
+        <dt>Expect</dt><dd>Refused cleanly with a readable message; never a silent overflow or a binary-float artefact reaching micros.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="preview">
+  <h2>05 &nbsp; Preview vs what applies</h2>
+  <p>The preview is the entire approval model. If it can ever describe something other than what applies, every other control is decoration.</p>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">P-1</span><h4>The approved preview matches the mutation, field by field</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>For each write tool: draft, capture the preview text, confirm, capture the <code>MutationRequest</code>.</dd>
+        <dt>Expect</dt><dd>Every number in the preview appears in the payload, converted correctly. Assert on parsed values, not substrings.</dd>
+        <dt>Why</dt><dd>Preview and payload are derived separately from the same variables. Nothing structurally prevents drift.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">P-2</span><h4>Every entity mutated is named in the preview</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>A budget shared by three campaigns; a campaign moved to another budget between draft and confirm.</dd>
+        <dt>Expect</dt><dd>Refused, both at draft and at confirm. Regression tests exist for both — keep them, and add the shared case at draft.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">P-3</span><h4>A warning on the preview is actually present</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Broad match on a manual-CPC ad group, now a warning rather than a refusal.</dd>
+        <dt>Expect</dt><dd>The plan is created <em>and</em> the preview carries the warning. A rule downgraded to a warning is only safe if the warning reliably appears.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="failure">
+  <h2>06 &nbsp; Failure modes</h2>
+  <p>Ask, at every point where the server talks to Google or the disk: what if this fails <em>here</em>?</p>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">F-1</span><h4>Google fails at each step of confirm</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Inject a failure at: the re-read, the account-total fetch, and the mutate itself.</dd>
+        <dt>Expect</dt><dd>The first two refuse <em>without</em> consuming the plan. The third consumes it and says plainly that the outcome is unknown and a human must check the account.</dd>
+        <dt>Why</dt><dd>The distinction between "refused" and "used up" is the difference between retrying safely and double-spending.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">F-2</span><h4>The audit log cannot be written</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Make the log path unwritable, then attempt a change.</dd>
+        <dt>Expect</dt><dd>The mutation does not happen. An unloggable change must be refused, not applied silently.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">F-3</span><h4>A corrupt or truncated audit line</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Append half a JSON line, then read the day's total.</dd>
+        <dt>Expect</dt><dd>The bad line is skipped <em>and</em> surfaced somewhere. Skipping silently hands back allowance, which is the fail-open direction.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">F-4</span><h4>A missing audit file is not the same as no spend</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Delete today's dated file, then read the total.</dd>
+        <dt>Expect</dt><dd>Currently this reads as zero used. Decide whether that is acceptable and pin the answer either way.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">F-5</span><h4>A bad roles.yaml keeps the last good table</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Invalid YAML, then valid-YAML-wrong-shape, then a deleted file.</dd>
+        <dt>Expect</dt><dd>Last good table retained, <code>last_error</code> set, <code>/healthz</code> 503. The deleted-file case currently reports healthy — worth deciding on.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="accounts">
+  <h2>07 &nbsp; Accounts and permissions</h2>
+  <p>The account set now comes from the MCC rather than a list, which is newer code and carries the most recent risk.</p>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">A-1</span><h4>An account outside the MCC is refused, everywhere</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>A customer ID the caller genuinely has access to on their own Google login, but which is not under the manager account. Try every read tool and every write tool.</dd>
+        <dt>Expect</dt><dd>Refused for all of them. This protects the developer token, so a gap here is an attribution problem, not just a permissions one.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">A-2</span><h4>"Not ours" and "could not find out" stay distinct</h4><span class="chip c-hi">High</span></div>
+      <dl>
+        <dt>Setup</dt><dd>An unknown account with a healthy MCC lookup, versus a failing MCC lookup.</dd>
+        <dt>Expect</dt><dd>Both refuse, with different audit verdicts. An outage must read as <code>lookup_failed</code>, not as a wave of correct refusals — otherwise nobody can tell an outage from ordinary use.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">A-3</span><h4>Each account is judged in its own currency</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Two managed accounts, one INR and one USD.</dd>
+        <dt>Expect</dt><dd>Previews and messages use each account's own currency code. Nothing compares a figure in one currency against a limit expressed in another.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">A-4</span><h4>Demotion from lead to operator, mid-plan</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>Lead drafts a lead-tier change; demote to operator; confirm.</dd>
+        <dt>Expect</dt><dd>Refused. Note that demoting to <em>readonly</em> does not test this — the middleware catches that earlier, which is exactly how this went untested for months.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">A-5</span><h4>health_check tells a stranger nothing useful</h4><span class="chip c-md">Medium</span></div>
+      <dl>
+        <dt>Setup</dt><dd>A caller at tier <code>none</code> calls <code>health_check</code>. Separately, hit <code>/healthz</code> while a config reload is refused.</dd>
+        <dt>Expect</dt><dd>No customer IDs, no email addresses, no file paths in either response. Both currently leak in at least one path.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="quality">
+  <h2>08 &nbsp; Tests that need repairing</h2>
+  <p>These exist and pass, but do not prove what their names claim. A misleading test is worse than a missing one, because it stops anyone looking.</p>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:38%">Test</th><th>Problem</th></tr></thead>
+    <tbody>
+      <tr><td><code>test_the_daily_ceiling_accumulates_across_changes</code></td><td>Asserts <code>deltas == [10,15,20]</code>, recomputed as <code>target − 100</code> — the same subtraction the code performs, so it can never disagree. Assert against independently-known values.</td></tr>
+      <tr><td>Update-mask tests</td><td>Assert <code>paths &lt;= ALLOWLIST</code>, which the code already raises on — the assertion cannot fail. Add a case that drives the seal into actually refusing.</td></tr>
+      <tr><td>Refusal-message assertions</td><td><code>assert "20" in message</code> passes on "120". Match the rule that fired, not a digit that happens to appear.</td></tr>
+      <tr><td>Fakes vs the summary objects</td><td><code>FakeReader</code> is hand-maintained. When a real summary gains a field, the fake silently returns the default. Build fakes from the real dataclass so a new field is a visible decision.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="live">
+  <h2>09 &nbsp; Live-account tests</h2>
+  <div class="warnbox">
+    <span class="lbl">No request has ever left this process</span>
+    <p>Every test uses a fake executor or an offline client. Proto construction, enum lookups and update-mask logic are exercised for real, but nothing has ever been sent to Google. These are the cases only a live account can settle — run them on a <strong>test account</strong> first, in this order.</p>
+  </div>
+  <div class="cases">
+    <div class="case">
+      <div class="chead"><span class="tid">L-1</span><h4>A non-admin can read their own access role</h4><span class="chip c-live">Do first</span></div>
+      <dl>
+        <dt>Do</dt><dd>Have a real <code>STANDARD</code> or <code>READ_ONLY</code> user connect and call <code>health_check</code>.</dd>
+        <dt>Expect</dt><dd>Their tier resolves. If it fails, the whole "add them in Google Ads and they just work" model needs the documented fallback — and you learn it now rather than on rollout day.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">L-2</span><h4>Reads return real shapes</h4><span class="chip c-live">Live</span></div>
+      <dl>
+        <dt>Do</dt><dd><code>list_accounts</code>, then <code>get_campaign_performance</code> and <code>get_search_terms</code> on a real account.</dd>
+        <dt>Expect</dt><dd>Sensible numbers. Cross-check spend and clicks against the Google Ads UI for the same window — this is where a micros error or a timezone shift shows itself.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">L-3</span><h4>The first mutation is a pause</h4><span class="chip c-live">Live</span></div>
+      <dl>
+        <dt>Do</dt><dd>With <code>GADS_WRITE_ENABLED=true</code>, pause one campaign that does not matter. Approve the prompt. Then enable it again.</dd>
+        <dt>Expect</dt><dd>The change appears in the Google Ads UI. The audit log has a line for each. Crucially: the campaign's <em>name is unchanged</em> — a mask naming an unset field is how a status change silently blanks a name.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">L-4</span><h4>A budget change, then read it back</h4><span class="chip c-live">Live</span></div>
+      <dl>
+        <dt>Do</dt><dd>Raise a test campaign's daily budget by a small amount, approve, then re-read it.</dd>
+        <dt>Expect</dt><dd>The new amount matches the preview exactly. A 1,000,000× error is unmistakable here and nearly invisible anywhere else.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">L-5</span><h4>The refusals actually refuse, against real data</h4><span class="chip c-live">Live</span></div>
+      <dl>
+        <dt>Do</dt><dd>Attempt a change on a genuinely shared budget; attempt one on an account outside the MCC; attempt a raise past the backstop.</dd>
+        <dt>Expect</dt><dd>All refused, with the message you expect. Verified against fakes, never against Google.</dd>
+      </dl>
+    </div>
+    <div class="case">
+      <div class="chead"><span class="tid">L-6</span><h4>The approval prompt works in the real client</h4><span class="chip c-live">Live</span></div>
+      <dl>
+        <dt>Do</dt><dd>Run a write end to end through Claude's own connector UI.</dd>
+        <dt>Expect</dt><dd>A prompt appears and declining it changes nothing. Elicitation has never been exercised against that client — if it is unsupported, writes refuse rather than misbehave, but you want to know before rollout.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="habit">
+  <h2>10 &nbsp; The habit that matters most</h2>
+  <p>More valuable than any single case below: <strong>before trusting a safety test, break the thing it guards and watch it fail.</strong></p>
+  <pre><code><span style="color:var(--muted)"># 1. comment out the check</span>
+<span style="color:var(--muted)"># 2. run only that test  →  it MUST fail</span>
+<span style="color:var(--muted)"># 3. restore, confirm green</span></code></pre>
+  <p>This caught two problems in this codebase in one afternoon. A test asserting the confirm-time tier check passed against a deliberately broken build, because a different check refused first — it was pinning the wrong line entirely. Another guard turned out to be pinned by three tests that all failed for the same unrelated reason.</p>
+  <div class="note">
+    <span class="lbl">Back up the file first</span>
+    <p>Restore with a per-file copy, not <code>git checkout -- &lt;directory&gt;</code>. That command reverts every uncommitted change in the directory, which is a fast way to lose an afternoon of work that was never committed.</p>
+  </div>
+</section>
+
+<footer>
+  <p><strong>Suggested order:</strong> C-1 and F-1 first — both are cheap and both guard against double-spending. Then the P group, because the preview is what every other control rests on. The L group only after everything else is green, and only on a test account.</p>
+  <p>Written against <code>bc11c0c</code>. The rules changed materially in the three commits before it — absolute limits removed, the daily total downgraded from a refusal to information, accounts derived from the MCC — so re-read the module docstrings before writing against any rule named here.</p>
+</footer>
+
+</div>

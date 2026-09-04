@@ -1,6 +1,8 @@
-"""Shared fixtures. Tests build their own policy files rather than reading
-config/policy.yaml, so that changing a real business limit never breaks the
-test suite and a passing suite never implies the real limits are sane.
+"""Shared fixtures.
+
+There is no policy file any more, so there is no policy fixture. The spending
+rules come from Settings and code constants; tests that care about a limit set
+it on the Settings object they build.
 """
 
 from __future__ import annotations
@@ -9,43 +11,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
-BASE_POLICY: dict = {
-    "version": 2,
-    "allowed_customer_ids": ["1234567890"],
-    "currency_code": "INR",
-    "timezone": "Asia/Kolkata",
-    "limits": {
-        "defaults": {
-            "budget": {
-                "min_daily": 50,
-                "max_daily": 5000,
-                "max_increase_percent": 25,
-                "max_total_increase_per_user_per_day": 10000,
-            },
-            "bids": {"max_cpc": 200, "max_increase_percent": 30},
-        },
-        "tiers": {
-            "operator": {
-                "budget": {
-                    "max_daily": 2000,
-                    "max_increase_percent": 20,
-                    "max_total_increase_per_user_per_day": 3000,
-                },
-                "bids": {"max_cpc": 100},
-            },
-            "lead": {},
-        },
-    },
-    "rules": {
-        "new_entities_start_paused": True,
-        "block_broad_match_with_manual_cpc": True,
-        "allowed_final_url_domains": ["indiraivf.com", "www.indiraivf.com"],
-    },
-    "blocked_operations": ["remove_campaign"],
-    "plans": {"ttl_seconds": 600, "single_use": True},
-}
-
 
 def _deep_update(base: dict, patch: dict) -> dict:
     out = dict(base)
@@ -57,22 +22,9 @@ def _deep_update(base: dict, patch: dict) -> dict:
     return out
 
 
-@pytest.fixture
-def write_policy(tmp_path: Path):
-    """Write a policy file, optionally patched. Returns its path."""
-
-    def _write(patch: dict | None = None, *, name: str = "policy.yaml") -> Path:
-        data = _deep_update(BASE_POLICY, patch or {})
-        path = tmp_path / name
-        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-        return path
-
-    return _write
-
-
+# Break-glass overrides. Normally empty in production; the fixture carries a
+# couple so tests can exercise the override path.
 BASE_ROLES: dict = {
-    "mode": "file",
-    "default_tier": "none",
     "users": {"lead@example.com": "lead", "op@example.com": "operator"},
 }
 
@@ -113,3 +65,66 @@ class FakeClock:
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+# ---------------------------------------------------------------------------
+# managed accounts
+# ---------------------------------------------------------------------------
+# The set of accounts under the MCC used to be `allowed_customer_ids` in
+# policy.yaml. It is now derived from Google, so tests inject this stand-in
+# at the same seam the server injects ManagedAccountStore.
+
+DEFAULT_TEST_ACCOUNTS: dict = {"1234567890": ("INR", "Asia/Kolkata")}
+
+
+class FakeManagedAccounts:
+    """Mirrors ManagedAccountStore: None means "not ours", raising means
+    "we could not find out"."""
+
+    def __init__(self, accounts: dict | None = None, *, raises: bool = False) -> None:
+        self._accounts = (
+            DEFAULT_TEST_ACCOUNTS if accounts is None else dict(accounts)
+        )
+        self._raises = raises
+        self.calls = 0
+
+    async def get(self, customer_id: str):
+        from gads_write.safety.accounts import AccountLookupError, ManagedAccount
+
+        self.calls += 1
+        if self._raises:
+            raise AccountLookupError("Google Ads API timed out")
+        entry = self._accounts.get(str(customer_id).strip())
+        if entry is None:
+            return None
+        currency, tz = entry
+        return ManagedAccount(
+            customer_id=str(customer_id).strip(),
+            currency_code=currency,
+            timezone=tz,
+            descriptive_name=f"Account {customer_id}",
+            is_manager=False,
+        )
+
+    async def all(self):
+        from gads_write.safety.accounts import ManagedAccount
+
+        if self._raises:
+            from gads_write.safety.accounts import AccountLookupError
+
+            raise AccountLookupError("Google Ads API timed out")
+        return tuple(
+            ManagedAccount(
+                customer_id=cid,
+                currency_code=cur,
+                timezone=tz,
+                descriptive_name=f"Account {cid}",
+                is_manager=False,
+            )
+            for cid, (cur, tz) in sorted(self._accounts.items())
+        )
+
+
+@pytest.fixture
+def managed_accounts() -> FakeManagedAccounts:
+    return FakeManagedAccounts()

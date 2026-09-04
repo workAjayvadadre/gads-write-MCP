@@ -103,12 +103,15 @@ silently relax a limit.
 pm2 logs gads-write-mcp --lines 50 | grep -i "REFUSED"
 ```
 
-You will see which file and why. Fix the YAML and save. Both `policy.yaml`
-and `roles.yaml` hot-reload within seconds - **no restart needed**. Re-check
-`/healthz` until it returns 200.
+You will see why. Fix the YAML and save. `roles.yaml` hot-reloads within
+seconds - **no restart needed**. Re-check `/healthz` until it returns 200.
 
-Until you fix it, the running limits are the older ones, not what the file
+Until you fix it, the running roles are the older ones, not what the file
 says.
+
+`roles.yaml` is the only file that can fail this way. The spending rules are
+relative, fixed in code, or read from `.env`, so there is no limits file to
+mistype.
 
 ---
 
@@ -132,9 +135,10 @@ touched - and `plan_id`, plus the preview the person approved.
 tools. Reverse the change in the Google Ads UI. If it was a budget or bid,
 the previous value is in the audit line's preview.
 
-**To stop it recurring:** lower the limit in `config/policy.yaml` (takes
-effect in seconds, no restart) or reduce the person's role in the Google Ads
-UI (takes effect within the tier cache window, default 60s).
+**To stop it recurring:** reduce the person's role in the Google Ads UI
+(takes effect within the tier cache window, default 60s). To tighten the
+rules for everyone, lower `GADS_MAX_INCREASE_PERCENT` in `.env` and
+`pm2 restart gads-write-mcp`.
 
 ---
 
@@ -157,20 +161,34 @@ so a full 400-day retention is on the order of 30 MB.
 
 ## 7. Routine changes
 
-**Change a spending limit** - edit `config/policy.yaml`, save. Hot-reloads in
-seconds. Verify with `/healthz` (200 = accepted, 503 = your edit was
-rejected).
-
 **Give someone access** - add them in the Google Ads UI. Nothing to do here.
 Their tier comes from their own Google Ads role, within the cache window.
+
+**Add an account** - link it under the MCC in the Google Ads UI. Nothing to
+do here either; the managed set is derived from the manager account and
+refreshes within 5 minutes.
+
+**Change the spending backstop** - edit `GADS_MAX_INCREASE_PERCENT` in `.env`
+and `pm2 restart gads-write-mcp`. It is a percentage, not an amount: 1000
+means "nothing may jump more than elevenfold in one change". It is a typo
+backstop set far above ordinary work, NOT an operating limit — the control is
+that a person approves a preview.
+
+**Restore access when Google cannot resolve a role** - add the person to
+`users:` in `config/roles.yaml`, save. It applies on the next request, no
+restart. Remove the entry once Google is answering again.
 
 **Remove someone** - remove them in the Google Ads UI. They lose access
 immediately: every call uses their own OAuth token, so Google refuses them
 regardless of anything cached here.
 
-**Break glass (Google Ads lookup is failing)** - in `config/roles.yaml`, set
-`mode: file` and add the person under `users:`. Hot-reloads. This is visible,
-in git, and obviously temporary. Undo it when Google recovers.
+**Break glass (Google Ads lookup is failing)** - add the person under
+`users:` in `config/roles.yaml`. Hot-reloads, no restart. This is visible, in
+git, and obviously temporary. Undo it when Google recovers.
+
+It is not a privilege escalation: every call still uses that person's own
+OAuth token, so if Google has removed them, Google refuses the call whatever
+tier is set here.
 
 ---
 
@@ -205,11 +223,12 @@ someone re-drafts a change.
 
 ## 9. Before first live use
 
-- [ ] Real account ID in `config/policy.yaml` (`0000000000` is a placeholder)
-- [ ] Real limits in `config/policy.yaml`
+- [ ] `GADS_LOGIN_CUSTOMER_ID` is the real MCC (it decides which accounts
+      this server may touch at all)
+- [ ] `GADS_ALLOWED_URL_DOMAINS` set, or new ads will be refused
 - [ ] `GADS_JWT_SIGNING_KEY` set (production refuses to boot without it)
 - [ ] `GADS_REQUIRE_HUMAN_CONFIRMATION=true`
-- [ ] `roles.yaml` on `mode: google_ads`
+- [ ] `config/roles.yaml` `users:` map empty (break-glass only)
 - [ ] Uptime monitor on `/healthz`
 - [ ] Only then `GADS_WRITE_ENABLED=true`, and pause one campaign that does
       not matter as the first live test

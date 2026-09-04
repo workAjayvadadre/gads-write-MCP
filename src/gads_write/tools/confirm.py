@@ -8,7 +8,7 @@ The order of operations is the point, and it is not arbitrary:
 
   1. identity          who is confirming, per Google
   2. peek the plan     ownership, expiry and single-use, WITHOUT consuming it
-  3. authorise         tier, kill switch and allowlist, before any read
+  3. authorise         tier, kill switch and account check, before any read
   4. re-read state     what the account looks like NOW, not at draft time
   5. re-run the gate   the full chain again, against the ORIGINAL tool
   6. consume the plan  marked used BEFORE anything is applied
@@ -17,8 +17,9 @@ The order of operations is the point, and it is not arbitrary:
 
 Why 5 exists at all, given the draft already passed the gate: because time
 passed. Between draft and confirm, someone may have been demoted in Google
-Ads, the account may have been dropped from the allowlist, `policy.yaml` may
-have been tightened, or the kill switch may have been thrown. A plan carries
+Ads, the account may have been unlinked from the MCC, the account's own
+budgets may have moved under the daily ceiling, or the kill switch may have
+been thrown. A plan carries
 intent, never authority. Re-checking is what makes that true rather than
 merely stated.
 
@@ -32,7 +33,7 @@ increase needs something to be a percentage OF. A plan stores an absolute
 target, so trusting the value the preview was built from would let an
 approved "100 -> 120" become a 1100% increase if someone lowered the budget
 to 10 in the Google Ads UI first. Step 3 comes before step 4 for the same
-reason tools/writes.py authorises before reading: the account allowlist must
+reason tools/writes.py authorises before reading: the managed-account check must
 hold before this server touches an account at all. That costs a second audit
 line on the tools that need state, which is the same deliberate trade
 drafting already makes.

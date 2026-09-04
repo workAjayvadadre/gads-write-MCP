@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 
 from gads_write.ads.reads import AccountSummary, AdsReadError, CampaignRow, SearchTermRow
@@ -113,26 +115,30 @@ class FakeReader:
         )
 
 
-def _settings(tmp_path: Path, policy_path: Path) -> Settings:
+def _settings(tmp_path: Path) -> Settings:
     return Settings(
         env="test", host="127.0.0.1", port=8081, base_url="https://example.com",
         oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
         jwt_signing_key="k", developer_token="d", login_customer_id="9999999999",
         write_enabled=False,           # reads must work with writes switched off
-        policy_path=policy_path,
         roles_path=tmp_path / "roles.yaml",
         audit_log_path=tmp_path / "audit.jsonl",
     )
 
 
 @pytest.fixture
-def harness(tmp_path, write_policy):
+def harness(tmp_path):
     """A real server with fake Google and a fixed tier."""
 
-    def _build(tier: Tier = Tier.READONLY, *, reader: FakeReader | None = None):
-        policy_path = write_policy()
-        settings = _settings(tmp_path, policy_path)
-        policy_store = PolicyStore(policy_path)
+    def _build(
+        tier: Tier = Tier.READONLY,
+        *,
+        reader: FakeReader | None = None,
+        accounts: FakeManagedAccounts | None = None,
+    ):
+        accounts = accounts or FakeManagedAccounts()
+        settings = _settings(tmp_path)
+        policy_store = PolicyStore(settings)
         audit_log = AuditLog(settings.audit_log_path)
         resolver = FixedTierResolver(tier)
         guard = Guard(
@@ -141,6 +147,7 @@ def harness(tmp_path, write_policy):
             tier_resolver=resolver,
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=accounts,
         )
 
         ads_reader = reader or FakeReader()
@@ -157,6 +164,7 @@ def harness(tmp_path, write_policy):
             guard=guard,
             reader=ads_reader,
             policy_store=policy_store,
+            managed_accounts=accounts,
             caller_provider=FakeCaller,
         )
         return mcp, ads_reader, settings.audit_log_path
@@ -382,3 +390,57 @@ async def test_a_non_numeric_campaign_filter_is_refused(harness) -> None:
                 {"customer_id": ACCOUNT, "campaign_id": "55 OR 1=1"},
             )
     assert reader.search_term_calls == []
+
+
+def test_a_derived_window_honours_the_timezone_it_is_given() -> None:
+    """Deterministic half of the timezone check.
+
+    Kiritimati is UTC+14 and Niue is UTC-11, twenty-five hours apart, so
+    their dates ALWAYS differ. That makes this fail whenever the zone
+    argument is ignored, rather than only when UTC happens to disagree.
+    """
+    from gads_write.tools.reads import _derived_window
+
+    _, ahead = _derived_window("Pacific/Kiritimati", 1)
+    _, behind = _derived_window("Pacific/Niue", 1)
+
+    assert ahead > behind
+
+
+async def test_the_report_window_uses_the_accounts_timezone_not_utc(harness) -> None:
+    """The window is derived AFTER the gate, on purpose.
+
+    The timezone belongs to the account and only the gate establishes it.
+    Deriving the window before the gate silently used the UTC fallback, which
+    shifts "today" by a day for part of every Asia/Kolkata day - a whole day
+    missing from a report, with nothing to show for it.
+    """
+    from gads_write.tools.reads import _today_in_timezone
+
+    zone = "Pacific/Kiritimati"
+    mcp, reader, _ = harness(
+        Tier.READONLY, accounts=FakeManagedAccounts({ACCOUNT: ("AUD", zone)})
+    )
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "get_campaign_performance", {"customer_id": ACCOUNT, "days": 1}
+        )
+
+    assert reader.campaign_calls[-1]["end_date"] == _today_in_timezone(zone).isoformat()
+
+
+async def test_an_explicit_range_is_passed_through_untouched(harness) -> None:
+    """An explicit range is the caller's own and needs no timezone at all."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "get_campaign_performance",
+            {
+                "customer_id": ACCOUNT,
+                "start_date": "2026-08-01",
+                "end_date": "2026-08-31",
+            },
+        )
+
+    call = reader.campaign_calls[-1]
+    assert (call["start_date"], call["end_date"]) == ("2026-08-01", "2026-08-31")

@@ -44,12 +44,17 @@ of them says no, nothing happens.
    read-only. One env change, one restart.
 3. **Role tier.** `config/roles.yaml` maps email to `readonly` / `operator` /
    `lead`. Unlisted people get `none`.
-4. **Policy.** `config/policy.yaml` holds the account allowlist and spend
-   limits, checked at draft time **and again** at confirm time.
-5. **Two-step confirm.** Writes return a preview and a `plan_id` and do
-   nothing else. A separate call applies it.
-
-Phase 1 implements 1–3. Layers 4 and 5 arrive in Phase 2.
+4. **Managed accounts.** The accounts this server may touch are derived from
+   your MCC, not configured. That protects your developer token; it is not a
+   spend control.
+5. **Parity with the Google Ads UI.** You can do here what you could already
+   do there. Very little is refused: only what cannot be undone (there are no
+   delete tools), an account outside your MCC, or a change whose preview would
+   misrepresent it. Risky-but-legitimate choices are warnings, not blocks.
+   One relative backstop catches a stray digit.
+6. **Two-step confirm.** Writes return a preview and a `plan_id` and do
+   nothing else. A separate call applies it, and a person must accept the
+   preview first. This is the real control — everything above supports it.
 
 ---
 
@@ -72,9 +77,24 @@ Three files, and only these three, decide what this server can do:
 
 | File | Controls | Committed? |
 |---|---|---|
-| `.env` | credentials, port, kill switch | **no** |
-| `config/policy.yaml` | account allowlist, spend limits | yes |
-| `config/roles.yaml` | who has which tier | yes |
+| `.env` | credentials, port, kill switch, the two spend settings | **no** |
+| `config/roles.yaml` | break-glass tier overrides — **optional, normally absent** | yes |
+
+There is no policy file. Everything it used to hold is now derived or fixed:
+
+| Was in `policy.yaml` | Now |
+|---|---|
+| `allowed_customer_ids` | every account under `GADS_LOGIN_CUSTOMER_ID` |
+| `currency_code`, `timezone` | read from each account |
+| `min_daily`, `max_daily`, `max_cpc` | **removed** — a rupee figure is wrong for some account, and always goes stale |
+| `max_increase_percent` | `GADS_MAX_INCREASE_PERCENT`, default 1000 — a typo backstop, not an operating limit |
+| daily increase ceiling | **removed as a limit** — shown on the preview instead, so the person approving decides |
+| `block_broad_match_with_manual_cpc` | **now a warning on the preview**, not a refusal |
+| `allowed_final_url_domains` | `GADS_ALLOWED_URL_DOMAINS` |
+| structural rules, blocked ops, plan TTL | fixed in `safety/policy.py` |
+
+The point of that table: **deploy it, add people in Google Ads, hand over the
+URL.** Nobody edits a file to add an account or onboard a colleague.
 
 No customer ID, budget limit, or email address may be hardcoded in Python.
 
@@ -166,7 +186,7 @@ token ever leaving `auth/identity.py`.
 ## Where things live
 
 ```
-config/            policy.yaml, roles.yaml  — all limits and permissions
+config/            roles.yaml — break-glass overrides, normally absent
 src/gads_write/
   server.py        FastMCP app, tool registration
   settings.py      boot validation, fails fast

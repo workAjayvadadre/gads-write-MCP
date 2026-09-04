@@ -166,7 +166,7 @@ def local_date_for(moment: datetime, account_timezone: str) -> str:
         zone = ZoneInfo(account_timezone)
     except (ZoneInfoNotFoundError, ValueError):
         logger.warning(
-            "unknown timezone %r in policy.yaml, falling back to UTC for the "
+            "unknown timezone %r reported by Google, falling back to UTC for the "
             "daily spend ceiling",
             account_timezone,
         )

@@ -19,7 +19,12 @@ from gads_write.safety.guards import (
     Guard,
     GuardDenied,
 )
-from gads_write.safety.policy import PolicyStore, evaluate_budget_change
+from gads_write.safety.accounts import AccountLookupError, ManagedAccount
+from gads_write.safety.policy import (
+    PolicyStore,
+    evaluate_bid_change,
+    evaluate_budget_change,
+)
 from gads_write.safety.spend import DailySpendLedger
 from gads_write.safety.validators import ValidationResult
 from gads_write.tools.registry import ToolSpec, register, reset_for_tests
@@ -63,6 +68,49 @@ class FakeTierResolver:
         return "fake"
 
 
+class FakeAccounts:
+    """The managed-account set, without Google.
+
+    Mirrors ManagedAccountStore: `None` means "not ours", an exception means
+    "we could not find out".
+    """
+
+    def __init__(self, accounts=None, *, raises: bool = False) -> None:
+        if accounts is None:
+            accounts = {ACCOUNT: ("INR", "Asia/Kolkata")}
+        self._accounts = accounts
+        self._raises = raises
+        self.calls = 0
+
+    async def get(self, customer_id: str):
+        self.calls += 1
+        if self._raises:
+            raise AccountLookupError("Google Ads API timed out")
+        entry = self._accounts.get(str(customer_id).strip())
+        if entry is None:
+            return None
+        currency, tz = entry
+        return ManagedAccount(
+            customer_id=str(customer_id).strip(),
+            currency_code=currency,
+            timezone=tz,
+            descriptive_name="Test Account",
+            is_manager=False,
+        )
+
+    async def all(self):
+        return tuple(
+            ManagedAccount(
+                customer_id=cid,
+                currency_code=cur,
+                timezone=tz,
+                descriptive_name="Test Account",
+                is_manager=False,
+            )
+            for cid, (cur, tz) in sorted(self._accounts.items())
+        )
+
+
 @pytest.fixture(autouse=True)
 def _tools():
     """A tool set to gate. Restored after every test."""
@@ -84,13 +132,12 @@ def _tools():
 
 def _guard(
     tmp_path: Path,
-    write_policy,
     *,
     tier=Tier.OPERATOR,
     write_enabled: bool = True,
     raises: bool = False,
-    policy_patch: dict | None = None,
     ledger=None,
+    accounts=None,
 ) -> tuple[Guard, AuditLog, PolicyStore]:
     from gads_write.settings import Settings
 
@@ -105,11 +152,10 @@ def _guard(
         developer_token="d",
         login_customer_id=ACCOUNT,
         write_enabled=write_enabled,
-        policy_path=tmp_path / "policy.yaml",
         roles_path=tmp_path / "roles.yaml",
         audit_log_path=tmp_path / "audit.jsonl",
     )
-    store = PolicyStore(write_policy(policy_patch))
+    store = PolicyStore(settings)
     audit = AuditLog(tmp_path / "audit.jsonl")
     guard = Guard(
         settings=settings,
@@ -117,6 +163,7 @@ def _guard(
         tier_resolver=FakeTierResolver(tier, raises=raises),
         audit_log=audit,
         spend_ledger=ledger if ledger is not None else DailySpendLedger(audit),
+        managed_accounts=accounts if accounts is not None else FakeAccounts(),
         now=lambda: NOW,
     )
     return guard, audit, store
@@ -143,12 +190,11 @@ class CountingLedger:
 
 def _budget_evaluator(current: object, new: object):
     def evaluate(policy, tier, spend_today):
+        # `spend_today` is still handed to every evaluator and still lands on
+        # the decision, but it is no longer a limit - the draft tools put it
+        # on the preview as information. See safety/policy.py.
         return evaluate_budget_change(
-            policy,
-            tier=tier,
-            current_units=current,
-            new_units=new,
-            already_increased_today_units=spend_today,
+            policy, tier=tier, current_units=current, new_units=new
         )
 
     return evaluate
@@ -162,8 +208,8 @@ def _lines(audit: AuditLog) -> list[dict]:
 # 1. kill switch
 # ---------------------------------------------------------------------------
 
-async def test_kill_switch_blocks_every_write(tmp_path, write_policy) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy, tier=Tier.LEAD, write_enabled=False)
+async def test_kill_switch_blocks_every_write(tmp_path) -> None:
+    guard, audit, _ = _guard(tmp_path, tier=Tier.LEAD, write_enabled=False)
 
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("lead@x.com"), customer_id=ACCOUNT
@@ -174,27 +220,27 @@ async def test_kill_switch_blocks_every_write(tmp_path, write_policy) -> None:
     assert "GADS_WRITE_ENABLED" in decision.reason_text
 
 
-async def test_kill_switch_does_not_block_reads(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.READONLY, write_enabled=False)
+async def test_kill_switch_does_not_block_reads(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path, tier=Tier.READONLY, write_enabled=False)
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
     )
     assert decision.allowed
 
 
-async def test_kill_switch_beats_even_a_lead(tmp_path, write_policy) -> None:
+async def test_kill_switch_beats_even_a_lead(tmp_path) -> None:
     # It is absolute and tier-independent. That is the point of a kill switch.
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.LEAD, write_enabled=False)
+    guard, _, _ = _guard(tmp_path, tier=Tier.LEAD, write_enabled=False)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("lead@x.com"), customer_id=ACCOUNT
     )
     assert not decision.allowed
 
 
-async def test_kill_switch_is_checked_before_the_tier_lookup(tmp_path, write_policy) -> None:
+async def test_kill_switch_is_checked_before_the_tier_lookup(tmp_path) -> None:
     # Cheapest first: no reason to hit Google to learn the server is off.
     guard, _, _ = _guard(
-        tmp_path, write_policy, tier=Tier.LEAD, write_enabled=False, raises=True
+        tmp_path, tier=Tier.LEAD, write_enabled=False, raises=True
     )
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("lead@x.com"), customer_id=ACCOUNT
@@ -206,15 +252,15 @@ async def test_kill_switch_is_checked_before_the_tier_lookup(tmp_path, write_pol
 # 2. identity
 # ---------------------------------------------------------------------------
 
-async def test_no_caller_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+async def test_no_caller_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path)
     decision = await guard.check(tool="get_campaigns", caller=None, customer_id=ACCOUNT)
     assert not decision.allowed
     assert decision.failed_check == "identity"
 
 
-async def test_caller_without_an_email_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+async def test_caller_without_an_email_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller(""), customer_id=ACCOUNT
     )
@@ -225,8 +271,8 @@ async def test_caller_without_an_email_is_refused(tmp_path, write_policy) -> Non
 # 3. tier
 # ---------------------------------------------------------------------------
 
-async def test_tier_below_the_tool_requirement_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.READONLY)
+async def test_tier_below_the_tool_requirement_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path, tier=Tier.READONLY)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
     )
@@ -235,23 +281,27 @@ async def test_tier_below_the_tool_requirement_is_refused(tmp_path, write_policy
     assert "requires tier operator" in decision.reason_text
 
 
-async def test_tier_is_resolved_for_the_specific_account(tmp_path, write_policy) -> None:
+async def test_tier_is_resolved_for_the_specific_account(tmp_path) -> None:
     """Per-account, not global. The decision you approved."""
     from gads_write.settings import Settings
 
-    store = PolicyStore(write_policy({"allowed_customer_ids": [ACCOUNT, OTHER_ACCOUNT]}))
     audit = AuditLog(tmp_path / "audit.jsonl")
     resolver = FakeTierResolver({ACCOUNT: Tier.OPERATOR, OTHER_ACCOUNT: Tier.READONLY})
     settings = Settings(
         env="test", host="h", port=1, base_url="https://x",
         oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
         jwt_signing_key="k", developer_token="d", login_customer_id=ACCOUNT,
-        write_enabled=True, policy_path=tmp_path / "p", roles_path=tmp_path / "r",
+        write_enabled=True, roles_path=tmp_path / "r",
         audit_log_path=tmp_path / "audit.jsonl",
     )
+    store = PolicyStore(settings)
     guard = Guard(
         settings=settings, policy_store=store, tier_resolver=resolver,
-        audit_log=audit, spend_ledger=DailySpendLedger(audit), now=lambda: NOW,
+        audit_log=audit, spend_ledger=DailySpendLedger(audit),
+        managed_accounts=FakeAccounts(
+            {ACCOUNT: ("INR", "Asia/Kolkata"), OTHER_ACCOUNT: ("INR", "Asia/Kolkata")}
+        ),
+        now=lambda: NOW,
     )
     caller = FakeCaller("a@x.com")
 
@@ -267,9 +317,9 @@ async def test_tier_is_resolved_for_the_specific_account(tmp_path, write_policy)
     assert "9999999999" in denied.reason_text
 
 
-async def test_an_indeterminate_lookup_fails_closed(tmp_path, write_policy) -> None:
+async def test_an_indeterminate_lookup_fails_closed(tmp_path) -> None:
     """A Google outage must never become an escalation path."""
-    guard, audit, _ = _guard(tmp_path, write_policy, raises=True)
+    guard, audit, _ = _guard(tmp_path, raises=True)
 
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
@@ -287,18 +337,18 @@ async def test_an_indeterminate_lookup_fails_closed(tmp_path, write_policy) -> N
 # 4 and 5. allowlist, blocked operations
 # ---------------------------------------------------------------------------
 
-async def test_account_not_on_the_allowlist_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+async def test_an_account_outside_the_manager_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=OTHER_ACCOUNT
     )
-    assert decision.failed_check == "account_allowlist"
-    assert "no wildcard" in decision.reason_text
+    assert decision.failed_check == "managed_account"
+    assert OTHER_ACCOUNT in decision.reason_text
 
 
-async def test_allowlist_is_checked_before_validation(tmp_path, write_policy) -> None:
+async def test_membership_is_checked_before_validation(tmp_path) -> None:
     # An unmanaged account must not have its contents inspected at all.
-    guard, _, _ = _guard(tmp_path, write_policy)
+    guard, _, _ = _guard(tmp_path)
 
     def validate(policy):
         raise AssertionError("validation must not run for an unmanaged account")
@@ -309,19 +359,88 @@ async def test_allowlist_is_checked_before_validation(tmp_path, write_policy) ->
         customer_id=OTHER_ACCOUNT,
         validate=validate,
     )
-    assert decision.failed_check == "account_allowlist"
+    assert decision.failed_check == "managed_account"
 
 
-async def test_blocked_operation_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.LEAD)
+async def test_an_indeterminate_account_lookup_fails_closed(tmp_path) -> None:
+    """Distinct from "not ours", exactly as a failed tier lookup is.
+
+    If a Google outage produced an ordinary denial, the audit log could not
+    tell an outage apart from a wave of correct refusals.
+    """
+    guard, audit, _ = _guard(
+        tmp_path, accounts=FakeAccounts(raises=True)
+    )
+    decision = await guard.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+    assert not decision.allowed
+    assert decision.failed_check == "managed_account_lookup"
+    assert decision.verdict == VERDICT_LOOKUP_FAILED
+
+
+async def test_the_account_currency_reaches_the_policy_message(
+    tmp_path
+) -> None:
+    """Currency is per account now, not one value for the whole server."""
+    guard, _, _ = _guard(
+        tmp_path,
+        accounts=FakeAccounts({ACCOUNT: ("USD", "America/New_York")}),
+    )
+
+    seen: dict = {}
+
+    def evaluate(policy, tier, spend_today):
+        seen["currency"] = policy.currency_code
+        return evaluate_budget_change(
+            policy, tier=tier, current_units=100, new_units=100_000
+        )
+
+    decision = await guard.check(
+        tool="update_campaign_budget",
+        caller=FakeCaller("a@x.com"),
+        customer_id=ACCOUNT,
+        evaluate=evaluate,
+    )
+    assert seen["currency"] == "USD"
+    assert "USD" in decision.reason_text
+
+
+async def test_the_audit_date_uses_the_account_timezone(tmp_path) -> None:
+    """The daily ceiling groups by this date, so it must follow the account.
+
+    NOW is 04:00 UTC on the 15th - already the 15th in Kolkata, still the
+    14th in New York.
+    """
+    guard_kolkata, _, _ = _guard(
+        tmp_path, accounts=FakeAccounts({ACCOUNT: ("INR", "Asia/Kolkata")})
+    )
+    guard_ny, _, _ = _guard(
+        tmp_path,
+        accounts=FakeAccounts({ACCOUNT: ("USD", "America/New_York")}),
+    )
+
+    kolkata = await guard_kolkata.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+    new_york = await guard_ny.check(
+        tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
+    )
+
+    assert kolkata.local_date == "2026-01-15"
+    assert new_york.local_date == "2026-01-14"
+
+
+async def test_blocked_operation_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path, tier=Tier.LEAD)
     decision = await guard.check(
         tool="remove_campaign", caller=FakeCaller("lead@x.com"), customer_id=ACCOUNT
     )
     assert decision.failed_check == "blocked_operation"
 
 
-async def test_an_unregistered_tool_is_refused(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.LEAD)
+async def test_an_unregistered_tool_is_refused(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path, tier=Tier.LEAD)
     decision = await guard.check(
         tool="whatever_someone_forgot", caller=FakeCaller("lead@x.com"), customer_id=ACCOUNT
     )
@@ -333,9 +452,9 @@ async def test_an_unregistered_tool_is_refused(tmp_path, write_policy) -> None:
 # ---------------------------------------------------------------------------
 
 async def test_validation_failure_is_refused_with_every_problem(
-    tmp_path, write_policy
+    tmp_path
 ) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+    guard, _, _ = _guard(tmp_path)
 
     def validate(policy):
         result = ValidationResult()
@@ -353,19 +472,20 @@ async def test_validation_failure_is_refused_with_every_problem(
     assert len(decision.reasons) == 2
 
 
-async def test_policy_limit_is_enforced_at_the_gate(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+async def test_policy_limit_is_enforced_at_the_gate(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget",
         caller=FakeCaller("a@x.com"),
         customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 5000),  # way over operator's 20%
+        # Past the typo backstop: 1,000 -> 50,000 is a fiftyfold jump.
+        evaluate=_budget_evaluator(1000, 50000),
     )
     assert decision.failed_check == "policy"
 
 
-async def test_a_change_within_every_limit_is_allowed(tmp_path, write_policy) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy)
+async def test_a_change_within_every_limit_is_allowed(tmp_path) -> None:
+    guard, audit, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget",
         caller=FakeCaller("a@x.com"),
@@ -377,33 +497,41 @@ async def test_a_change_within_every_limit_is_allowed(tmp_path, write_policy) ->
     assert decision.tier is Tier.OPERATOR
 
 
-async def test_the_daily_ceiling_reaches_the_gate(tmp_path, write_policy) -> None:
-    """Today's applied increases are read from the audit log and enforced."""
-    guard, audit, _ = _guard(tmp_path, write_policy)
+# The two daily-ceiling tests that stood here are gone with the rule. It
+# refused past a percentage of the account's total, which blocked ordinary
+# work - raising five campaigns for a seasonal push stopped after the second.
+# The running total is still computed here and rides out on the decision;
+# tools/writes.py puts it on the preview instead of refusing.
+
+
+async def test_the_running_total_still_reaches_the_decision(tmp_path) -> None:
+    """Not a limit any more, but the draft preview shows it, so it has to be
+    on the decision for the tool to read."""
+    guard, _, _ = _guard(tmp_path)
     caller = FakeCaller("a@x.com")
 
-    # Record 2,900 of the operator's 3,000 daily allowance as already applied.
-    decision = await guard.check(
+    first = await guard.check(
         tool="update_campaign_budget", caller=caller, customer_id=ACCOUNT,
         evaluate=_budget_evaluator(1000, 1200),
     )
     guard.record_application(
-        decision, arguments={}, plan_id=None, resource_names=[],
-        spend_delta_units=Decimal(2900),
+        first, arguments={}, plan_id=None, resource_names=[],
+        spend_delta_units=Decimal(200),
     )
 
-    blocked = await guard.check(
+    second = await guard.check(
         tool="update_campaign_budget", caller=caller, customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),  # +200 -> 3100, over the cap
+        evaluate=_budget_evaluator(1200, 1400),
     )
-    assert not blocked.allowed
-    assert "daily ceiling" in blocked.reason_text
+
+    assert second.allowed
+    assert second.spend_today_units == Decimal(200)
 
 
 async def test_another_users_spending_does_not_count_against_you(
-    tmp_path, write_policy
+    tmp_path
 ) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy)
+    guard, _, _ = _guard(tmp_path)
 
     other = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("other@x.com"),
@@ -425,61 +553,36 @@ async def test_another_users_spending_does_not_count_against_you(
 # the confirm-time re-evaluation
 # ---------------------------------------------------------------------------
 
-async def test_a_plan_drafted_under_old_limits_fails_after_a_tightening(
-    tmp_path, write_policy
-) -> None:
-    """End to end through the gate, not just the policy module.
-
-    Drafted while the cap allowed it. The lead then tightens policy.yaml.
-    The identical check at confirm time refuses, because the gate reads
-    PolicyStore.current() rather than anything captured at draft time.
-    """
-    guard, _, _ = _guard(tmp_path, write_policy)
-    caller = FakeCaller("a@x.com")
-
-    drafted = dict(
-        tool="update_campaign_budget",
-        caller=caller,
-        customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 1200),
-    )
-    assert (await guard.check(**drafted)).allowed
-
-    write_policy({"limits": {"defaults": {"budget": {"max_daily": 1000}},
-                             "tiers": {"operator": {"budget": {"max_daily": 1000}}}}})
-
-    after = await guard.check(**drafted)
-    assert not after.allowed
-    assert after.failed_check == "policy"
-
-
-async def test_a_broken_policy_edit_does_not_open_the_gate(tmp_path, write_policy) -> None:
-    guard, _, store = _guard(tmp_path, write_policy)
-    store.path.write_text("broken: [\n", encoding="utf-8")
-
-    decision = await guard.check(
-        tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT,
-        evaluate=_budget_evaluator(1000, 5000),
-    )
-    assert not decision.allowed  # last good policy still in force
-    assert store.last_error is not None
+# NOTE: two tests were removed here with the policy file itself.
+#
+#   test_a_plan_drafted_under_old_limits_fails_after_a_tightening
+#   test_a_broken_policy_edit_does_not_open_the_gate
+#
+# Both exercised policy.yaml hot-reload: a lead tightening a limit between
+# draft and confirm, and a mistyped edit not relaxing the gate. Neither is
+# reachable now - the limits are relative, fixed in code, and there is no
+# file to edit or to mistype.
+#
+# The property they were really protecting - that confirm RE-EVALUATES rather
+# than trusting the plan - is still pinned, by the demotion and re-read
+# regression tests in tests/test_phase5_tools.py.
 
 
 # ---------------------------------------------------------------------------
 # audit
 # ---------------------------------------------------------------------------
 
-async def test_every_decision_writes_exactly_one_line(tmp_path, write_policy) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy)
+async def test_every_decision_writes_exactly_one_line(tmp_path) -> None:
+    guard, audit, _ = _guard(tmp_path)
     await guard.check(tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT)
     await guard.check(tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=OTHER_ACCOUNT)
     assert len(_lines(audit)) == 2
 
 
-async def test_refusals_are_logged_not_just_successes(tmp_path, write_policy) -> None:
+async def test_refusals_are_logged_not_just_successes(tmp_path) -> None:
     # How you notice someone repeatedly pushing at a cap, or a limit set too
     # tight for the team to work.
-    guard, audit, _ = _guard(tmp_path, write_policy, tier=Tier.READONLY)
+    guard, audit, _ = _guard(tmp_path, tier=Tier.READONLY)
     await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
     )
@@ -490,7 +593,7 @@ async def test_refusals_are_logged_not_just_successes(tmp_path, write_policy) ->
 
 
 async def test_the_spend_ledger_is_not_read_when_no_rule_needs_it(
-    tmp_path, write_policy
+    tmp_path
 ) -> None:
     """A read must not pay for the daily spend ceiling.
 
@@ -500,7 +603,7 @@ async def test_the_spend_ledger_is_not_read_when_no_rule_needs_it(
     """
     audit = AuditLog(tmp_path / "audit.jsonl")
     ledger = CountingLedger(DailySpendLedger(audit))
-    guard, _, _ = _guard(tmp_path, write_policy, ledger=ledger)
+    guard, _, _ = _guard(tmp_path, ledger=ledger)
 
     decision = await guard.check(
         tool="get_campaigns", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
@@ -511,12 +614,12 @@ async def test_the_spend_ledger_is_not_read_when_no_rule_needs_it(
 
 
 async def test_the_spend_ledger_is_read_when_a_rule_does_need_it(
-    tmp_path, write_policy
+    tmp_path
 ) -> None:
     """The other half: a budget change still gets its running daily total."""
     audit = AuditLog(tmp_path / "audit.jsonl")
     ledger = CountingLedger(DailySpendLedger(audit))
-    guard, _, _ = _guard(tmp_path, write_policy, ledger=ledger)
+    guard, _, _ = _guard(tmp_path, ledger=ledger)
 
     decision = await guard.check(
         tool="update_campaign_budget",
@@ -529,8 +632,8 @@ async def test_the_spend_ledger_is_read_when_a_rule_does_need_it(
     assert ledger.reads == 1
 
 
-async def test_audit_arguments_are_redacted_by_the_gate(tmp_path, write_policy) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy)
+async def test_audit_arguments_are_redacted_by_the_gate(tmp_path) -> None:
+    guard, audit, _ = _guard(tmp_path)
     await guard.check(
         tool="get_campaigns",
         caller=FakeCaller("a@x.com"),
@@ -544,8 +647,8 @@ async def test_audit_arguments_are_redacted_by_the_gate(tmp_path, write_policy) 
     assert records[0]["arguments"]["campaign_id"] == "111"
 
 
-async def test_a_denied_decision_raises_when_asked(tmp_path, write_policy) -> None:
-    guard, _, _ = _guard(tmp_path, write_policy, tier=Tier.READONLY)
+async def test_a_denied_decision_raises_when_asked(tmp_path) -> None:
+    guard, _, _ = _guard(tmp_path, tier=Tier.READONLY)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT
     )
@@ -553,8 +656,8 @@ async def test_a_denied_decision_raises_when_asked(tmp_path, write_policy) -> No
         decision.raise_if_denied()
 
 
-async def test_record_application_marks_the_line_applied(tmp_path, write_policy) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy)
+async def test_record_application_marks_the_line_applied(tmp_path) -> None:
+    guard, audit, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT,
         evaluate=_budget_evaluator(1000, 1200),
@@ -575,9 +678,9 @@ async def test_record_application_marks_the_line_applied(tmp_path, write_policy)
 
 
 async def test_a_failed_application_is_not_counted_as_applied(
-    tmp_path, write_policy
+    tmp_path
 ) -> None:
-    guard, audit, _ = _guard(tmp_path, write_policy)
+    guard, audit, _ = _guard(tmp_path)
     decision = await guard.check(
         tool="update_campaign_budget", caller=FakeCaller("a@x.com"), customer_id=ACCOUNT,
         evaluate=_budget_evaluator(1000, 1200),
@@ -587,3 +690,10 @@ async def test_a_failed_application_is_not_counted_as_applied(
         spend_delta_units=Decimal(200), error="RESOURCE_EXHAUSTED",
     )
     assert not any(line["applied"] for line in _lines(audit))
+
+
+# NOTE: four tests stood here covering the daily-ceiling base - that it was
+# fetched only for rules needing it, and that a failed read refused the
+# change. The ceiling is no longer a limit (it blocked ordinary work; the
+# running total is shown on the preview instead), so there is no base to
+# fetch and nothing to gate on. See safety/policy.py.

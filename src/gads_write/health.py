@@ -5,11 +5,16 @@ learn something was wrong was for a person to complain. A crash is the easy
 case - PM2 restarts it and the logs say so. The case this exists for is
 quieter:
 
-    Someone lowers a limit in policy.yaml and makes a typo. PolicyStore does
-    the right thing and keeps the last good version rather than crashing a
-    live request. The server carries on serving perfectly, on the OLD limit.
-    The team believes the new limit is in force. Nothing errors, nothing
-    alerts, and nobody finds out.
+    Someone edits roles.yaml and makes a typo. RoleStore does the right
+    thing and keeps the last good version rather than crashing a live
+    request. The server carries on serving perfectly, on the OLD table. The
+    team believes the new role is in force. Nothing errors, nothing alerts,
+    and nobody finds out.
+
+roles.yaml is now the ONLY file that can fail this way. The spending rules
+used to live in policy.yaml and were the original reason for this endpoint;
+they are relative, fixed in code, or read from the environment now, so a bad
+edit cannot silently leave old limits running - there is no edit to make.
 
 `/healthz` is what makes that visible without a login.
 
@@ -40,7 +45,6 @@ def register_health_route(
     mcp: Any,
     *,
     settings: Any,
-    policy_store: Any,
     role_store: Any,
     path: str = "/healthz",
 ) -> None:
@@ -53,25 +57,19 @@ def register_health_route(
 
     @mcp.custom_route(path, methods=["GET"])
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
-        policy_error = getattr(policy_store, "last_error", None)
         roles_error = getattr(role_store, "last_error", None)
-        degraded = bool(policy_error) or bool(roles_error)
+        degraded = bool(roles_error)
 
         body = {
-            # "ok" means: alive, and serving the configuration on disk.
-            # "degraded" means: alive, but a config edit was REFUSED and we
-            # are running on an older version than the files show.
+            # "ok" means: alive, and serving the roles table on disk.
+            # "degraded" means: alive, but a roles.yaml edit was REFUSED and
+            # we are running on an older version than the file shows.
             "status": "degraded" if degraded else "ok",
             "write_enabled": bool(getattr(settings, "write_enabled", False)),
-            "policy_reload_error": policy_error,
             "roles_reload_error": roles_error,
         }
         if degraded:
-            logger.warning(
-                "/healthz reporting degraded: policy=%r roles=%r",
-                policy_error,
-                roles_error,
-            )
+            logger.warning("/healthz reporting degraded: roles=%r", roles_error)
         return JSONResponse(body, status_code=503 if degraded else 200)
 
 

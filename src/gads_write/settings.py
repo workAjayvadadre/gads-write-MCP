@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,7 +53,6 @@ class Settings:
     write_enabled: bool
 
     # --- paths ---
-    policy_path: Path
     roles_path: Path
     audit_log_path: Path
 
@@ -75,6 +75,19 @@ class Settings:
     # enough to change anything. Defaults to true; turning it off is a
     # deliberate act, like the kill switch.
     require_human_confirmation: bool = True
+
+    # A TYPO BACKSTOP, not an operating limit. The server never sees what the
+    # person actually asked for - a tool call carries a number, never the
+    # conversation - so it can only judge magnitude. 1000 means "nothing may
+    # jump more than elevenfold in one change", which ordinary work never
+    # meets and a stray digit always does. Raising a budget from 500 to 5,000
+    # is fine; 500 to 500,000 is not.
+    max_increase_percent: Decimal = Decimal(1000)
+
+    # Hosts a new ad's final URL may point at. Deployment-specific and not
+    # derivable: Google cannot tell us which domains are yours. Exact host
+    # match, so list the www variant separately.
+    allowed_url_domains: frozenset[str] = frozenset()
 
     @property
     def is_production(self) -> bool:
@@ -121,39 +134,32 @@ def _resolve(path_str: str) -> Path:
 # validation
 # --------------------------------------------------------------------------
 
-def _validate_config_files(policy_path: Path, roles_path: Path) -> list[str]:
-    """Confirm both YAML files exist and are fully valid.
+# The backstop's own backstop. The default is 1000 (elevenfold); this leaves
+# room to loosen that deliberately while still refusing a value that is not a
+# limit at all, which is how the control gets disabled by accident.
+MAX_SANE_INCREASE_PERCENT = Decimal(10_000)
 
-    Validation is delegated to the same parsers the running server uses, so
-    boot-time checks and runtime checks can never drift apart. Imports are
-    local to this function to keep module import order simple.
+
+def _validate_config_files(roles_path: Path) -> list[str]:
+    """Confirm the break-glass override file, IF it exists, is readable.
+
+    Its absence is the healthy state: overrides are the exception. Validation
+    is delegated to the same parser the running server uses, so a boot-time
+    check and a runtime check can never drift apart.
+
+    There is no policy file to check any more, and no roles `mode` - tiers
+    always come from Google Ads.
     """
     from .auth.roles import RoleTable
-    from .safety.policy import load_policy_file
 
-    problems: list[str] = []
+    if not roles_path.exists():
+        return []
 
-    # Both blocks catch Exception rather than the parsers' own error types.
-    # A config file that breaks in a shape the parser did not anticipate
-    # must still be reported as a configuration problem, in the same
-    # readable list as every other one - not as a raw traceback at boot.
-    if not policy_path.is_file():
-        problems.append(f"policy file not found at {policy_path}")
-    else:
-        try:
-            load_policy_file(policy_path)
-        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-            problems.append(str(exc))
-
-    if not roles_path.is_file():
-        problems.append(f"roles file not found at {roles_path}")
-    else:
-        try:
-            RoleTable.load(roles_path)
-        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-            problems.append(str(exc))
-
-    return problems
+    try:
+        RoleTable.load(roles_path)
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        return [str(exc)]
+    return []
 
 
 def load_settings(*, env_file: Path | None = None) -> Settings:
@@ -273,11 +279,49 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
             "evidence, so it cannot be set to keep nothing."
         )
 
-    policy_path = _resolve(_env("GADS_POLICY_PATH", "config/policy.yaml") or "config/policy.yaml")
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
 
-    problems.extend(_validate_config_files(policy_path, roles_path))
+    # The typo backstop. Deliberately far above ordinary work; see the field
+    # comment on Settings and safety/policy.py for why it is not a limit.
+    raw_increase = _env("GADS_MAX_INCREASE_PERCENT", "1000") or "1000"
+    max_increase_percent = Decimal(1000)
+    try:
+        max_increase_percent = Decimal(raw_increase)
+        # `is_finite()` is the check that matters, not `< 0`. Decimal happily
+        # parses "inf" and "nan": Infinity passes a negativity test, and then
+        # every `increase > limit` comparison is False, so a single typo in
+        # .env silently disables the only money control left. NaN is worse -
+        # it compares False both ways.
+        if not max_increase_percent.is_finite() or max_increase_percent < 0:
+            raise ValueError
+    except (ValueError, ArithmeticError):
+        problems.append(
+            f"GADS_MAX_INCREASE_PERCENT must be a finite, non-negative number, "
+            f"got {raw_increase!r}. It is a percentage: 100 means a change may "
+            "at most multiply a budget or a bid elevenfold."
+        )
+    else:
+        if max_increase_percent > MAX_SANE_INCREASE_PERCENT:
+            # Same reasoning as the tier cache ceiling below: a number this
+            # large is not a loose limit, it is no limit, and it arrives by
+            # typo rather than by intent. 1000 already permits an elevenfold
+            # increase in a single change.
+            problems.append(
+                f"GADS_MAX_INCREASE_PERCENT is {max_increase_percent}, which "
+                f"is not a limit at all. The maximum accepted is "
+                f"{MAX_SANE_INCREASE_PERCENT}."
+            )
+
+    # Exact host match, comma separated. Empty is allowed and means no new ad
+    # can be created - which is the right default for a server that has not
+    # been told which domains belong to it.
+    raw_domains = _env("GADS_ALLOWED_URL_DOMAINS", "") or ""
+    allowed_url_domains = frozenset(
+        part.strip().lower() for part in raw_domains.split(",") if part.strip()
+    )
+
+    problems.extend(_validate_config_files(roles_path))
 
     if problems:
         bullets = "\n".join(f"  - {p}" for p in problems)
@@ -297,9 +341,10 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         developer_token=developer_token,  # type: ignore[arg-type]
         login_customer_id=login_customer_id,  # type: ignore[arg-type]
         write_enabled=write_enabled,
-        policy_path=policy_path,
         roles_path=roles_path,
         audit_log_path=audit_log_path,
+        max_increase_percent=max_increase_percent,
+        allowed_url_domains=allowed_url_domains,
         tier_cache_seconds=tier_cache_seconds,
         audit_retention_days=audit_retention_days,
         require_human_confirmation=require_human_confirmation,

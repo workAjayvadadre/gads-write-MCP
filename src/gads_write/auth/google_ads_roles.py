@@ -61,10 +61,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..ads.reads import AdsReader, AdsReadError
+from ..safety.accounts import AccountLookupError
 from .roles import RoleStore
 from .tiers import Tier, TierLookupError, TierResolver, highest
 
@@ -190,12 +191,15 @@ class GoogleAdsTierResolver(TierResolver):
         *,
         reader: AdsReader,
         login_customer_id: str,
-        allowed_customer_ids: Callable[[], frozenset[str]],
+        managed_customer_ids: Callable[[], Awaitable[frozenset[str]]],
         cache: TierCache | None = None,
     ) -> None:
         self._reader = reader
         self._login_customer_id = login_customer_id
-        self._allowed_customer_ids = allowed_customer_ids
+        # Async because the managed set is now derived from the manager
+        # account rather than read out of a config file. See
+        # safety/accounts.py.
+        self._managed_customer_ids = managed_customer_ids
         self._cache = cache or TierCache(0)
 
     # -- interface --------------------------------------------------------
@@ -217,10 +221,10 @@ class GoogleAdsTierResolver(TierResolver):
     async def visible_tier(self, caller) -> Tier:  # noqa: ANN001
         """Highest tier this caller holds on any account WE MANAGE.
 
-        The allowlist intersection is a real security control, not tidiness.
-        Someone may be ADMIN on a personal Google Ads account that has
-        nothing to do with this company; without the intersection that would
-        light up every `lead` tool in their menu.
+        Intersecting with the managed set is a real security control, not
+        tidiness. Someone may be ADMIN on a personal Google Ads account that
+        has nothing to do with this company; without the intersection that
+        would light up every `lead` tool in their menu.
         """
         email = (getattr(caller, "email", "") or "").strip().lower()
         if not email:
@@ -230,10 +234,23 @@ class GoogleAdsTierResolver(TierResolver):
         if cached is not None:
             return cached
 
-        accounts = sorted(self._allowed_customer_ids())
+        # The managed set is derived from the manager account now, so unlike
+        # the config list it replaced, asking for it can FAIL. Everything
+        # upstream - the middleware's tools/list hook and the gate's step 3 -
+        # catches TierLookupError and only that, so an AccountLookupError
+        # escaping raw would crash tool listing and would skip the gate's
+        # audit line, leaving an outage with no `lookup_failed` record.
+        try:
+            accounts = sorted(await self._managed_customer_ids())
+        except AccountLookupError as exc:
+            raise TierLookupError(
+                f"could not determine which accounts this server manages, so "
+                f"your access level cannot be established: {exc}"
+            ) from exc
+
         if not accounts:
-            # No managed accounts configured. Nobody can do anything, which
-            # is the correct reading of an empty allowlist.
+            # A readable but empty manager account. Nobody can do anything,
+            # which is the correct reading of "we manage nothing".
             return Tier.NONE
 
         found: list[Tier] = []
@@ -314,9 +331,9 @@ class GoogleAdsTierResolver(TierResolver):
 class OverridingTierResolver(TierResolver):
     """Consults roles.yaml first, then the real resolver.
 
-    In `mode: google_ads` the `users` map in roles.yaml is normally empty and
-    this is a pass-through. A name in that map means: "Google could not tell
-    us this person's role and a lead has deliberately overridden it."
+    The override file is normally absent, so this is a pass-through. A name
+    in it means: "Google could not tell us this person's role and a lead has
+    deliberately overridden it."
 
     Deliberately a file edit rather than an automatic fallback. It is
     visible, it is in git, it shows up in review, and it is obviously
@@ -324,7 +341,7 @@ class OverridingTierResolver(TierResolver):
     an API call fails.
 
     An override can only be *consulted*; it is still subject to every other
-    check in the gate, including the account allowlist and the kill switch.
+    check in the gate, including the managed-account check and the kill switch.
     """
 
     def __init__(self, *, overrides: RoleStore, primary: TierResolver) -> None:
@@ -336,7 +353,7 @@ class OverridingTierResolver(TierResolver):
         if not email:
             return None
         table = self._overrides.current()
-        tier = table.users.get(email)
+        tier = table.override_for(email)
         if tier is not None:
             logger.warning(
                 "BREAK-GLASS: tier for %s came from %s, not from Google Ads",

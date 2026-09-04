@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 import yaml
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
@@ -132,31 +134,28 @@ class Harness:
     executor: FakeExecutor
     tiers: MutableTier
     clock: StepClock
-    policy_path: Path
     audit_path: Path
     settings: Settings
     caller: CallerBox
 
 
 @pytest.fixture
-def harness(tmp_path, write_policy):
+def harness(tmp_path):
     def _build(
         tier: Tier = Tier.OPERATOR,
         *,
         write_enabled: bool = True,
         status: str = "ENABLED",
     ) -> Harness:
-        policy_path = write_policy()
         settings = Settings(
             env="test", host="127.0.0.1", port=8081, base_url="https://example.com",
             oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
             jwt_signing_key="k", developer_token="d", login_customer_id="9999999999",
             write_enabled=write_enabled,
-            policy_path=policy_path,
             roles_path=tmp_path / "roles.yaml",
             audit_log_path=tmp_path / "audit.jsonl",
         )
-        policy_store = PolicyStore(policy_path)
+        policy_store = PolicyStore(settings)
         audit_log = AuditLog(settings.audit_log_path)
         tiers = MutableTier(tier)
         guard = Guard(
@@ -165,6 +164,7 @@ def harness(tmp_path, write_policy):
             tier_resolver=tiers,
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=FakeManagedAccounts(),
         )
         clock = StepClock()
         plan_store = PlanStore(clock=clock)
@@ -188,8 +188,7 @@ def harness(tmp_path, write_policy):
             reader=reader, caller_provider=caller,
         )
         return Harness(
-            mcp=mcp, reader=reader, executor=executor, tiers=tiers, clock=clock,
-            policy_path=policy_path, audit_path=settings.audit_log_path,
+            mcp=mcp, reader=reader, executor=executor, tiers=tiers, clock=clock, audit_path=settings.audit_log_path,
             settings=settings, caller=caller,
         )
 
@@ -396,34 +395,21 @@ async def test_a_demotion_between_draft_and_confirm_refuses_the_apply(harness) -
     assert h.executor.applied == []
 
 
-async def test_tightening_policy_between_draft_and_confirm_refuses_the_apply(
-    harness,
-) -> None:
-    """The end-to-end proof that policy is re-read, not remembered.
-
-    pause_campaign is added to blocked_operations after the plan exists. The
-    policy file hot-reloads, so the confirm sees the new rule.
-    """
-    h = harness()
-    draft = await _call(
-        h.mcp, "pause_campaign", {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN}
-    )
-
-    data = yaml.safe_load(h.policy_path.read_text(encoding="utf-8"))
-    data["blocked_operations"] = list(data["blocked_operations"]) + ["pause_campaign"]
-    h.policy_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-    with pytest.raises(Exception) as caught:
-        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
-
-    assert "no longer be applied" in str(caught.value)
-    assert h.executor.applied == []
+# test_tightening_policy_between_draft_and_confirm_refuses_the_apply stood
+# here. It added pause_campaign to blocked_operations mid-flight and proved
+# the confirm re-read the file rather than remembering the draft's verdict.
+# The blocked list is fixed in code now, so there is nothing to edit.
+#
+# The property it proved - policy is RE-EVALUATED at confirm, never carried in
+# the plan - is still covered end to end by the demotion test above, by the
+# ceiling-tightening tests in test_phase5_tools.py, and by the re-read tests
+# that refuse a plan once the current budget has moved.
 
 
 async def test_a_refused_confirm_does_not_burn_the_plan(harness) -> None:
     """Refused by policy is not the same as used up.
 
-    If a lead widens the limit a minute later, the same plan must still work.
+    If the demotion is reversed a minute later, the same plan must still work.
     """
     h = harness()
     draft = await _call(

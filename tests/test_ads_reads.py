@@ -287,6 +287,7 @@ async def _capture_queries() -> list[str]:
     reader = StubReader(service)
 
     await reader.account_summary("1234567890")
+    await reader.managed_accounts(manager_customer_id="9999999999")
     await reader.access_role(customer_id="1234567890", email="a@b.com")
     await reader.campaign_by_id(customer_id="1234567890", campaign_id="55")
     await reader.campaign_performance(
@@ -353,6 +354,9 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
     )
     from google.ads.googleads.v25.resources.types import customer as customer_mod
     from google.ads.googleads.v25.resources.types import (
+        customer_client as customer_client_mod,
+    )
+    from google.ads.googleads.v25.resources.types import (
         customer_user_access as cua_mod,
     )
     from google.ads.googleads.v25.resources.types import (
@@ -371,6 +375,7 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         "campaign": campaign_mod.Campaign,
         "campaign_budget": campaign_budget_mod.CampaignBudget,
         "customer": customer_mod.Customer,
+        "customer_client": customer_client_mod.CustomerClient,
         "customer_user_access": cua_mod.CustomerUserAccess,
         "search_term_view": stv_mod.SearchTermView,
     }
@@ -390,3 +395,80 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
 
     # Guard against the loop silently checking nothing.
     assert checked > 20, f"expected to verify many fields, only checked {checked}"
+
+
+# ---------------------------------------------------------------------------
+# managed accounts - the query that replaces allowed_customer_ids
+# ---------------------------------------------------------------------------
+
+
+def _client_row(customer_id="1234567890", currency="INR", tz="Asia/Kolkata", manager=False):
+    return SimpleNamespace(
+        customer_client=SimpleNamespace(
+            id=customer_id,
+            descriptive_name="Brand India",
+            currency_code=currency,
+            time_zone=tz,
+            manager=manager,
+            test_account=False,
+            status=SimpleNamespace(name="ENABLED"),
+        )
+    )
+
+
+async def test_managed_accounts_are_queried_against_the_manager_account() -> None:
+    """The set is derived from the MCC, so the query must be sent TO the MCC.
+
+    Sending it to a child would return only that child's own subtree, which
+    for a leaf account is nothing at all.
+    """
+    service = FakeService(rows=[_client_row()])
+    reader = StubReader(service)
+
+    await reader.managed_accounts(manager_customer_id="9999999999")
+
+    sent_to, query = service.queries[0]
+    assert sent_to == "9999999999"
+    assert " FROM customer_client" in query
+
+
+async def test_managed_accounts_map_currency_and_timezone_per_account() -> None:
+    service = FakeService(
+        rows=[
+            _client_row("1234567890", currency="INR", tz="Asia/Kolkata"),
+            _client_row("2222222222", currency="USD", tz="America/New_York"),
+        ]
+    )
+    reader = StubReader(service)
+
+    accounts = await reader.managed_accounts(manager_customer_id="9999999999")
+
+    assert [(a.customer_id, a.currency_code, a.time_zone) for a in accounts] == [
+        ("1234567890", "INR", "Asia/Kolkata"),
+        ("2222222222", "USD", "America/New_York"),
+    ]
+
+
+async def test_managed_accounts_exclude_cancelled_and_closed_accounts() -> None:
+    service = FakeService(rows=[_client_row()])
+    reader = StubReader(service)
+
+    await reader.managed_accounts(manager_customer_id="9999999999")
+
+    _, query = service.queries[0]
+    assert "customer_client.status = 'ENABLED'" in query
+
+
+async def test_a_hostile_manager_id_never_reaches_the_query() -> None:
+    reader = StubReader(FakeService(rows=[]))
+    with pytest.raises(AdsReadError):
+        await reader.managed_accounts(manager_customer_id="999' OR '1'='1")
+
+
+async def test_a_failed_manager_listing_raises_rather_than_returning_nothing() -> None:
+    service = FakeService(rows=[])
+    service.explode = RuntimeError("PERMISSION_DENIED")
+    reader = StubReader(service)
+
+    with pytest.raises(AdsReadError):
+        await reader.managed_accounts(manager_customer_id="9999999999")

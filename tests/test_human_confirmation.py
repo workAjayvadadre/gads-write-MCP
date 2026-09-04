@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
 
@@ -99,25 +101,24 @@ class Harness:
 
 
 @pytest.fixture
-def harness(tmp_path, write_policy):
+def harness(tmp_path):
     def _build(*, require_confirmation: bool = True) -> Harness:
-        policy_path = write_policy()
         settings = Settings(
             env="test", host="127.0.0.1", port=8081, base_url="https://example.com",
             oauth_client_id="x.apps.googleusercontent.com", oauth_client_secret="s",
             jwt_signing_key="k", developer_token="d", login_customer_id="9999999999",
             write_enabled=True,
-            policy_path=policy_path,
             roles_path=tmp_path / "roles.yaml",
             audit_log_path=tmp_path / "audit.jsonl",
             require_human_confirmation=require_confirmation,
         )
-        policy_store = PolicyStore(policy_path)
+        policy_store = PolicyStore(settings)
         audit_log = AuditLog(settings.audit_log_path)
         tiers = FixedTier()
         guard = Guard(
             settings=settings, policy_store=policy_store, tier_resolver=tiers,
             audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
+            managed_accounts=FakeManagedAccounts(),
         )
         plans = PlanStore()
         executor = FakeExecutor()

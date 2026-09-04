@@ -23,7 +23,6 @@ ENV_KEYS = (
     "GADS_DEVELOPER_TOKEN",
     "GADS_LOGIN_CUSTOMER_ID",
     "GADS_WRITE_ENABLED",
-    "GADS_POLICY_PATH",
     "GADS_ROLES_PATH",
     "GADS_AUDIT_LOG_PATH",
     "GADS_HOST",
@@ -34,7 +33,7 @@ ENV_KEYS = (
 
 
 @pytest.fixture
-def env(monkeypatch: pytest.MonkeyPatch, write_policy, write_roles):
+def env(monkeypatch: pytest.MonkeyPatch, write_roles):
     """A valid environment. Tests mutate it to prove each check fires."""
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -47,7 +46,6 @@ def env(monkeypatch: pytest.MonkeyPatch, write_policy, write_roles):
     monkeypatch.setenv("GADS_DEVELOPER_TOKEN", "dev-token")
     monkeypatch.setenv("GADS_LOGIN_CUSTOMER_ID", "1234567890")
     monkeypatch.setenv("GADS_WRITE_ENABLED", "false")
-    monkeypatch.setenv("GADS_POLICY_PATH", str(write_policy()))
     monkeypatch.setenv("GADS_ROLES_PATH", str(write_roles()))
     return monkeypatch
 
@@ -148,57 +146,74 @@ def test_all_problems_are_reported_together(env, tmp_path: Path) -> None:
 # config files, validated by the same parsers the server uses
 # ---------------------------------------------------------------------------
 
-def test_missing_policy_file_fails_at_boot(env, tmp_path: Path) -> None:
-    env.setenv("GADS_POLICY_PATH", str(tmp_path / "gone.yaml"))
-    with pytest.raises(ConfigError, match="not found"):
-        _load(tmp_path)
+# The three policy-file tests that stood here are gone with the file. There is
+# no GADS_POLICY_PATH, no YAML to mistype and no shape to get wrong: the
+# spending rules are relative, fixed in code, and read from the environment.
+# What remains configurable is covered by the two tests below.
 
 
-def test_empty_customer_allowlist_is_rejected(env, tmp_path: Path, write_policy) -> None:
-    env.setenv("GADS_POLICY_PATH", str(write_policy({"allowed_customer_ids": []})))
-    with pytest.raises(ConfigError, match="no wildcard"):
-        _load(tmp_path)
+def test_the_increase_percent_defaults_and_can_be_overridden(env, tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    assert _load(tmp_path).max_increase_percent == Decimal(1000)
+    env.setenv("GADS_MAX_INCREASE_PERCENT", "50")
+    assert _load(tmp_path).max_increase_percent == Decimal(50)
 
 
-def test_invalid_policy_yaml_is_rejected(env, tmp_path: Path) -> None:
-    broken = tmp_path / "broken.yaml"
-    broken.write_text("not: valid: yaml: [\n", encoding="utf-8")
-    env.setenv("GADS_POLICY_PATH", str(broken))
-    with pytest.raises(ConfigError):
-        _load(tmp_path)
-
-
-def test_a_mis_shaped_policy_block_is_rejected_at_boot(
-    env, tmp_path: Path, write_policy
+@pytest.mark.parametrize("bad", ["-1", "abc"])
+def test_a_nonsensical_increase_percent_refuses_to_start(
+    env, tmp_path: Path, bad: str
 ) -> None:
-    """Valid YAML, wrong shape. Boot must refuse with the same readable
-    message as any other bad config, not a raw traceback."""
-    env.setenv(
-        "GADS_POLICY_PATH",
-        str(write_policy({"limits": {"tiers": {"operator": {"budget": None}}}})),
-    )
-    with pytest.raises(ConfigError) as caught:
+    env.setenv("GADS_MAX_INCREASE_PERCENT", bad)
+    with pytest.raises(ConfigError, match="GADS_MAX_INCREASE_PERCENT"):
         _load(tmp_path)
-    assert "budget" in str(caught.value)
 
 
-def test_roles_in_file_mode_without_a_lead_is_rejected(
+def test_an_empty_increase_percent_means_the_default(env, tmp_path: Path) -> None:
+    """Empty reads as unset, the same as every other variable here. Refusing
+    to boot on a blank line somebody left in .env would be unhelpful."""
+    from decimal import Decimal
+
+    env.setenv("GADS_MAX_INCREASE_PERCENT", "")
+    assert _load(tmp_path).max_increase_percent == Decimal(1000)
+
+
+def test_url_domains_are_split_and_normalised(env, tmp_path: Path) -> None:
+    env.setenv("GADS_ALLOWED_URL_DOMAINS", " IndiraIVF.com , www.indiraivf.com ,")
+    assert _load(tmp_path).allowed_url_domains == frozenset(
+        {"indiraivf.com", "www.indiraivf.com"}
+    )
+
+
+def test_no_url_domains_is_allowed_and_means_no_new_ads(env, tmp_path: Path) -> None:
+    """The right default for a server that has not been told which domains
+    are its own: creating an ad is refused rather than pointed anywhere."""
+    assert _load(tmp_path).allowed_url_domains == frozenset()
+
+
+def test_a_missing_roles_file_is_fine(env, tmp_path: Path) -> None:
+    """Break-glass overrides are the exception, so having none is the healthy
+    state. Requiring the file would mean shipping an empty one."""
+    env.setenv("GADS_ROLES_PATH", str(tmp_path / "no-overrides.yaml"))
+    assert _load(tmp_path).is_production
+
+
+def test_an_empty_roles_file_is_fine(env, tmp_path: Path, write_roles) -> None:
+    env.setenv("GADS_ROLES_PATH", str(write_roles({"users": {}})))
+    assert _load(tmp_path).is_production
+
+
+def test_a_broken_roles_file_still_refuses_to_start(
     env, tmp_path: Path, write_roles
 ) -> None:
+    """A file that EXISTS must be readable. A typo in a privilege grant is
+    exactly the thing that should stop a deploy."""
     env.setenv(
         "GADS_ROLES_PATH",
-        str(write_roles({"users": {"analyst@example.com": "readonly"}})),
+        str(write_roles({"users": {"a@b.com": "superuser"}})),
     )
-    with pytest.raises(ConfigError, match="lead"):
+    with pytest.raises(ConfigError, match="not one of"):
         _load(tmp_path)
-
-
-def test_roles_in_google_ads_mode_may_be_empty(env, tmp_path: Path, write_roles) -> None:
-    # Phase 3: the file becomes a break-glass override, normally empty.
-    env.setenv(
-        "GADS_ROLES_PATH", str(write_roles({"mode": "google_ads", "users": {}}))
-    )
-    assert _load(tmp_path).is_production
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +227,19 @@ def test_secrets_are_not_in_repr(env, tmp_path: Path) -> None:
     assert "GOCSPX-secret" not in rendered
     assert "dev-token" not in rendered
     assert "a-stable-signing-key" not in rendered
+
+
+@pytest.mark.parametrize("hostile", ["inf", "Infinity", "-inf", "nan", "1e999"])
+def test_a_non_finite_increase_percent_is_refused(
+    env, tmp_path: Path, hostile: str
+) -> None:
+    """The nastiest single typo available in this file.
+
+    Decimal parses "inf" happily. Infinity is not negative, so a `< 0` check
+    passes it, and every `increase > limit` comparison is then False - one
+    character in .env silently disables the only money control left. NaN is
+    worse: it compares False in both directions.
+    """
+    env.setenv("GADS_MAX_INCREASE_PERCENT", hostile)
+    with pytest.raises(ConfigError, match="GADS_MAX_INCREASE_PERCENT"):
+        _load(tmp_path)

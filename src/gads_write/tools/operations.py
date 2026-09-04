@@ -8,12 +8,10 @@ applied under rules it was never checked against.
 
 They used to be different code, and the gap was real. `REVALIDATORS` carried
 only the argument-shape validator, and confirm re-ran that faithfully. But
-the money rules - `max_daily`, `max_increase_percent`, `max_cpc`, broad match
-under manual CPC, and the per-user daily ceiling - lived in an `evaluate`
-closure inside each draft tool's body, reachable from nowhere else. Confirm
-never passed one, and `Guard.check` skips the whole policy evaluation when
-`evaluate is None`. So a plan drafted while the operator ceiling was 2000
-still applied after a lead dropped it to 60.
+the money rules lived in an `evaluate` closure inside each draft tool's
+body, reachable from nowhere else. Confirm never passed one, and
+`Guard.check` skips the whole policy evaluation when `evaluate is None`. So a
+plan drafted while the ceiling was wide still applied after it narrowed.
 
 The other half of the same bug: budget and bid rules are RELATIVE. A plan
 stores an ABSOLUTE target (`amount_micros`), so re-checking one means
@@ -47,7 +45,6 @@ from ..safety.policy import (
     PolicyVerdict,
     evaluate_bid_change,
     evaluate_budget_change,
-    evaluate_match_type_against_bidding,
 )
 from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
@@ -306,7 +303,6 @@ def recheck_budget(
         tier=tier,
         current_units=units_from_micros(current.daily_budget_micros),
         new_units=new_units,
-        already_increased_today_units=spend_today,
     )
 
 
@@ -348,33 +344,6 @@ def recheck_bid(
     )
 
 
-def recheck_keyword(
-    policy: Policy,
-    *,
-    tier: Tier,
-    arguments: dict[str, Any],
-    current: Any,
-    payload: dict[str, Any],
-    spend_today: Decimal,
-) -> PolicyVerdict:
-    """Broad match under manual CPC is the classic way to burn money.
-
-    The bidding strategy is read from the ad group rather than remembered,
-    because a campaign can be moved off manual CPC - or onto it - between
-    drafting a keyword and confirming it.
-    """
-    if current is None:
-        return PolicyVerdict.deny(
-            "the ad group's bidding strategy could not be established, so this "
-            "keyword cannot be checked against the match-type rule."
-        )
-    return evaluate_match_type_against_bidding(
-        policy,
-        match_type=str(arguments.get("match_type", "")),
-        bidding_strategy=current.bidding_strategy_type,
-    )
-
-
 # ---------------------------------------------------------------------------
 # the table
 # ---------------------------------------------------------------------------
@@ -396,9 +365,6 @@ OPERATIONS: dict[str, OperationChecks] = {
     "add_negative_keyword": OperationChecks(validate=validate_negative_keyword_args),
     "add_keyword": OperationChecks(
         validate=validate_keyword_args,
-        recheck=recheck_keyword,
-        reads=ReadKind.AD_GROUP,
-        id_argument="ad_group_id",
     ),
     "update_ad_group_bid": OperationChecks(
         validate=validate_bid_args,
@@ -444,7 +410,6 @@ __all__ = [
     "read_current",
     "recheck_bid",
     "recheck_budget",
-    "recheck_keyword",
     "validate_bid_args",
     "validate_budget_args",
     "validate_campaign_status_args",

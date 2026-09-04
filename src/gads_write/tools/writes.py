@@ -48,6 +48,7 @@ from ..ads.reads import AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..safety.plans import PlanError, PlanStore
 from ..safety.policy import (
+    broad_match_warning,
     Policy,
     PolicyStore,
 )
@@ -58,7 +59,6 @@ from .operations import (
     budget_spend_delta,
     recheck_bid,
     recheck_budget,
-    recheck_keyword,
     shared_budget_verdict,
     units_from_micros,
     validate_campaign_status_args,
@@ -201,7 +201,7 @@ def register_write_tools(
     # know the CURRENT value, and we must not read an account before the gate
     # has authorised it. So these tools gate twice:
     #
-    #   1. authorise  tier, kill switch, account allowlist, argument shape.
+    #   1. authorise  tier, kill switch, managed account, argument shape.
     #                 Marked dry_run so the audit line reads as "looked",
     #                 not "changed".
     #   2. decide     the same chain again, now with the numbers, running
@@ -209,7 +209,7 @@ def register_write_tools(
     #
     # Two audit lines per draft is deliberate. They record two genuinely
     # different checkpoints, and the alternative - reading the account before
-    # the allowlist has been checked - is the thing the allowlist exists to
+    # the account has been checked - is the thing that check exists to
     # prevent.
 
     async def _authorise(
@@ -424,7 +424,13 @@ def register_write_tools(
                 f"  daily budget : {format_micros(campaign.daily_budget_micros, code)}"
                 f" -> {format_units(new_units, code)}"
                 f"   ({direction} of {format_units(abs(delta), code)})",
-                f"  your total increase today would become "
+                # Information, not a limit. This used to REFUSE past a
+                # percentage of the account's total, which blocked ordinary
+                # work - raising five campaigns for a seasonal push stopped
+                # after the second. The number is still worth seeing, so the
+                # person approving gets it and decides, which is more than
+                # the Google Ads UI gives them.
+                f"  your budget increases today would total "
                 f"{format_units(decision.spend_today_units + (spend_delta or 0), code)}",
             ]
         )
@@ -579,34 +585,39 @@ def register_write_tools(
         caller, _ = await _authorise("add_keyword", customer_id, arguments)
         ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
 
-        # Broad match under manual CPC is the classic way to burn money, and
-        # the strategy can change between drafting and confirming, so confirm
-        # re-reads the ad group and runs recheck_keyword again.
+        # Broad match under manual CPC used to be refused outright. The Google
+        # Ads UI allows it, so this server does too - the risk is spelled out
+        # on the preview and the person approving decides. See
+        # safety/policy.py for why refusing it stopped being the right call.
         decision = await _decide(
             "add_keyword",
             customer_id,
             arguments,
             validate=_validator("add_keyword", arguments),
-            evaluate=_evaluator(recheck_keyword, arguments, current=ad_group),
         )
         policy = decision.policy or policy_store.current()
         status = "PAUSED" if policy.rules.new_entities_start_paused else "ENABLED"
 
-        preview = "\n".join(
-            [
-                f"Account {customer_id}",
-                f"Add keyword to ad group {ad_group.name!r} (id {ad_group.ad_group_id})",
-                f"  campaign   : {ad_group.campaign_name}",
-                f"  keyword    : {keyword_text}",
-                f"  match type : {match_type}",
-                f"  created as : {status}",
-                (
-                    "  It cannot spend until someone enables it."
-                    if status == "PAUSED"
-                    else "  WARNING: this keyword will be live immediately."
-                ),
-            ]
+        lines = [
+            f"Account {customer_id}",
+            f"Add keyword to ad group {ad_group.name!r} (id {ad_group.ad_group_id})",
+            f"  campaign   : {ad_group.campaign_name}",
+            f"  keyword    : {keyword_text}",
+            f"  match type : {match_type}",
+            f"  created as : {status}",
+            (
+                "  It cannot spend until someone enables it."
+                if status == "PAUSED"
+                else "  WARNING: this keyword will be live immediately."
+            ),
+        ]
+        warning = broad_match_warning(
+            match_type=match_type,
+            bidding_strategy=getattr(ad_group, "bidding_strategy_type", ""),
         )
+        if warning:
+            lines.append(f"  {warning}")
+        preview = "\n".join(lines)
 
         return _park(
             caller=caller,

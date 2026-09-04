@@ -235,6 +235,20 @@ class AdsReader(Protocol):
 
     async def account_summary(self, customer_id: str) -> AccountSummary | None: ...
 
+    async def managed_accounts(
+        self, *, manager_customer_id: str
+    ) -> tuple[AccountSummary, ...]:
+        """Every account under this manager account, with currency and timezone.
+
+        This is what the managed-account set is derived from, in place of a
+        hand-written allowlist. The query must be sent TO the manager: asking
+        a child returns only that child's own subtree.
+
+        Raises AdsReadError on failure. It must never report an empty set for
+        an account it could not read - see safety/accounts.py.
+        """
+        ...
+
     async def access_role(self, *, customer_id: str, email: str) -> str | None:
         """This user's Google Ads access role on this account, or None.
 
@@ -371,6 +385,44 @@ class GoogleAdsReader(AdsReader):
             is_manager=bool(customer.manager),
             is_test_account=bool(customer.test_account),
             status=_enum_name(customer.status),
+        )
+
+    async def managed_accounts(
+        self, *, manager_customer_id: str
+    ) -> tuple[AccountSummary, ...]:
+        manager_customer_id = _literal(
+            manager_customer_id, field="manager_customer_id"
+        )
+        # customer_client lists the manager's whole subtree, one row per
+        # descendant, and carries the currency and timezone with it. That is
+        # why one query can answer both "is this account ours?" and "in what
+        # currency?" - see safety/accounts.py.
+        #
+        # CANCELLED and CLOSED accounts are filtered out here rather than
+        # downstream: they cannot serve ads, so offering them would only
+        # produce a confusing failure later.
+        query = (
+            "SELECT customer_client.id, customer_client.descriptive_name, "
+            "customer_client.currency_code, customer_client.time_zone, "
+            "customer_client.manager, customer_client.test_account, "
+            "customer_client.status "
+            "FROM customer_client "
+            "WHERE customer_client.status = 'ENABLED'"
+        )
+        rows = await self._search_rows(
+            customer_id=manager_customer_id, query=query
+        )
+        return tuple(
+            AccountSummary(
+                customer_id=str(row.customer_client.id),
+                descriptive_name=row.customer_client.descriptive_name or "",
+                currency_code=row.customer_client.currency_code or "",
+                time_zone=row.customer_client.time_zone or "",
+                is_manager=bool(row.customer_client.manager),
+                is_test_account=bool(row.customer_client.test_account),
+                status=_enum_name(row.customer_client.status),
+            )
+            for row in rows
         )
 
     async def access_role(self, *, customer_id: str, email: str) -> str | None:

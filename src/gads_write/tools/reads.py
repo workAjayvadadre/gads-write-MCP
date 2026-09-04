@@ -13,7 +13,7 @@ no tool touches a Google Ads service object. A tool that grew its own logic
 would be a tool that could grow its own bypass.
 
 These are reads, so nothing here can spend money - but they still go through
-the full gate. That is on purpose. The account allowlist has to hold for
+the full gate. That is on purpose. The managed-account check has to hold for
 reads too, or this becomes a way to read any Google Ads account the caller
 happens to have on their personal login, through our developer token and our
 audit log. And every read is audited, which is what lets you answer "who
@@ -41,6 +41,7 @@ from fastmcp.exceptions import ToolError
 from ..ads.reads import AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..auth.tiers import Tier
+from ..safety.accounts import AccountLookupError, ManagedAccountStore
 from ..safety.audit import local_date_for
 from ..safety.policy import Policy, PolicyStore
 from ..safety.units import format_micros
@@ -56,7 +57,7 @@ from ..safety.validators import (
 logger = logging.getLogger(__name__)
 
 # How many accounts list_accounts will describe in one call. There is no
-# silent truncation: if the allowlist is longer than this, the response says
+# silent truncation: if the manager holds more than this, the response says
 # so explicitly.
 MAX_ACCOUNTS_LISTED = 50
 
@@ -74,14 +75,17 @@ def _money(micros: int, currency_code: str) -> str:
     return format_micros(micros, currency_code)
 
 
-def _today_in_account_timezone(policy: Policy) -> date:
+def _today_in_timezone(timezone_name: str) -> date:
     """Today, as the Google Ads account reckons it.
 
     Using UTC here would mean that for the first five and a half hours of
     every Indian day, "today" meant yesterday. The audit log already dates
     itself this way; reports must agree with it.
+
+    Takes the zone NAME rather than a Policy because the account's timezone
+    is only known after the gate has run - see `_derived_window`.
     """
-    stamp = local_date_for(datetime.now(timezone.utc), policy.timezone)
+    stamp = local_date_for(datetime.now(timezone.utc), timezone_name)
     return date.fromisoformat(stamp)
 
 
@@ -91,6 +95,7 @@ def register_read_tools(
     guard: Any,
     reader: AdsReader,
     policy_store: PolicyStore,
+    managed_accounts: ManagedAccountStore,
     caller_provider: Callable[[], Any] = current_caller,
 ) -> None:
     """Define the read tools on `mcp`, closed over their dependencies."""
@@ -129,16 +134,28 @@ def register_read_tools(
     async def list_accounts() -> dict:
         """List the Google Ads accounts you may work with, and your access on each.
 
-        Shows only accounts on this server's allowlist, never everything your
-        Google login can reach. Start here to find the customer_id that the
-        other tools need.
+        Shows only accounts under this server's manager account, never
+        everything your Google login can reach. Start here to find the
+        customer_id that the other tools need.
         """
         decision = await _gate(tool="list_accounts", customer_id=None, arguments={})
-        policy = policy_store.current()
 
-        allowlist = sorted(policy.allowed_customer_ids)
-        shown = allowlist[:MAX_ACCOUNTS_LISTED]
-        omitted = len(allowlist) - len(shown)
+        # The canonical list comes from the manager account, not a config
+        # file. `account_summary` is still called per account below because
+        # that runs on the CALLER's credential: the MCC listing says what
+        # this server manages, the per-account read says what this person can
+        # actually reach.
+        try:
+            managed = await managed_accounts.all()
+        except AccountLookupError as exc:
+            raise ToolError(
+                f"could not list the accounts this server manages: {exc}. "
+                "Nothing was changed."
+            ) from exc
+
+        all_ids = [account.customer_id for account in managed]
+        shown = all_ids[:MAX_ACCOUNTS_LISTED]
+        omitted = len(all_ids) - len(shown)
 
         accounts: list[dict] = []
         for customer_id in shown:
@@ -179,7 +196,7 @@ def register_read_tools(
         if omitted > 0:
             # No silent caps. If we did not show everything, say so.
             result["note"] = (
-                f"{omitted} further allowlisted account(s) were not listed; "
+                f"{omitted} further managed account(s) were not listed; "
                 f"this tool describes at most {MAX_ACCOUNTS_LISTED} per call."
             )
         return result
@@ -205,28 +222,34 @@ def register_read_tools(
         Metrics are aggregated across the whole range - one row per campaign,
         not one row per day.
         """
-        policy = policy_store.current()
-        window_start, window_end = _resolve_window(policy, days, start_date, end_date)
+        # An explicit range is the caller's own and needs no timezone. A
+        # `days` window does, and the account's timezone is only known once
+        # the gate has stamped it - so that half is resolved AFTER the gate.
+        explicit = _explicit_window(start_date, end_date)
 
-        arguments = {
-            "customer_id": customer_id,
-            "start_date": window_start,
-            "end_date": window_end,
-            "limit": limit,
-        }
+        arguments: dict[str, Any] = {"customer_id": customer_id, "limit": limit}
+        if explicit is not None:
+            arguments["start_date"], arguments["end_date"] = explicit
+        else:
+            arguments["days"] = days
 
         def validate(_: Policy) -> ValidationResult:
             result = ValidationResult()
             result.extend(validate_customer_id(customer_id))
-            result.extend(validate_date_range(window_start, window_end))
+            if explicit is not None:
+                result.extend(validate_date_range(*explicit))
             result.extend(validate_row_limit(limit, maximum=MAX_REPORT_ROWS))
             return result
 
-        await _gate(
+        decision = await _gate(
             tool="get_campaign_performance",
             customer_id=str(customer_id).strip(),
             arguments=arguments,
             validate=validate,
+        )
+
+        window_start, window_end = explicit or _derived_window(
+            (decision.policy or policy_store.current()).timezone, days
         )
 
         rows = await reader.campaign_performance(
@@ -236,6 +259,11 @@ def register_read_tools(
             limit=limit,
         )
 
+        # From the gate's decision, not `policy_store.current()`: the gate
+        # stamped the ACCOUNT's own currency onto its snapshot, and this
+        # report may well be for an account in a different one. The fallback
+        # matches tools/writes.py - `policy` is optional on GuardDecision.
+        policy = decision.policy or policy_store.current()
         currency = policy.currency_code
         return {
             "ok": True,
@@ -283,21 +311,23 @@ def register_read_tools(
         This is the report you read before adding negative keywords. Optional
         `campaign_id` narrows it to one campaign.
         """
-        policy = policy_store.current()
-        window_start, window_end = _resolve_window(policy, days, start_date, end_date)
+        explicit = _explicit_window(start_date, end_date)
 
-        arguments = {
+        arguments: dict[str, Any] = {
             "customer_id": customer_id,
-            "start_date": window_start,
-            "end_date": window_end,
             "campaign_id": campaign_id,
             "limit": limit,
         }
+        if explicit is not None:
+            arguments["start_date"], arguments["end_date"] = explicit
+        else:
+            arguments["days"] = days
 
         def validate(_: Policy) -> ValidationResult:
             result = ValidationResult()
             result.extend(validate_customer_id(customer_id))
-            result.extend(validate_date_range(window_start, window_end))
+            if explicit is not None:
+                result.extend(validate_date_range(*explicit))
             result.extend(validate_row_limit(limit, maximum=MAX_REPORT_ROWS))
             if campaign_id is not None:
                 result.extend(
@@ -305,11 +335,15 @@ def register_read_tools(
                 )
             return result
 
-        await _gate(
+        decision = await _gate(
             tool="get_search_terms",
             customer_id=str(customer_id).strip(),
             arguments=arguments,
             validate=validate,
+        )
+
+        window_start, window_end = explicit or _derived_window(
+            (decision.policy or policy_store.current()).timezone, days
         )
 
         rows = await reader.search_terms(
@@ -320,7 +354,7 @@ def register_read_tools(
             campaign_id=None if campaign_id is None else str(campaign_id).strip(),
         )
 
-        currency = policy.currency_code
+        currency = (decision.policy or policy_store.current()).currency_code
         return {
             "ok": True,
             "customer_id": str(customer_id).strip(),
@@ -347,21 +381,28 @@ def register_read_tools(
         }
 
 
-def _resolve_window(
-    policy: Policy,
-    days: int,
-    start_date: str | None,
-    end_date: str | None,
-) -> tuple[str, str]:
-    """Turn (days | explicit dates) into one pair of ISO dates.
+def _explicit_window(
+    start_date: str | None, end_date: str | None
+) -> tuple[str, str] | None:
+    """The caller's own dates, if they gave both. None means "derive them".
 
-    Explicit dates win when both are given. Anything malformed is passed
-    through untouched so that the gate's validation step is what reports it -
-    this function must never be the thing that rejects input, or the error
-    would arrive without an audit line.
+    Anything malformed is passed through untouched so that the gate's
+    validation step is what reports it - this must never be the thing that
+    rejects input, or the error would arrive without an audit line.
     """
     if start_date and end_date:
         return str(start_date).strip(), str(end_date).strip()
+    return None
+
+
+def _derived_window(timezone_name: str, days: int) -> tuple[str, str]:
+    """The last `days` days, ending today in the ACCOUNT'S timezone.
+
+    Resolved AFTER the gate, never before, because the timezone belongs to
+    the account and the gate is what establishes it. Deriving it earlier
+    would silently use the UTC fallback and shift every window by a day for
+    the first 5.5 hours of an Asia/Kolkata day.
+    """
 
     try:
         span = int(days)
@@ -369,13 +410,9 @@ def _resolve_window(
         span = DEFAULT_REPORT_DAYS
     span = max(1, span)
 
-    today = _today_in_account_timezone(policy)
+    today = _today_in_timezone(timezone_name)
     start = today - timedelta(days=span - 1)
-
-    return (
-        str(start_date).strip() if start_date else start.isoformat(),
-        str(end_date).strip() if end_date else today.isoformat(),
-    )
+    return start.isoformat(), today.isoformat()
 
 
 __all__ = ["register_read_tools", "MAX_ACCOUNTS_LISTED"]

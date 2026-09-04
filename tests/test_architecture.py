@@ -125,7 +125,8 @@ def test_safety_package_never_imports_the_ads_client() -> None:
 
 def test_no_hardcoded_customer_ids_outside_config() -> None:
     # Ten consecutive digits in source is almost always a customer ID that
-    # belongs in policy.yaml. Tests are exempt; they use fixtures.
+    # belongs in the environment or comes from the MCC. Tests are exempt;
+    # they use fixtures.
     pattern = re.compile(r"(?<!\d)\d{10}(?!\d)")
     offenders: list[str] = []
     for path in _python_files():
@@ -134,7 +135,7 @@ def test_no_hardcoded_customer_ids_outside_config() -> None:
                 offenders.append(f"{path.relative_to(SRC)}:{number}: {line.strip()}")
 
     assert not offenders, (
-        "Customer IDs belong in config/policy.yaml, not in Python:\n  "
+        "Customer IDs come from the MCC or the environment, never from Python:\n  "
         + "\n  ".join(offenders)
     )
 
