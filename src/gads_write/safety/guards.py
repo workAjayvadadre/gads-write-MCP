@@ -12,9 +12,7 @@ The order is deliberate, cheapest and most absolute first:
   4  managed account    refuse accounts outside our MCC before inspecting them
   5  blocked operation  irreversible operations, refused outright
   6  field validation   shape of the input
-  7  policy limits      per-tier caps on the actual numbers
-  8  daily ceiling      this user's running total for the day, against a
-                        percentage of the account's own total budget
+  8  policy limits      the typo backstop on the actual numbers
 
 Why that order and not another:
 
@@ -25,8 +23,10 @@ Why that order and not another:
     an account we do not manage never has its contents inspected, expanded
     into an API call, or written to the audit log in detail. It also yields
     the account's currency and timezone, which every money check below needs.
-  - The daily ceiling is last because it is the only check that reads a
-    file. Everything cheaper has already had its chance to refuse.
+  - The policy check is last because it is the only one that reads a file:
+    the audit log, for this user's running total today. That total is no
+    longer a limit - it is information for the preview - but it is still
+    read here, once, where the ledger already is.
 
 Every decision is audited, including refusals. A refused change is often the
 more interesting record: it is how you notice someone repeatedly pushing at
@@ -50,7 +50,6 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from ..ads.reads import AdsReader
 from ..auth.identity import AuthError
 from ..auth.tiers import Tier, TierLookupError, TierResolver, tier_at_least
 from ..settings import Settings
@@ -59,7 +58,6 @@ from .accounts import AccountLookupError, ManagedAccountStore
 from .audit import AuditLog, AuditRecord, local_date_for
 from .policy import Policy, PolicyStore, PolicyVerdict, evaluate_operation
 from .spend import DailySpendLedger
-from .units import MICROS_PER_UNIT
 from .validators import ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -119,7 +117,6 @@ class Guard:
         audit_log: AuditLog,
         spend_ledger: DailySpendLedger,
         managed_accounts: ManagedAccountStore,
-        reader: AdsReader,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._settings = settings
@@ -128,9 +125,6 @@ class Guard:
         self._audit = audit_log
         self._spend = spend_ledger
         self._accounts = managed_accounts
-        # Only ever used for the daily-ceiling base, and only when a monetary
-        # rule is actually being evaluated.
-        self._reader = reader
         self._now = now
 
     async def check(
@@ -143,7 +137,6 @@ class Guard:
         validate: Callable[[Policy], ValidationResult] | None = None,
         evaluate: Callable[[Policy, Tier, Decimal], PolicyVerdict] | None = None,
         spend_delta_units: Decimal | None = None,
-        needs_account_total: bool = False,
         plan_id: str | None = None,
         dry_run: bool = False,
     ) -> GuardDecision:
@@ -310,47 +303,21 @@ class Guard:
             if not result.ok:
                 return deny_with_tier("validation", *result.as_messages())
 
-        # --- 7 & 8. policy limits, including this user's daily ceiling -------
+        # --- 7. policy limits ------------------------------------------------
         # Last, because it is the only check that touches the filesystem, and
-        # ONLY when a rule actually needs the number. The ledger is rebuilt
+        # ONLY when a monetary rule is being evaluated. The ledger is rebuilt
         # from the audit log, so reading it unconditionally made every call -
         # including reads, which have no spend to check - slower every day
         # the log grew. Tools with no monetary rule never open it.
+        #
+        # `spend_today` is no longer a limit. It rides out on the decision so
+        # the draft tools can put "you have already raised budgets by X today"
+        # on the preview, and the person approving decides.
         spend_today = Decimal(0)
         if evaluate is not None:
             spend_today = self._spend.total_increase_units(
                 user_email=email, local_date=local_date
             )
-
-            # The base for the daily increase ceiling, fetched HERE, only
-            # here, and only for a rule that actually measures against it.
-            # `needs_account_total` comes from the OPERATIONS table, so a bid
-            # - which has no daily ceiling - pays for no round trip, and a
-            # read pays for none either.
-            #
-            # A failure is stamped as None rather than swallowed:
-            # evaluate_budget_change refuses on None instead of silently
-            # dropping the ceiling, so the caller is told, and the change does
-            # not proceed. That only holds for rules that read it, which is
-            # exactly why this is gated on the flag rather than on
-            # `evaluate is not None`.
-            if needs_account_total and customer_id is not None:
-                try:
-                    total_micros = (
-                        await self._reader.account_total_daily_budget_micros(
-                            customer_id
-                        )
-                    )
-                    policy = policy.with_account_budget(
-                        Decimal(total_micros) / MICROS_PER_UNIT
-                    )
-                except Exception as exc:  # noqa: BLE001 - surfaced by the rule
-                    logger.warning(
-                        "could not read the total daily budget for %s: %s",
-                        customer_id,
-                        exc,
-                    )
-                    policy = policy.with_account_budget(None)
 
             verdict = evaluate(policy, tier, spend_today)
             if not verdict.allowed:

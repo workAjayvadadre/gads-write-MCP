@@ -22,9 +22,9 @@ def _deep_update(base: dict, patch: dict) -> dict:
     return out
 
 
+# Break-glass overrides. Normally empty in production; the fixture carries a
+# couple so tests can exercise the override path.
 BASE_ROLES: dict = {
-    "mode": "file",
-    "default_tier": "none",
     "users": {"lead@example.com": "lead", "op@example.com": "operator"},
 }
 
@@ -128,38 +128,3 @@ class FakeManagedAccounts:
 @pytest.fixture
 def managed_accounts() -> FakeManagedAccounts:
     return FakeManagedAccounts()
-
-
-# ---------------------------------------------------------------------------
-# the daily-ceiling base
-# ---------------------------------------------------------------------------
-# The per-user daily ceiling is now a percentage of the account's own total
-# daily budget rather than a rupee figure in a file, so the gate reads that
-# total when - and only when - a monetary rule is being evaluated.
-
-DEFAULT_ACCOUNT_TOTAL_UNITS = 10_000
-
-
-class FakeBudgetReader:
-    """Supplies the account total the daily ceiling is measured against."""
-
-    def __init__(self, total_units: int | None = None, *, raises: bool = False) -> None:
-        self._total_units = (
-            DEFAULT_ACCOUNT_TOTAL_UNITS if total_units is None else total_units
-        )
-        self._raises = raises
-        self.calls = 0
-
-    def set_total_units(self, total_units: int) -> None:
-        """Change the account's total, the way editing budgets in the Google
-        Ads UI would. The daily ceiling is a percentage of this, so lowering
-        it tightens the rule between a draft and its confirm."""
-        self._total_units = total_units
-
-    async def account_total_daily_budget_micros(self, customer_id: str) -> int:
-        self.calls += 1
-        if self._raises:
-            from gads_write.ads.reads import AdsReadError
-
-            raise AdsReadError("Google Ads API timed out")
-        return int(self._total_units) * 1_000_000

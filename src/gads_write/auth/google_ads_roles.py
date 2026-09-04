@@ -331,9 +331,9 @@ class GoogleAdsTierResolver(TierResolver):
 class OverridingTierResolver(TierResolver):
     """Consults roles.yaml first, then the real resolver.
 
-    In `mode: google_ads` the `users` map in roles.yaml is normally empty and
-    this is a pass-through. A name in that map means: "Google could not tell
-    us this person's role and a lead has deliberately overridden it."
+    The override file is normally absent, so this is a pass-through. A name
+    in it means: "Google could not tell us this person's role and a lead has
+    deliberately overridden it."
 
     Deliberately a file edit rather than an automatic fallback. It is
     visible, it is in git, it shows up in review, and it is obviously
@@ -353,7 +353,7 @@ class OverridingTierResolver(TierResolver):
         if not email:
             return None
         table = self._overrides.current()
-        tier = table.users.get(email)
+        tier = table.override_for(email)
         if tier is not None:
             logger.warning(
                 "BREAK-GLASS: tier for %s came from %s, not from Google Ads",

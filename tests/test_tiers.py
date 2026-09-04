@@ -1,4 +1,14 @@
-"""Tier resolution through the interface, never through roles.yaml directly."""
+"""Tier ranking, and the break-glass override table.
+
+`FileTierResolver` is gone with roles.yaml's `mode`. Tiers always come from
+Google Ads now (tests/test_google_ads_tiers.py), and this file exists to
+cover the one thing left in the roles file: a deliberate override, used when
+Google cannot tell us someone's role and the team would otherwise be locked
+out with no way back in but a redeploy.
+
+The file itself is OPTIONAL. Its absence means "no overrides", which is the
+ordinary state; its presence is the signal that something is wrong.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from gads_write.auth.roles import (
-    FileTierResolver,
-    RoleConfigError,
-    RoleStore,
-    RoleTable,
-)
-from gads_write.auth.tiers import Tier, TierResolver, highest, tier_at_least
-from gads_write.tools.registry import ToolSpec, spec_for
+from gads_write.auth.roles import RoleConfigError, RoleStore, RoleTable
+from gads_write.auth.tiers import Tier, highest, tier_at_least
+from gads_write.tools.registry import spec_for
 
 
 @dataclass(frozen=True)
@@ -30,9 +35,7 @@ def _roles(tmp_path: Path, body: str) -> Path:
     return path
 
 
-FILE_MODE = """
-mode: file
-default_tier: none
+OVERRIDES = """
 users:
   "lead@example.com": lead
   "op@example.com": operator
@@ -44,6 +47,7 @@ users:
 # ranking
 # ---------------------------------------------------------------------------
 
+
 def test_tier_ranking() -> None:
     assert tier_at_least(Tier.LEAD, Tier.OPERATOR)
     assert tier_at_least(Tier.OPERATOR, Tier.OPERATOR)
@@ -52,172 +56,126 @@ def test_tier_ranking() -> None:
 
 
 def test_highest() -> None:
-    assert highest([Tier.READONLY, Tier.LEAD, Tier.NONE]) is Tier.LEAD
+    assert highest([Tier.NONE, Tier.OPERATOR, Tier.READONLY]) is Tier.OPERATOR
     assert highest([]) is Tier.NONE
 
 
 # ---------------------------------------------------------------------------
-# the file resolver satisfies the interface
+# the override table
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_file_resolver_satisfies_the_protocol(tmp_path: Path) -> None:
-    resolver = FileTierResolver(RoleStore(_roles(tmp_path, FILE_MODE)))
-    assert isinstance(resolver, TierResolver)
+
+def test_a_missing_file_means_no_overrides(tmp_path: Path) -> None:
+    """The healthy state. Overrides are the exception, so requiring the file
+    would mean shipping an empty one just to say "nothing to see here"."""
+    table = RoleTable.load(tmp_path / "absent.yaml")
+    assert table.users == {}
+    assert table.override_for("anyone@example.com") is None
 
 
-@pytest.mark.asyncio
-async def test_resolves_known_users(tmp_path: Path) -> None:
-    resolver = FileTierResolver(RoleStore(_roles(tmp_path, FILE_MODE)))
-    assert await resolver.resolve(FakeCaller("lead@example.com"), "1234567890") is Tier.LEAD
-    assert await resolver.resolve(FakeCaller("op@example.com"), "1234567890") is Tier.OPERATOR
+def test_an_empty_file_means_no_overrides(tmp_path: Path) -> None:
+    table = RoleTable.load(_roles(tmp_path, "# nothing overridden\n"))
+    assert table.users == {}
 
 
-@pytest.mark.asyncio
-async def test_unknown_user_gets_none(tmp_path: Path) -> None:
-    resolver = FileTierResolver(RoleStore(_roles(tmp_path, FILE_MODE)))
-    assert await resolver.resolve(FakeCaller("stranger@example.com"), "1234567890") is Tier.NONE
+def test_a_listed_person_gets_their_override(tmp_path: Path) -> None:
+    table = RoleTable.load(_roles(tmp_path, OVERRIDES))
+    assert table.override_for("lead@example.com") is Tier.LEAD
+    assert table.override_for("op@example.com") is Tier.OPERATOR
 
 
-@pytest.mark.asyncio
-async def test_email_matching_is_case_insensitive(tmp_path: Path) -> None:
-    resolver = FileTierResolver(RoleStore(_roles(tmp_path, FILE_MODE)))
-    assert await resolver.resolve(FakeCaller("  LEAD@EXAMPLE.COM "), "1234567890") is Tier.LEAD
+def test_an_unlisted_person_falls_through_to_google(tmp_path: Path) -> None:
+    """None means "no override", NEVER "no access" - the caller asks Google
+    on None, so conflating the two would lock out everyone not listed."""
+    table = RoleTable.load(_roles(tmp_path, OVERRIDES))
+    assert table.override_for("stranger@example.com") is None
+    assert table.override_for(None) is None
+    assert table.override_for("") is None
 
 
-@pytest.mark.asyncio
-async def test_customer_id_is_ignored_by_the_file_backing(tmp_path: Path) -> None:
-    # Documents the known limitation: a file has no per-account concept.
-    # Phase 3's resolver is where these two answers start to differ.
-    resolver = FileTierResolver(RoleStore(_roles(tmp_path, FILE_MODE)))
-    caller = FakeCaller("op@example.com")
-    assert await resolver.resolve(caller, "1111111111") is Tier.OPERATOR
-    assert await resolver.resolve(caller, "2222222222") is Tier.OPERATOR
-    assert await resolver.visible_tier(caller) is Tier.OPERATOR
+def test_email_matching_is_case_insensitive(tmp_path: Path) -> None:
+    table = RoleTable.load(_roles(tmp_path, OVERRIDES))
+    assert table.override_for("LEAD@Example.COM") is Tier.LEAD
 
 
-# ---------------------------------------------------------------------------
-# hot reload: a demotion must land on the very next call
-# ---------------------------------------------------------------------------
+def test_an_empty_users_map_is_fine(tmp_path: Path) -> None:
+    """No lead is required. Requiring one made sense when this file WAS the
+    permission model; it is a break-glass now and is normally empty."""
+    assert RoleTable.load(_roles(tmp_path, "users: {}\n")).users == {}
 
-@pytest.mark.asyncio
-async def test_a_demotion_takes_effect_on_the_next_call(tmp_path: Path) -> None:
-    """The gate condition.
-
-    No reconnect, no restart. Someone removed from the team must lose their
-    powers immediately, not at the end of their session.
-    """
-    path = _roles(tmp_path, FILE_MODE)
-    resolver = FileTierResolver(RoleStore(path))
-    caller = FakeCaller("op@example.com")
-
-    assert await resolver.resolve(caller, "1234567890") is Tier.OPERATOR
-
-    path.write_text(
-        'mode: file\ndefault_tier: none\nusers:\n  "lead@example.com": lead\n',
-        encoding="utf-8",
-    )
-
-    assert await resolver.resolve(caller, "1234567890") is Tier.NONE
-
-
-@pytest.mark.asyncio
-async def test_a_promotion_also_takes_effect_immediately(tmp_path: Path) -> None:
-    path = _roles(tmp_path, FILE_MODE)
-    resolver = FileTierResolver(RoleStore(path))
-    caller = FakeCaller("analyst@example.com")
-
-    assert await resolver.resolve(caller, "1234567890") is Tier.READONLY
-
-    path.write_text(
-        'mode: file\ndefault_tier: none\nusers:\n'
-        '  "lead@example.com": lead\n  "analyst@example.com": operator\n',
-        encoding="utf-8",
-    )
-
-    assert await resolver.resolve(caller, "1234567890") is Tier.OPERATOR
-
-
-@pytest.mark.asyncio
-async def test_a_broken_edit_keeps_the_last_good_table(tmp_path: Path) -> None:
-    # A YAML typo must not grant anyone anything, and must not crash a
-    # request that is already in flight.
-    path = _roles(tmp_path, FILE_MODE)
-    store = RoleStore(path)
-    resolver = FileTierResolver(store)
-    caller = FakeCaller("op@example.com")
-
-    path.write_text("users: [unclosed\n", encoding="utf-8")
-
-    assert await resolver.resolve(caller, "1234567890") is Tier.OPERATOR
-    assert store.last_error is not None
-    assert store.reload_count == 0
-
-
-@pytest.mark.asyncio
-async def test_an_edit_that_removes_every_lead_is_refused(tmp_path: Path) -> None:
-    path = _roles(tmp_path, FILE_MODE)
-    store = RoleStore(path)
-    resolver = FileTierResolver(store)
-
-    path.write_text(
-        'mode: file\ndefault_tier: none\nusers:\n  "op@example.com": operator\n',
-        encoding="utf-8",
-    )
-
-    # last good table retained, so the existing lead keeps working
-    assert await resolver.resolve(FakeCaller("lead@example.com"), "1234567890") is Tier.LEAD
-    assert store.last_error is not None
-
-
-# ---------------------------------------------------------------------------
-# parsing
-# ---------------------------------------------------------------------------
 
 def test_invalid_tier_is_rejected_at_load(tmp_path: Path) -> None:
-    with pytest.raises(RoleConfigError):
-        RoleTable.load(
-            _roles(tmp_path, 'mode: file\nusers:\n  "a@b.com": opperator\n')
-        )
+    with pytest.raises(RoleConfigError, match="not one of"):
+        RoleTable.load(_roles(tmp_path, 'users:\n  "a@b.com": superuser\n'))
 
 
-def test_invalid_mode_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(RoleConfigError, match="mode"):
-        RoleTable.load(_roles(tmp_path, 'mode: whatever\nusers:\n  "a@b.com": lead\n'))
-
-
-def test_file_mode_requires_a_lead(tmp_path: Path) -> None:
-    with pytest.raises(RoleConfigError, match="lead"):
-        RoleTable.load(_roles(tmp_path, 'mode: file\nusers:\n  "a@b.com": operator\n'))
-
-
-def test_google_ads_mode_allows_an_empty_users_map(tmp_path: Path) -> None:
-    # In Phase 3 this map is a break-glass override and is normally empty,
-    # so the "must have a lead" rule must not apply.
-    table = RoleTable.load(_roles(tmp_path, "mode: google_ads\nusers: {}\n"))
-    assert table.mode == "google_ads"
-    assert table.tier_for("anyone@example.com") is Tier.NONE
-
-
-def test_the_shipped_roles_file_loads() -> None:
-    shipped = Path(__file__).resolve().parents[1] / "config" / "roles.yaml"
-    table = RoleTable.load(shipped)
-    assert table.mode in {"file", "google_ads"}
+def test_a_non_mapping_users_block_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(RoleConfigError, match="must be a mapping"):
+        RoleTable.load(_roles(tmp_path, "users:\n  - a@b.com\n"))
 
 
 # ---------------------------------------------------------------------------
-# registry defaults
+# hot reload - the reason this stayed a file rather than moving into .env
 # ---------------------------------------------------------------------------
+
+
+def test_an_override_applies_on_the_next_call(tmp_path: Path) -> None:
+    """Break-glass is for the moment you are ALREADY locked out. A file edit
+    applies on the next request; an env var would need a restart."""
+    path = _roles(tmp_path, "users: {}\n")
+    store = RoleStore(path)
+    assert store.current().override_for("op@example.com") is None
+
+    path.write_text('users:\n  "op@example.com": operator\n', encoding="utf-8")
+
+    assert store.current().override_for("op@example.com") is Tier.OPERATOR
+
+
+def test_removing_an_override_also_applies_immediately(tmp_path: Path) -> None:
+    path = _roles(tmp_path, 'users:\n  "op@example.com": operator\n')
+    store = RoleStore(path)
+    assert store.current().override_for("op@example.com") is Tier.OPERATOR
+
+    path.write_text("users: {}\n", encoding="utf-8")
+
+    assert store.current().override_for("op@example.com") is None
+
+
+def test_a_broken_edit_keeps_the_last_good_table(tmp_path: Path) -> None:
+    """Never relax to defaults, never crash a live request. The error is
+    surfaced by health_check and /healthz instead."""
+    path = _roles(tmp_path, OVERRIDES)
+    store = RoleStore(path)
+
+    path.write_text("users:\n  - [\n", encoding="utf-8")
+
+    assert store.current().override_for("lead@example.com") is Tier.LEAD
+    assert store.last_error is not None
+
+
+def test_a_bad_edit_followed_by_a_good_one_recovers(tmp_path: Path) -> None:
+    path = _roles(tmp_path, OVERRIDES)
+    store = RoleStore(path)
+    path.write_text("users:\n  - [\n", encoding="utf-8")
+    store.current()
+    assert store.last_error is not None
+
+    path.write_text('users:\n  "new@example.com": lead\n', encoding="utf-8")
+
+    assert store.current().override_for("new@example.com") is Tier.LEAD
+    assert store.last_error is None
+
+
+# ---------------------------------------------------------------------------
+# the registry default
+# ---------------------------------------------------------------------------
+
 
 def test_an_unregistered_tool_fails_closed() -> None:
-    """Forgetting to register a tool must make it MORE restricted, not less."""
-    spec = spec_for("some_tool_nobody_registered")
+    spec = spec_for("something_nobody_registered")
     assert spec.required_tier is Tier.LEAD
     assert spec.writes is True
 
 
 def test_health_check_is_available_at_tier_none() -> None:
-    # Someone not yet listed must be able to find out why they have no tools.
-    assert spec_for("health_check") == ToolSpec(
-        name="health_check", required_tier=Tier.NONE, writes=False
-    )
+    assert spec_for("health_check").required_tier is Tier.NONE

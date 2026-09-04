@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeBudgetReader, FakeManagedAccounts
+from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 
 from gads_write.ads.reads import AccountSummary, AdsReadError, CampaignRow, SearchTermRow
@@ -148,7 +148,6 @@ def harness(tmp_path):
             audit_log=audit_log,
             spend_ledger=DailySpendLedger(audit_log),
             managed_accounts=accounts,
-            reader=FakeBudgetReader(),
         )
 
         ads_reader = reader or FakeReader()

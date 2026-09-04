@@ -1,42 +1,51 @@
 """The spending rules, and the pure functions that evaluate them.
 
-There is no policy FILE any more. Every value here is either derived from
-the account being changed, fixed in code, or set once at deploy in the
-environment - because a rupee limit in a YAML file was unmaintainable by
-construction. ₹50 means nothing without knowing the account: too high for a
-test campaign, absurdly low for a real one, and stale the moment budgets
-move. Somebody has to keep it current, and that somebody was a developer.
+There is no policy file. The design principle these rules answer to:
 
-What replaced each thing, and why it is safe:
+    A person should be able to do here what they could already do in the
+    Google Ads UI. The UI has no guardrails at all - somebody types a number
+    and saves - so the control there is the human. Here the human is still
+    the control, but they are shown a preview first and must accept it, and
+    every change is audited. That makes this strictly safer than the UI
+    without being more restrictive than it.
 
-  min_daily / max_daily / max_cpc   REMOVED. They bounded nothing a human
-    could not already do in the Google Ads UI, and Google itself offers no
-    manager-set ceiling on a campaign budget for us to lean on. The error
-    they actually caught was an LLM turning "bump it a bit" into 50000, and
-    a RELATIVE cap catches that without knowing anything about the account.
-    `min_daily` was worse than useless: it blocked LOWERING a budget, which
-    is the safe direction.
+So this module REFUSES very little, and only where refusing protects the
+approval model itself:
 
-  max_increase_percent             KEPT, and now the load-bearing control.
-    "Never more than double in one change" is correct for a ₹100 campaign
-    and a ₹100,000 one, never goes stale, and needs no setup.
-    GADS_MAX_INCREASE_PERCENT, default 100.
+  - an increase past `max_increase_percent`, which is a TYPO BACKSTOP and
+    not an operating limit. It exists because the server cannot see what the
+    person actually asked for - the tool call carries a number, never the
+    conversation - so it can only judge magnitude. A decimal-place slip
+    (50,000 for 5,000) looks much like the real thing to someone approving
+    in a hurry; an eleven-fold jump does not arrive by intent. Set high
+    enough that ordinary work never meets it.
+  - a budget or bid of zero or less, and a rise from zero, where a
+    percentage is undefined.
 
-  max_total_increase_per_user_per_day   KEPT, but expressed as a percentage
-    of the ACCOUNT'S OWN total daily budget rather than a rupee amount, so
-    it scales itself. It closes the incremental-creep hole that the
-    per-change cap cannot: ten changes each under the per-change limit still
-    compound. Still derived from the audit log, never a counter - see
-    safety/spend.py.
+Everything else that used to be refused here is now either information on
+the preview or gone entirely:
 
-  the structural rules             Fixed in code. Nobody was ever going to
-    want "new keywords start ENABLED" or "broad match on manual CPC is fine".
-    A setting nobody should change is not a setting.
+  min_daily / max_daily / max_cpc   REMOVED. Absolute rupee figures are wrong
+    for some account and stale for all of them. `min_daily` was worse than
+    useless - it blocked LOWERING a budget, the one change that can only
+    reduce spend.
 
-`PolicyStore` survives as the seam every caller already reads through, so
-that removing the file changed no call site downstream. It no longer reloads
-anything, and `last_error` is now always None - there is no longer any edit
-that can be refused.
+  the per-user daily ceiling        REMOVED as a refusal. It blocked ordinary
+    work: raising five campaigns for a seasonal push would stop after the
+    second. The running total is still computed from the audit log and shown
+    on the preview, so the person approving can see "you have already raised
+    budgets by X today" and decide for themselves.
+
+  broad match on manual CPC        Now a WARNING on the preview, not a
+    refusal. The Google Ads UI permits it; so do we, having said it is risky.
+
+What is still refused lives elsewhere, and only for these reasons: an
+operation that cannot be undone (there are no delete tools), an account
+outside our MCC (safety/accounts.py - that protects our developer token, not
+your budget), and a change whose preview would LIE about what it does
+(a shared budget names one campaign and changes several - see
+`shared_budget_verdict`). Anything that corrupts the preview destroys the one
+control everything else rests on.
 
 Python notes for a TypeScript reader:
   - `Decimal` again for money. Never float.
@@ -71,13 +80,9 @@ class PolicyError(RuntimeError):
 
 @dataclass(frozen=True)
 class BudgetLimits:
-    # Per change. Relative, so it never needs tuning per account.
+    # The only budget rule left. Relative, so it never needs tuning, and set
+    # high enough to be a typo backstop rather than an operating limit.
     max_increase_percent: Decimal
-    # Per user per day, as a percentage of the account's own total daily
-    # budget. Relative for the same reason, and it is what stops ten small
-    # increases compounding past what one large one would have been refused
-    # for.
-    max_total_increase_percent_of_account: Decimal
 
 
 @dataclass(frozen=True)
@@ -94,7 +99,6 @@ class TierLimits:
 @dataclass(frozen=True)
 class Rules:
     new_entities_start_paused: bool
-    block_broad_match_with_manual_cpc: bool
     allowed_final_url_domains: frozenset[str]
 
 
@@ -106,7 +110,6 @@ class Rules:
 # spending before a human has seen it, and nobody wants broad match on a
 # manual-CPC campaign.
 NEW_ENTITIES_START_PAUSED = True
-BLOCK_BROAD_MATCH_WITH_MANUAL_CPC = True
 
 # A plan is a draft awaiting human approval. Ten minutes is long enough to
 # read a preview and short enough that an abandoned one cannot be applied
@@ -127,17 +130,6 @@ BLOCKED_OPERATIONS = frozenset(
     }
 )
 
-# The daily ceiling, per tier, as a percentage of the account's total daily
-# budget. Fixed in code rather than configured, and deliberately different
-# per tier: it is the one place the operator/lead distinction still carries a
-# number. An operator may add a tenth of the account's daily spend in a day;
-# a lead a quarter.
-DAILY_INCREASE_PERCENT_BY_TIER: dict[Tier, Decimal] = {
-    Tier.OPERATOR: Decimal(10),
-    Tier.LEAD: Decimal(25),
-}
-
-
 def build_policy(
     *,
     max_increase_percent: Decimal,
@@ -153,10 +145,7 @@ def build_policy(
     what makes that guarantee independent of how the table above is edited.
     """
     denied_everything = TierLimits(
-        budget=BudgetLimits(
-            max_increase_percent=Decimal(0),
-            max_total_increase_percent_of_account=Decimal(0),
-        ),
+        budget=BudgetLimits(max_increase_percent=Decimal(0)),
         bids=BidLimits(max_increase_percent=Decimal(0)),
     )
 
@@ -166,19 +155,13 @@ def build_policy(
             limits_by_tier[tier.value] = denied_everything
             continue
         limits_by_tier[tier.value] = TierLimits(
-            budget=BudgetLimits(
-                max_increase_percent=max_increase_percent,
-                max_total_increase_percent_of_account=(
-                    DAILY_INCREASE_PERCENT_BY_TIER[tier]
-                ),
-            ),
+            budget=BudgetLimits(max_increase_percent=max_increase_percent),
             bids=BidLimits(max_increase_percent=max_increase_percent),
         )
 
     return Policy(
         rules=Rules(
             new_entities_start_paused=NEW_ENTITIES_START_PAUSED,
-            block_broad_match_with_manual_cpc=BLOCK_BROAD_MATCH_WITH_MANUAL_CPC,
             allowed_final_url_domains=allowed_final_url_domains,
         ),
         blocked_operations=BLOCKED_OPERATIONS,
@@ -199,10 +182,6 @@ class Policy:
     # See `for_account` and `with_account_budget`.
     currency_code: str = ""
     timezone: str = "UTC"
-    # The account's total daily budget across its campaigns. `None` means it
-    # was never established, which is why the daily-ceiling rule refuses
-    # rather than assuming - see evaluate_budget_change.
-    account_total_budget_units: Decimal | None = None
 
     def limits_for(self, tier: Tier) -> TierLimits:
         """Limits for a tier, with the non-writing tiers pinned to zero."""
@@ -225,15 +204,6 @@ class Policy:
             currency_code=(currency_code or "").strip() or self.currency_code,
             timezone=(timezone or "").strip() or self.timezone,
         )
-
-    def with_account_budget(self, total_units: Decimal | None) -> "Policy":
-        """This policy, stamped with the account's total daily budget.
-
-        Same seam, one step later: the gate fetches this ONLY when a rule
-        actually needs it, so a read - which has no spend to check - still
-        costs no Google round trip. See safety/guards.py step 7.
-        """
-        return replace(self, account_total_budget_units=total_units)
 
     def blocks_operation(self, operation: str) -> bool:
         return str(operation).strip() in self.blocked_operations
@@ -304,34 +274,26 @@ def evaluate_budget_change(
     tier: Tier,
     current_units: object,
     new_units: object,
-    already_increased_today_units: object = 0,
 ) -> PolicyVerdict:
-    """Check one daily-budget change against the tier's relative limits.
+    """Check one daily-budget change against the typo backstop.
 
-    Two rules, both relative, neither needing to know anything about this
-    particular account in advance:
+    One rule: the increase may not exceed `max_increase_percent`. That is
+    deliberately set high enough never to meet ordinary work - it exists
+    because the server cannot see what the person actually ASKED for, only
+    the number Claude produced, so it can judge magnitude and nothing else.
 
-      per change   the increase may not exceed max_increase_percent
-      per day      this user's TOTAL increases today, this one included, may
-                   not exceed a percentage of the account's total daily budget
+    Boundaries are inclusive. Only INCREASES are constrained: lowering a
+    budget can only reduce spend, so there is no minimum and never was a good
+    reason for one.
 
-    The second is what the first cannot do. A 100% per-change cap still allows
-    100 -> 200 -> 400 -> 800 inside an afternoon; the daily ceiling bounds the
-    day.
-
-    Boundaries are inclusive: exactly at a limit is allowed, a hair over is
-    not. Only INCREASES are constrained. There is deliberately no minimum any
-    more - refusing to lower a budget was refusing the one change that can
-    only ever reduce spend.
+    The per-user daily total is no longer checked here. It is still computed
+    from the audit log and shown on the preview, so the person approving sees
+    what they have already done today and decides - which is the same
+    position they are in using the Google Ads UI, with more information.
     """
     limits = policy.limits_for(tier).budget
-    reasons: list[str] = []
-
     current = coerce_units(current_units, field="current_units")
     proposed = coerce_units(new_units, field="new_units")
-    spent_today = coerce_units(
-        already_increased_today_units, field="already_increased_today_units"
-    )
     code = policy.currency_code
 
     if proposed <= 0:
@@ -339,67 +301,29 @@ def evaluate_budget_change(
             f"a daily budget must be above zero, got {proposed} {code}"
         )
 
-    delta = proposed - current
-    if delta <= 0:
-        # A decrease. Nothing to check: it cannot raise spend, and it must not
-        # create headroom under the daily ceiling either - see safety/spend.py,
-        # which counts positive deltas only.
+    if proposed <= current:
+        # A decrease. Nothing to check - it cannot raise spend.
         return PolicyVerdict.allow()
 
     if current == 0:
-        # percent_change from zero is undefined. Treat any rise off a zero
-        # budget as unbounded and refuse it rather than invent a percentage.
-        reasons.append(
+        # percent_change from zero is undefined. Refuse rather than invent a
+        # percentage.
+        return PolicyVerdict.deny(
             "cannot raise a budget from zero through this server; the "
             "percentage increase is undefined. Set it in the Google Ads UI "
             "once, then adjust it here."
         )
-    else:
-        increase_percent = percent_change(current, proposed)
-        if increase_percent > limits.max_increase_percent:
-            reasons.append(
-                f"a {increase_percent}% increase exceeds the limit of "
-                f"{limits.max_increase_percent}% per change "
-                f"({current} -> {proposed} {code})"
-            )
 
-    account_total = policy.account_total_budget_units
-    if account_total is not None and account_total <= 0:
-        # Zero is a real answer, and it means zero headroom - NOT "no ceiling".
-        # Skipping the rule here would have been the one fail-open direction
-        # in an otherwise fail-closed check: an account with no live budgets
-        # would have permitted an increase of any size.
+    increase_percent = percent_change(current, proposed)
+    if increase_percent > limits.max_increase_percent:
         return PolicyVerdict.deny(
-            f"this account has no live daily budget to measure a ceiling "
-            f"against, so no increase can be authorised here. Set the budget "
-            f"in the Google Ads UI once, then adjust it from here."
+            f"a {increase_percent}% increase is past the {limits.max_increase_percent}% "
+            f"safety backstop ({current} -> {proposed} {code}). That limit is "
+            "set far above normal work, so this usually means a digit went "
+            "astray. Make the change in two steps if it is genuinely intended."
         )
 
-    if account_total is None:
-        # Refuse rather than skip. The ceiling is a real control, and "we could
-        # not work out the base" is a reason to stop, not a reason to wave an
-        # unbounded change through.
-        reasons.append(
-            "the account's total daily budget could not be established, so "
-            "your daily increase ceiling cannot be applied. Nothing was "
-            "changed; try again in a moment."
-        )
-    else:
-        ceiling = (
-            account_total * limits.max_total_increase_percent_of_account
-        ) / Decimal(100)
-        running_total = spent_today + delta
-        if running_total > ceiling:
-            reasons.append(
-                f"this raises your total budget increases today to "
-                f"{running_total} {code}, over your {tier.value} ceiling of "
-                f"{ceiling} {code} "
-                f"({limits.max_total_increase_percent_of_account}% of the "
-                f"account's {account_total} {code} total daily budget; "
-                f"already {spent_today} {code} today)"
-            )
-
-    return PolicyVerdict.deny(*reasons) if reasons else PolicyVerdict.allow()
+    return PolicyVerdict.allow()
 
 
 def evaluate_bid_change(
@@ -437,9 +361,11 @@ def evaluate_bid_change(
             increase_percent = percent_change(current, proposed)
             if increase_percent > limits.max_increase_percent:
                 reasons.append(
-                    f"a {increase_percent}% increase exceeds the limit of "
-                    f"{limits.max_increase_percent}% per change "
-                    f"({current} -> {proposed} {code})"
+                    f"a {increase_percent}% increase is past the "
+                    f"{limits.max_increase_percent}% safety backstop "
+                    f"({current} -> {proposed} {code}). That limit is set far "
+                    "above normal work, so this usually means a digit went "
+                    "astray."
                 )
 
     return PolicyVerdict.deny(*reasons) if reasons else PolicyVerdict.allow()
@@ -454,19 +380,27 @@ def evaluate_operation(policy: Policy, operation: str) -> PolicyVerdict:
     return PolicyVerdict.allow()
 
 
-def evaluate_match_type_against_bidding(
-    policy: Policy, *, match_type: str, bidding_strategy: str
-) -> PolicyVerdict:
-    """Broad match under manual CPC is how accounts quietly haemorrhage money."""
-    if not policy.rules.block_broad_match_with_manual_cpc:
-        return PolicyVerdict.allow()
-    if (
-        str(match_type).strip().upper() == "BROAD"
-        and "MANUAL_CPC" in str(bidding_strategy).strip().upper()
-    ):
-        return PolicyVerdict.deny(
-            "broad match is not permitted on a manual CPC campaign "
-            "(rules.block_broad_match_with_manual_cpc). Use phrase or exact, "
-            "or move the campaign to an automated bidding strategy."
-        )
-    return PolicyVerdict.allow()
+def broad_match_warning(
+    *, match_type: str, bidding_strategy: str
+) -> str | None:
+    """A warning for the preview, or None. NOT a refusal.
+
+    Broad match under manual CPC is how accounts quietly haemorrhage money,
+    and it used to be refused outright. The Google Ads UI allows it, so this
+    server does too - the person approving is told why it is risky and
+    decides, which is the position they are in in the UI, with more
+    information rather than less.
+
+    An unreadable bidding strategy produces no warning rather than a refusal:
+    failing to establish an advisory fact is not a reason to block a change
+    the UI would have allowed.
+    """
+    if str(match_type).strip().upper() != "BROAD":
+        return None
+    if "MANUAL_CPC" not in str(bidding_strategy).strip().upper():
+        return None
+    return (
+        "WARNING: broad match on a manual-CPC campaign is the classic way to "
+        "spend quickly on searches you did not intend. Consider phrase or "
+        "exact match, or an automated bidding strategy."
+    )

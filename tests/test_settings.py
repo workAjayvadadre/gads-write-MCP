@@ -155,7 +155,7 @@ def test_all_problems_are_reported_together(env, tmp_path: Path) -> None:
 def test_the_increase_percent_defaults_and_can_be_overridden(env, tmp_path: Path) -> None:
     from decimal import Decimal
 
-    assert _load(tmp_path).max_increase_percent == Decimal(100)
+    assert _load(tmp_path).max_increase_percent == Decimal(1000)
     env.setenv("GADS_MAX_INCREASE_PERCENT", "50")
     assert _load(tmp_path).max_increase_percent == Decimal(50)
 
@@ -175,7 +175,7 @@ def test_an_empty_increase_percent_means_the_default(env, tmp_path: Path) -> Non
     from decimal import Decimal
 
     env.setenv("GADS_MAX_INCREASE_PERCENT", "")
-    assert _load(tmp_path).max_increase_percent == Decimal(100)
+    assert _load(tmp_path).max_increase_percent == Decimal(1000)
 
 
 def test_url_domains_are_split_and_normalised(env, tmp_path: Path) -> None:
@@ -191,23 +191,29 @@ def test_no_url_domains_is_allowed_and_means_no_new_ads(env, tmp_path: Path) -> 
     assert _load(tmp_path).allowed_url_domains == frozenset()
 
 
-def test_roles_in_file_mode_without_a_lead_is_rejected(
+def test_a_missing_roles_file_is_fine(env, tmp_path: Path) -> None:
+    """Break-glass overrides are the exception, so having none is the healthy
+    state. Requiring the file would mean shipping an empty one."""
+    env.setenv("GADS_ROLES_PATH", str(tmp_path / "no-overrides.yaml"))
+    assert _load(tmp_path).is_production
+
+
+def test_an_empty_roles_file_is_fine(env, tmp_path: Path, write_roles) -> None:
+    env.setenv("GADS_ROLES_PATH", str(write_roles({"users": {}})))
+    assert _load(tmp_path).is_production
+
+
+def test_a_broken_roles_file_still_refuses_to_start(
     env, tmp_path: Path, write_roles
 ) -> None:
+    """A file that EXISTS must be readable. A typo in a privilege grant is
+    exactly the thing that should stop a deploy."""
     env.setenv(
         "GADS_ROLES_PATH",
-        str(write_roles({"users": {"analyst@example.com": "readonly"}})),
+        str(write_roles({"users": {"a@b.com": "superuser"}})),
     )
-    with pytest.raises(ConfigError, match="lead"):
+    with pytest.raises(ConfigError, match="not one of"):
         _load(tmp_path)
-
-
-def test_roles_in_google_ads_mode_may_be_empty(env, tmp_path: Path, write_roles) -> None:
-    # Phase 3: the file becomes a break-glass override, normally empty.
-    env.setenv(
-        "GADS_ROLES_PATH", str(write_roles({"mode": "google_ads", "users": {}}))
-    )
-    assert _load(tmp_path).is_production
 
 
 # ---------------------------------------------------------------------------

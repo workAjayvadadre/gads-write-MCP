@@ -36,7 +36,7 @@ from .auth.identity import (
     google_access_token,
     has_google_access_token,
 )
-from .auth.roles import FileTierResolver, RoleStore
+from .auth.roles import RoleStore
 from .auth.tiers import Tier, TierResolver
 from .health import register_health_route
 from .mcp_middleware import TierMiddleware
@@ -117,21 +117,19 @@ def _build_tier_resolver(
     managed_accounts: ManagedAccountStore,
     reader: GoogleAdsReader,
 ) -> TierResolver:
-    """Pick the tier backing named by roles.yaml `mode`.
+    """Tiers from the caller's own Google Ads role, with break-glass on top.
 
-    `file`        roles.yaml is the source of truth. Fine for a staging box;
-                  it cannot express per-account access and it drifts from
-                  reality the moment someone is changed in the Google Ads UI.
+    There is no `mode` any more. Tiers ALWAYS come from Google Ads - that is
+    the operational requirement the whole design exists for: a lead adds
+    someone in the Google Ads UI and they work here, with no developer and no
+    file to edit.
 
-    `google_ads`  The intended production setting. Tiers come from the user's
-                  own Google Ads access role, and roles.yaml `users` becomes
-                  a break-glass override that is normally empty.
+    `OverridingTierResolver` wraps it with the break-glass file, which is
+    normally absent. See auth/roles.py for why that stayed a file.
 
     The managed set is passed as a callable rather than a value so that
     linking a new account in Google Ads changes which accounts count towards
-    a user's visible tier without a restart - the same live behaviour as
-    everything else here, now that the set comes from the MCC rather than a
-    file.
+    a user's visible tier without a restart.
     """
 
     async def managed_customer_ids() -> frozenset[str]:
@@ -139,21 +137,13 @@ def _build_tier_resolver(
             account.customer_id for account in await managed_accounts.all()
         )
 
-    mode = role_store.current().mode
-
-    if mode == "file":
-        return FileTierResolver(role_store)
-
-    if mode == "google_ads":
-        primary = GoogleAdsTierResolver(
-            reader=reader,
-            login_customer_id=settings.login_customer_id,
-            managed_customer_ids=managed_customer_ids,
-            cache=TierCache(settings.tier_cache_seconds),
-        )
-        return OverridingTierResolver(overrides=role_store, primary=primary)
-
-    raise ConfigError(f"roles.yaml sets an unsupported mode: {mode!r}")
+    primary = GoogleAdsTierResolver(
+        reader=reader,
+        login_customer_id=settings.login_customer_id,
+        managed_customer_ids=managed_customer_ids,
+        cache=TierCache(settings.tier_cache_seconds),
+    )
+    return OverridingTierResolver(overrides=role_store, primary=primary)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +198,6 @@ try:
         audit_log=AUDIT_LOG,
         spend_ledger=SPEND_LEDGER,
         managed_accounts=MANAGED_ACCOUNTS,
-        reader=READER,
     )
 except ConfigError as exc:
     print(f"\n{exc}\n", file=sys.stderr)

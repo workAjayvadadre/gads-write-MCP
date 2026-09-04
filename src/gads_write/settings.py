@@ -76,11 +76,13 @@ class Settings:
     # deliberate act, like the kill switch.
     require_human_confirmation: bool = True
 
-    # The one money rule left, and the only one that is tunable. Relative, so
-    # it is correct for a small campaign and a large one alike: 100 means
-    # "never more than double in a single change". There is no absolute rupee
-    # cap any more - see safety/policy.py for why one could not be maintained.
-    max_increase_percent: Decimal = Decimal(100)
+    # A TYPO BACKSTOP, not an operating limit. The server never sees what the
+    # person actually asked for - a tool call carries a number, never the
+    # conversation - so it can only judge magnitude. 1000 means "nothing may
+    # jump more than elevenfold in one change", which ordinary work never
+    # meets and a stray digit always does. Raising a budget from 500 to 5,000
+    # is fine; 500 to 500,000 is not.
+    max_increase_percent: Decimal = Decimal(1000)
 
     # Hosts a new ad's final URL may point at. Deployment-specific and not
     # derivable: Google cannot tell us which domains are yours. Exact host
@@ -132,35 +134,32 @@ def _resolve(path_str: str) -> Path:
 # validation
 # --------------------------------------------------------------------------
 
-# Above this, the per-change cap stops being a safety control. It is the
-# only money rule left, so an absurd value is refused rather than trusted.
-MAX_SANE_INCREASE_PERCENT = Decimal(1000)
+# The backstop's own backstop. The default is 1000 (elevenfold); this leaves
+# room to loosen that deliberately while still refusing a value that is not a
+# limit at all, which is how the control gets disabled by accident.
+MAX_SANE_INCREASE_PERCENT = Decimal(10_000)
 
 
 def _validate_config_files(roles_path: Path) -> list[str]:
-    """Confirm roles.yaml exists and is fully valid.
+    """Confirm the break-glass override file, IF it exists, is readable.
 
-    Validation is delegated to the same parser the running server uses, so
-    boot-time checks and runtime checks can never drift apart.
+    Its absence is the healthy state: overrides are the exception. Validation
+    is delegated to the same parser the running server uses, so a boot-time
+    check and a runtime check can never drift apart.
 
-    There is no policy file to check any more: the spending rules are derived
-    from the account, fixed in code, or read from the environment, so the
-    class of "the server started on a policy nobody meant" bug this guarded
-    against no longer exists.
+    There is no policy file to check any more, and no roles `mode` - tiers
+    always come from Google Ads.
     """
     from .auth.roles import RoleTable
 
-    problems: list[str] = []
+    if not roles_path.exists():
+        return []
 
-    if not roles_path.is_file():
-        problems.append(f"roles file not found at {roles_path}")
-    else:
-        try:
-            RoleTable.load(roles_path)
-        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-            problems.append(str(exc))
-
-    return problems
+    try:
+        RoleTable.load(roles_path)
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        return [str(exc)]
+    return []
 
 
 def load_settings(*, env_file: Path | None = None) -> Settings:
@@ -283,10 +282,10 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
 
-    # The one remaining money rule. Relative, so it needs no knowledge of any
-    # account; see safety/policy.py for why the absolute caps were removed.
-    raw_increase = _env("GADS_MAX_INCREASE_PERCENT", "100") or "100"
-    max_increase_percent = Decimal(100)
+    # The typo backstop. Deliberately far above ordinary work; see the field
+    # comment on Settings and safety/policy.py for why it is not a limit.
+    raw_increase = _env("GADS_MAX_INCREASE_PERCENT", "1000") or "1000"
+    max_increase_percent = Decimal(1000)
     try:
         max_increase_percent = Decimal(raw_increase)
         # `is_finite()` is the check that matters, not `< 0`. Decimal happily
@@ -300,7 +299,7 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
         problems.append(
             f"GADS_MAX_INCREASE_PERCENT must be a finite, non-negative number, "
             f"got {raw_increase!r}. It is a percentage: 100 means a change may "
-            "at most double a budget or a bid."
+            "at most multiply a budget or a bid elevenfold."
         )
     else:
         if max_increase_percent > MAX_SANE_INCREASE_PERCENT:
@@ -311,8 +310,7 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
             problems.append(
                 f"GADS_MAX_INCREASE_PERCENT is {max_increase_percent}, which "
                 f"is not a limit at all. The maximum accepted is "
-                f"{MAX_SANE_INCREASE_PERCENT}; 100 means a change may at most "
-                "double a budget or a bid."
+                f"{MAX_SANE_INCREASE_PERCENT}."
             )
 
     # Exact host match, comma separated. Empty is allowed and means no new ad

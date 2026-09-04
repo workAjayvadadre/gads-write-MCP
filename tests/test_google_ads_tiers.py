@@ -329,7 +329,7 @@ async def test_an_outage_is_never_cached() -> None:
 # ---------------------------------------------------------------------------
 
 def _google_ads_roles(write_roles, users: dict) -> RoleStore:
-    return RoleStore(write_roles({"mode": "google_ads", "users": users}))
+    return RoleStore(write_roles({"users": users}))
 
 
 async def test_no_overrides_means_google_decides(write_roles) -> None:

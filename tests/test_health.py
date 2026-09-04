@@ -93,15 +93,15 @@ async def test_healthz_reports_a_structurally_valid_but_wrong_edit(
 ) -> None:
     """The quietest version of the failure.
 
-    Valid YAML, so the edit looks fine to whoever saved it, but the mode is
-    one this code does not understand. Alive-but-broken must read as degraded
-    rather than going on answering 200 ok.
+    Valid YAML, so the edit looks fine to whoever saved it, but the tier
+    named is not one this code understands. Alive-but-broken must read as
+    degraded rather than going on answering 200 ok.
     """
     roles_path = write_roles()
     role_store = RoleStore(roles_path)
     assert role_store.current() is not None
 
-    roles_path.write_text("mode: sombrero\ndefault_tier: none\n", encoding="utf-8")
+    roles_path.write_text('users:\n  "a@b.com": superuser\n', encoding="utf-8")
     role_store.current()
 
     mcp = FastMCP(name="test")

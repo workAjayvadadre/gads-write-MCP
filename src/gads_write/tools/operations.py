@@ -8,9 +8,8 @@ applied under rules it was never checked against.
 
 They used to be different code, and the gap was real. `REVALIDATORS` carried
 only the argument-shape validator, and confirm re-ran that faithfully. But
-the money rules - `max_increase_percent`, broad match under manual CPC, and
-the per-user daily ceiling - lived in an `evaluate` closure inside each draft
-tool's body, reachable from nowhere else. Confirm never passed one, and
+the money rules lived in an `evaluate` closure inside each draft tool's
+body, reachable from nowhere else. Confirm never passed one, and
 `Guard.check` skips the whole policy evaluation when `evaluate is None`. So a
 plan drafted while the ceiling was wide still applied after it narrowed.
 
@@ -46,7 +45,6 @@ from ..safety.policy import (
     PolicyVerdict,
     evaluate_bid_change,
     evaluate_budget_change,
-    evaluate_match_type_against_bidding,
 )
 from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
@@ -128,12 +126,6 @@ class OperationChecks:
     id_argument: str = ""
     # None when the tool cannot raise daily spend.
     spend_delta: SpendDelta | None = None
-    # True only for rules measured against the ACCOUNT'S total daily budget -
-    # in practice, the per-user daily ceiling on budget changes. The gate
-    # fetches that total from Google, so declaring it here is what keeps the
-    # read off every other tool's path: a bid has no daily ceiling behind it
-    # and must not pay for a round trip it cannot use.
-    needs_account_total: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +303,6 @@ def recheck_budget(
         tier=tier,
         current_units=units_from_micros(current.daily_budget_micros),
         new_units=new_units,
-        already_increased_today_units=spend_today,
     )
 
 
@@ -353,33 +344,6 @@ def recheck_bid(
     )
 
 
-def recheck_keyword(
-    policy: Policy,
-    *,
-    tier: Tier,
-    arguments: dict[str, Any],
-    current: Any,
-    payload: dict[str, Any],
-    spend_today: Decimal,
-) -> PolicyVerdict:
-    """Broad match under manual CPC is the classic way to burn money.
-
-    The bidding strategy is read from the ad group rather than remembered,
-    because a campaign can be moved off manual CPC - or onto it - between
-    drafting a keyword and confirming it.
-    """
-    if current is None:
-        return PolicyVerdict.deny(
-            "the ad group's bidding strategy could not be established, so this "
-            "keyword cannot be checked against the match-type rule."
-        )
-    return evaluate_match_type_against_bidding(
-        policy,
-        match_type=str(arguments.get("match_type", "")),
-        bidding_strategy=current.bidding_strategy_type,
-    )
-
-
 # ---------------------------------------------------------------------------
 # the table
 # ---------------------------------------------------------------------------
@@ -397,14 +361,10 @@ OPERATIONS: dict[str, OperationChecks] = {
         reads=ReadKind.CAMPAIGN,
         id_argument="campaign_id",
         spend_delta=budget_spend_delta,
-        needs_account_total=True,
     ),
     "add_negative_keyword": OperationChecks(validate=validate_negative_keyword_args),
     "add_keyword": OperationChecks(
         validate=validate_keyword_args,
-        recheck=recheck_keyword,
-        reads=ReadKind.AD_GROUP,
-        id_argument="ad_group_id",
     ),
     "update_ad_group_bid": OperationChecks(
         validate=validate_bid_args,
@@ -450,7 +410,6 @@ __all__ = [
     "read_current",
     "recheck_bid",
     "recheck_budget",
-    "recheck_keyword",
     "validate_bid_args",
     "validate_budget_args",
     "validate_campaign_status_args",

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeBudgetReader, FakeManagedAccounts
+from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
 
@@ -119,7 +119,6 @@ def harness(tmp_path):
             settings=settings, policy_store=policy_store, tier_resolver=tiers,
             audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
             managed_accounts=FakeManagedAccounts(),
-        reader=FakeBudgetReader(),
         )
         plans = PlanStore()
         executor = FakeExecutor()

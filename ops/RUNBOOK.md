@@ -168,19 +168,27 @@ Their tier comes from their own Google Ads role, within the cache window.
 do here either; the managed set is derived from the manager account and
 refreshes within 5 minutes.
 
-**Change the spending rules** - edit `GADS_MAX_INCREASE_PERCENT` in `.env`
-and `pm2 restart gads-write-mcp`. This is a percentage, not an amount: 100
-means "a change may at most double a budget or a bid". The per-user daily
-ceiling is a percentage of each account's own total daily budget and is fixed
-in `safety/policy.py`; changing it is a code edit, deliberately.
+**Change the spending backstop** - edit `GADS_MAX_INCREASE_PERCENT` in `.env`
+and `pm2 restart gads-write-mcp`. It is a percentage, not an amount: 1000
+means "nothing may jump more than elevenfold in one change". It is a typo
+backstop set far above ordinary work, NOT an operating limit — the control is
+that a person approves a preview.
+
+**Restore access when Google cannot resolve a role** - add the person to
+`users:` in `config/roles.yaml`, save. It applies on the next request, no
+restart. Remove the entry once Google is answering again.
 
 **Remove someone** - remove them in the Google Ads UI. They lose access
 immediately: every call uses their own OAuth token, so Google refuses them
 regardless of anything cached here.
 
-**Break glass (Google Ads lookup is failing)** - in `config/roles.yaml`, set
-`mode: file` and add the person under `users:`. Hot-reloads. This is visible,
-in git, and obviously temporary. Undo it when Google recovers.
+**Break glass (Google Ads lookup is failing)** - add the person under
+`users:` in `config/roles.yaml`. Hot-reloads, no restart. This is visible, in
+git, and obviously temporary. Undo it when Google recovers.
+
+It is not a privilege escalation: every call still uses that person's own
+OAuth token, so if Google has removed them, Google refuses the call whatever
+tier is set here.
 
 ---
 
@@ -220,7 +228,7 @@ someone re-drafts a change.
 - [ ] `GADS_ALLOWED_URL_DOMAINS` set, or new ads will be refused
 - [ ] `GADS_JWT_SIGNING_KEY` set (production refuses to boot without it)
 - [ ] `GADS_REQUIRE_HUMAN_CONFIRMATION=true`
-- [ ] `roles.yaml` on `mode: google_ads`
+- [ ] `config/roles.yaml` `users:` map empty (break-glass only)
 - [ ] Uptime monitor on `/healthz`
 - [ ] Only then `GADS_WRITE_ENABLED=true`, and pause one campaign that does
       not matter as the first live test

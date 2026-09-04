@@ -1,56 +1,36 @@
-# Who may do what.
+# BREAK-GLASS TIER OVERRIDES. Normally this file does not exist.
 #
-# `mode` decides where tiers actually come from:
+# Tiers come from Google Ads. Add someone in the Google Ads UI and they work
+# here, within the cache window, with no developer and nothing to edit:
 #
-#   file        This file is the source of truth. Phase 2 default.
-#   google_ads  The user's own Google Ads access level is the source of
-#               truth (Admin -> lead, Standard -> operator, Read only ->
-#               readonly). Arrives in Phase 3. In that mode the `users` map
-#               below becomes a BREAK-GLASS OVERRIDE, normally empty.
+#   Admin      -> lead       everything
+#   Standard   -> operator   reports, pause/enable, negatives, budgets
+#   Read only  -> readonly   reports
+#   Email only -> none
 #
-# Emails are matched case-insensitively against the address Google asserts in
-# the OAuth token, never against anything a caller sends, so it cannot be
-# spoofed by the client.
+# This file exists for ONE situation: Google cannot tell us someone's role -
+# an outage, or a permission model that does not work the way we expect - and
+# the team is locked out with no way back in but a developer redeploy.
 #
-# This file hot-reloads. Save it and the change applies on the next request,
-# with no restart. A demoted user loses their powers immediately.
+# An entry here says: "Google could not tell us this person's role, and a lead
+# has deliberately overridden it." It short-circuits Google entirely, applies
+# on the next request with no restart, and logs a warning every time it is
+# used.
+#
+# It is NOT a privilege escalation, which is worth knowing before worrying
+# about a stale entry. Every Google Ads call still uses that person's own
+# OAuth token, so if Google has removed them, Google refuses the read or write
+# whatever tier we assign here. An override changes which tools appear in
+# their menu and which tier lands in the audit line; it cannot grant access to
+# an account Google will not let them touch.
+#
+# Why this is a file and not an env var: it is a list of privilege grants, and
+# .env is gitignored. Here it has a history, shows up in review, and a
+# forgotten entry is visible. Delete the entry - or the whole file - once
+# Google is answering again.
+#
+# For local development without Google credentials, put yourself here. That is
+# the same path a real break-glass takes, so it stays exercised.
 
-# Currently `file` for local development: `google_ads` resolves every tier by
-# calling the Google Ads API, which needs working credentials and a real
-# account under the manager. The Google Ads resolver is built and tested
-# (tests/test_google_ads_tiers.py) and boots in both modes - switch this one
-# word back to `google_ads` when credentials are in place.
-mode: file
-
-# Tiers, lowest to highest:
-#   none      authenticated, but no tools beyond health_check
-#   readonly  reads only
-#   operator  reads, pause/enable, negative keywords, budgets within policy
-#   lead      everything operator can do, plus keywords, bids, new RSAs
-#
-# Only consulted in `mode: file`. In `mode: google_ads` an address that is
-# absent from `users` below means "ask Google", not "deny" - so this value
-# is inert while that mode is set.
-default_tier: none
-
-# BREAK-GLASS ONLY. Normally empty.
-#
-# In `mode: google_ads` this map is checked BEFORE Google. An entry here
-# therefore means: "Google could not tell us this person's role, and a lead
-# has deliberately overridden it." It is a visible, in-git, obviously
-# temporary decision rather than a silent automatic fallback on error, and
-# the server logs a warning every time one is used.
-#
-# Because it short-circuits Google entirely, an address left here will never
-# exercise the real resolver. That is why this map was emptied when the mode
-# flipped: leaving an entry would have made the switch inert for that person.
-#
-# To restore access if the Google Ads lookup fails, uncomment one line, save,
-# and it applies on the next request - no restart.
-#
-# While mode is `file` this map is the ONLY source of tiers, and at least one
-# `lead` is required or the server refuses to boot.
-users:
-  "indiragenai@indiraivfgenai.com": lead
-  # "someone@indiraivf.com": operator
-  # "analyst@indiraivf.com": readonly
+users: {}
+  # "someone@indiraivf.com": lead

@@ -34,14 +34,15 @@ If you need a config value, a decision, or a file from the existing server,
 | 4 | First mutation (`pause`/`enable`), two-step confirm | **code done; NOT yet run against a live account** |
 | 5 | Budget, bids, negatives, keywords, RSA | **code done, 366 tests; NOT yet run against a live account** |
 | 6 | Rollout: runbook, health endpoint, self-managing audit log, human approval | **code done; not yet exercised against a live client** |
-| 6.5 | Zero-config: accounts/currency/timezone from Google, relative spend rules, `policy.yaml` deleted | **code done, 407 tests** |
+| 6.5 | Zero-config: accounts/currency/timezone from Google, relative spend rules, `policy.yaml` deleted | **code done** |
+| 6.6 | Parity with the Google Ads UI: absolute caps and the daily ceiling removed, broad match downgraded to a warning, `roles.yaml` reduced to break-glass | **code done, 410 tests** |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
 `ads/api_version.py` and nowhere else.
 
-`config/roles.yaml` still ships `mode: file`, and is now the only YAML left. The Google Ads resolver is
-built, tested and boots, but flipping the switch is a deliberate decision
-that depends on the open risk below.
+`config/roles.yaml` is the only YAML left, and it holds nothing but
+break-glass tier overrides - normally an empty map. Tiers always come from
+Google Ads; there is no `mode` any more.
 
 ## Non-negotiable constraints
 
@@ -105,9 +106,8 @@ would otherwise be re-litigated.
 
 **Tier comes from Google Ads, not from a file.** The operational
 requirement is: add someone in the Google Ads UI and they work here, with no
-developer involvement. `roles.yaml` in `mode: file` is temporary Phase 2
-backing only. In Phase 3 it flips to `mode: google_ads` and the `users` map
-empties out, becoming a break-glass override.
+developer involvement. `roles.yaml` holds only break-glass overrides now:
+there is no `mode`, and the `users` map is normally empty.
 
 **Tier is per-account, not global.** `resolve(caller, customer_id)`. Google
 stores access on `customer_user_access`, which is per-customer; a person can
@@ -135,36 +135,63 @@ visible, in git, obviously temporary - not an automatic fallback.
 caught `readonly` silently inheriting the permissive defaults because the
 config omitted its block. There is no config to omit anything now, but the
 pinning stays: it makes the guarantee independent of how
-`DAILY_INCREASE_PERCENT_BY_TIER` is edited.
+`GADS_MAX_INCREASE_PERCENT` is set.
 
-**There is no `policy.yaml`, and that was a deliberate reversal.** The file
-held a rupee band (`min_daily` / `max_daily` / `max_cpc`) that was
-unmaintainable by construction: 50 means nothing without knowing the account,
-it was wrong for every real campaign, and somebody - a developer - had to keep
-it current. Worse, `min_daily` blocked LOWERING a budget, the one change that
-can only reduce spend.
+**The design principle is parity with the Google Ads UI.** A person should
+be able to do here what they could already do in the UI. That is not a
+loosening of standards; it is the recognition that the UI has NO guardrails -
+somebody types a number and saves - so the control there is the human. Here
+the human is still the control, but sees a preview first, must accept it, and
+every change is audited. That makes this strictly safer than the UI without
+being more restrictive than it.
 
-What replaced it:
+Rules that blocked what the UI allows made people work around the tool, which
+is the one outcome that makes everything else moot. So:
 
-- The absolute caps are **gone**. They bounded nothing a human could not
-  already do in the Google Ads UI, and Google offers no manager-set ceiling on
-  a campaign budget to lean on. The error they actually caught was an LLM
-  turning "bump it a bit" into 50000, and a relative cap catches that without
-  knowing anything about the account.
-- `max_increase_percent` is the **load-bearing control** now, via
-  `GADS_MAX_INCREASE_PERCENT` (default 100). "Never more than double in one
-  change" is correct at any scale and never goes stale.
-- The daily ceiling is a **percentage of the account's own total daily
-  budget**, so it scales itself. It closes what the per-change cap cannot:
-  ten changes each under the limit still compound.
+- **There is no `policy.yaml`.** It held a rupee band (`min_daily` /
+  `max_daily` / `max_cpc`) that was unmaintainable by construction: 50 means
+  nothing without knowing the account, it was wrong for every real campaign,
+  and a developer had to keep it current. `min_daily` was worse than useless -
+  it blocked LOWERING a budget, the one change that can only reduce spend.
+- **The absolute caps are gone.** They bounded nothing a human could not
+  already do in the UI, and Google offers no manager-set ceiling on a campaign
+  budget to lean on (`AccountBudget` exists but is tied to `billing_setup` and
+  monthly invoicing).
+- **`max_increase_percent` is a TYPO BACKSTOP, not an operating limit**, via
+  `GADS_MAX_INCREASE_PERCENT` (default 1000). It exists because the server
+  cannot see what the person ASKED for - a tool call carries a number, never
+  the conversation - so it can judge magnitude and nothing else. A stray digit
+  looks much like the real thing to someone approving in a hurry; an
+  elevenfold jump does not arrive by intent. Set far above ordinary work: 500
+  to 5,000 goes through, 500 to 500,000 does not.
+- **The per-user daily ceiling was REMOVED as a refusal.** It blocked ordinary
+  work - raising five campaigns for a seasonal push stopped after the second.
+  The running total is still derived from the audit log and shown on the
+  preview, so the person approving sees "your budget increases today would
+  total X" and decides.
+- **Broad match under manual CPC is a WARNING on the preview**, not a refusal.
+  The UI permits it; so do we, having said plainly why it is risky.
 - Currency, timezone and the account set are **read from Google**.
-- The structural rules are **fixed in code**. A setting nobody should ever
-  change is not a setting.
 
-The operational requirement this serves is the same one behind tiers coming
-from Google Ads: deploy it, add people in Google Ads, hand over the URL. A
-config file the marketing team cannot reach is a developer dependency wearing
-a YAML hat.
+What is still refused, and the principle behind it: **only what cannot be
+undone, or what would break the approval model.**
+
+| Refused | Why |
+|---|---|
+| Anything irreversible - no delete/remove tools | Pausing can be undone; removal cannot |
+| Accounts outside the MCC | Protects our developer token, not the budget |
+| A change whose preview would LIE - a SHARED budget names one campaign and changes several | Approval is the control; anything that corrupts the preview destroys it |
+
+**Bids have no absolute cap and no daily ceiling, deliberately.** `max_cpc`
+went with the other absolute caps, and unlike budgets there is no ceiling
+behind the per-change backstop, so repeated approved changes could ladder a
+bid up over days. That is accepted, for three reasons: a runaway bid **cannot
+overspend you** - the campaign daily budget still caps what is spent, so the
+harm is paying too much for too few clicks rather than losing control of
+spend; every step needs a separate human approval; and it is `lead` only.
+Recorded here so it is a decision rather than an oversight. If it ever needs
+closing, the rule that fits is a cap on max CPC as a percentage of the
+campaign's daily budget - a self-scaling wall, not a rate limit.
 
 **The daily spend ceiling is derived from the audit log, not a counter.**
 An in-memory counter would make `pm2 restart` a way to clear the cap. Only
@@ -275,8 +302,7 @@ policy recheck, and which entity that recheck needs the current state of.
 `confirm_and_apply` fails closed on a tool missing from that table.
 
 This used to be split, and the split was a real hole. `REVALIDATORS` carried
-only the argument validator; the money rules - `max_increase_percent`,
-broad-match-under-manual-CPC and the daily ceiling - lived in an `evaluate`
+only the argument validator; the money rules lived in an `evaluate`
 closure inside each draft tool's body, reachable from nowhere else.
 `Guard.check` skips policy evaluation entirely when `evaluate is None`, and
 confirm never passed one, so confirm re-ran a strictly weaker check than
@@ -299,30 +325,6 @@ authorise (marked `dry_run`, audited as a look) and again with the numbers.
 Two audit lines is deliberate, at both steps. Tools whose rules need no
 account state - negative keywords, RSAs, pause/enable - pay for neither the
 second line nor the read.
-
-**The daily ceiling's base is fetched only for rules that measure against
-it.** `needs_account_total` on `OperationChecks` says so per operation, and
-both draft and confirm read it from that one table. It was briefly gated on
-`evaluate is not None`, which made every BID change pay for a Google round
-trip it could not use and, worse, swallowed a failed read to a warning while
-the change went ahead. A budget change refuses when the base is unknown; a
-bid never asks for it.
-
-**The audit log partitions by date and prunes itself, in-process.** Rotation
-is deliberately NOT a logrotate rule. The daily spend ceiling is rebuilt from
-these files, so an external tool that truncated or moved them would silently
-hand every user a fresh allowance - a security control disabled by a routine
-ops action, with no error and no log line. `GADS_AUDIT_RETENTION_DAYS`
-(default 400, minimum 1) is the only knob, and the server needs no cron, no
-logrotate and no scheduled maintenance. A pre-existing single `audit.jsonl`
-is still read so a deploy does not lose history.
-
-**The ceiling is only consulted when a rule needs it.** It used to be read on
-every gate check, including reads, which have no spend to check. Combined
-with the flat file that meant every tool call re-parsed the whole log: 27 ms
-at one month, 1.5 s at one year. Partitioning plus the conditional read takes
-a one-year log from 1483 ms to 27 ms per budget check, and to zero file reads
-for anything that is not a monetary change.
 
 **`/healthz` returns 503 when a config reload was refused**, not 200 with a
 status field. The failure it exists to catch is silent: the server runs
@@ -387,12 +389,12 @@ failure becomes `TierLookupError`, which fails closed with the distinct
 non-admin who connects answers the question loudly, and nobody is
 over-privileged in the meantime.
 
-**Settle it before flipping `roles.yaml` to `mode: google_ads`** - have one
-STANDARD or READ_ONLY user connect and call `health_check`. If the model
-breaks, the fallback is a read-only service credential used *solely* for the
-role lookup, with every actual read and write still on the user's own token;
-`OverridingTierResolver` keeps the team working in the meantime via a
-deliberate, in-git `users:` entry.
+**Settle it on the first read-only deploy** - have one STANDARD or READ_ONLY
+user connect and call `health_check`. Do that with `GADS_WRITE_ENABLED=false`,
+so the question is answered with no money at stake. If the model breaks, the
+fallback is a read-only service credential used *solely* for the role lookup,
+with every actual read and write still on the user's own token; the
+break-glass map in `config/roles.yaml` keeps the team working meanwhile.
 
 **Human approval is now enforced by the server, via MCP elicitation.**
 `confirm_and_apply` stops and asks the client to show the preview to a
@@ -408,10 +410,6 @@ Not yet exercised against Claude's own connector UI - if it turns out not to
 support elicitation, writes will refuse rather than misbehave, and the
 setting is the deliberate escape hatch.
 
-**`roles.yaml` is `mode: file` for local development.** `google_ads` needs
-live credentials to resolve any tier at all. The Google Ads resolver is built,
-tested and boots in both modes; switching back is one word.
-
 **Phases 4 and 5 have never touched a real Google Ads account.** Every test uses a
 fake executor, or a real `GoogleAdsClient` built offline with only
 `mutate_campaigns` replaced. So the proto construction, enum lookup,
@@ -422,14 +420,6 @@ pause one campaign that does not matter. `MutationRequest.validate_only` exists 
 against Google and is wired through the executor, but `confirm_and_apply`
 always sends `validate_only=False` - a validate-only tool is a Phase 6
 decision, not a silent flag.
-
-**The two tier percentages behind the daily ceiling were chosen, not
-measured.** `DAILY_INCREASE_PERCENT_BY_TIER` in `safety/policy.py` sets
-operator at 10% and lead at 25% of the account's total daily budget. They
-preserve the old operator/lead ordering and are the right SHAPE, but no real
-account has been observed against them. Worth a look once real traffic exists:
-too tight and the team works around them, too loose and the ceiling stops
-bounding the day.
 
 **A managed-account lookup now sits on the gate path.** It is cached for 300s
 and shared across callers, and failures are never cached, but it means the
@@ -449,7 +439,7 @@ so this should be invisible; if it is not, the TTL is the knob.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 407 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 410 tests, no network, no credentials
 curl -s localhost:8081/healthz          # 200 ok / 503 degraded, no auth needed
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env (roles.yaml hot-reloads)

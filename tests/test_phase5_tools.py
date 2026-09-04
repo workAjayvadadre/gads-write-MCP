@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeBudgetReader, FakeManagedAccounts
+from conftest import FakeManagedAccounts
 import yaml
 from fastmcp import Client, FastMCP
 from fastmcp.client.elicitation import ElicitResult
@@ -151,11 +151,6 @@ class Harness:
     tiers: MutableTier
     caller: CallerBox
     audit_path: Path
-    # Exposed so a test can shrink the account's total daily budget between
-    # draft and confirm. That total is the base of the per-user daily ceiling,
-    # so lowering it tightens the rule - which is what tightening policy.yaml
-    # used to do, before the limits stopped living in a file.
-    budgets: FakeBudgetReader
 
 
 @pytest.fixture
@@ -175,12 +170,10 @@ def linked(tmp_path):
         policy_store = PolicyStore(settings)
         audit_log = AuditLog(settings.audit_log_path)
         tiers = MutableTier(tier)
-        budgets = FakeBudgetReader()
         guard = Guard(
             settings=settings, policy_store=policy_store, tier_resolver=tiers,
             audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
             managed_accounts=FakeManagedAccounts(),
-            reader=budgets,
         )
         caller = CallerBox()
         reader = FakeReader()
@@ -202,7 +195,7 @@ def linked(tmp_path):
         )
         return Harness(
             mcp=mcp, reader=reader, executor=executor, tiers=tiers,
-            caller=caller, audit_path=settings.audit_log_path, budgets=budgets,
+            caller=caller, audit_path=settings.audit_log_path,
         )
 
     return _build
@@ -346,9 +339,9 @@ async def test_a_wildly_larger_budget_is_still_refused(linked) -> None:
     with pytest.raises(Exception) as caught:
         await _call(
             h.mcp, "update_campaign_budget",
-            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 2001},
+            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 50000},
         )
-    assert "exceeds the limit" in str(caught.value)
+    assert "backstop" in str(caught.value)
     assert h.executor.applied == []
 
 
@@ -365,13 +358,13 @@ async def test_a_lower_budget_is_no_longer_refused(linked) -> None:
 
 
 async def test_too_large_a_percentage_jump_is_refused(linked) -> None:
-    """The load-bearing rule now: never more than double in one change.
-    Current is 100, so 300 is +200%."""
+    """The typo backstop. Current is 100, so 5,000 is a fiftyfold jump - the
+    shape of a stray digit, not of an intended change."""
     h = linked(Tier.OPERATOR)
     with pytest.raises(Exception) as caught:
         await _call(
             h.mcp, "update_campaign_budget",
-            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 300},
+            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 5000},
         )
     assert "%" in str(caught.value)
 
@@ -470,48 +463,31 @@ async def test_the_daily_ceiling_accumulates_across_changes(linked) -> None:
 # are re-established at confirm time, not just the target.
 
 
-async def test_a_plan_is_refused_once_the_ceiling_tightens(linked) -> None:
-    """Drafted at 120 while the account's 10,000 total gave the operator a
-    1,000 daily ceiling. The account's budgets are then cut to 100, dropping
-    that ceiling to 10. Confirming afterwards must be refused: the plan
-    carried intent, not a permission.
-
-    This is the regression test for the hole described in tools/operations.py
-    - confirm re-running a strictly weaker check than draft. What tightens has
-    changed (there is no policy.yaml to edit any more), but the property is
-    the same: every money rule is re-evaluated at confirm, against the numbers
-    as they are NOW.
-    """
-    h = linked(Tier.OPERATOR)
-    draft = await _call(
-        h.mcp, "update_campaign_budget",
-        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
-    )
-
-    h.budgets.set_total_units(100)
-
-    with pytest.raises(Exception) as caught:
-        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
-
-    assert "ceiling" in str(caught.value)
-    assert h.executor.applied == []
+# Two tests stood here proving a plan is refused once the daily ceiling
+# tightens, and that a refused plan is not consumed. The ceiling is no longer
+# a limit, so there is nothing to tighten.
+#
+# The property they protected - that confirm RE-EVALUATES rather than trusting
+# the plan - is still pinned by the demotion test in test_write_tools.py and
+# by the re-read tests below, which refuse a plan once the CURRENT budget has
+# moved under it.
 
 
 async def test_a_refused_plan_is_not_consumed(linked) -> None:
-    """Refused by policy is not the same as used up. If the ceiling widens
-    again, the same plan_id must still be confirmable - otherwise a momentary
-    tightening silently destroys work people already approved."""
+    """Refused is not the same as used up. If the refusal is lifted a minute
+    later, the same plan must still be confirmable - otherwise a momentary
+    problem silently destroys work someone already approved."""
     h = linked(Tier.OPERATOR)
     draft = await _call(
         h.mcp, "update_campaign_budget",
         {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
     )
 
-    h.budgets.set_total_units(100)
+    h.tiers.tier = Tier.READONLY
     with pytest.raises(Exception):
         await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
 
-    h.budgets.set_total_units(10_000)
+    h.tiers.tier = Tier.OPERATOR
     applied = await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
 
     assert applied["applied"] is True
@@ -615,49 +591,40 @@ async def test_exactly_one_target_is_required(linked, args) -> None:
 # keywords
 # ===========================================================================
 
-async def test_broad_match_is_refused_on_manual_cpc(linked) -> None:
-    """rules.block_broad_match_with_manual_cpc - the classic money burner."""
+async def test_broad_match_on_manual_cpc_warns_but_goes_through(linked) -> None:
+    """The Google Ads UI permits this, so this server does too.
+
+    It used to be refused. Refusing something the UI allows is the kind of
+    block that makes people work around the tool; the risk goes on the
+    preview and the person approving decides.
+    """
     h = linked(Tier.LEAD)
     h.reader.bidding_strategy = "MANUAL_CPC"
-    with pytest.raises(Exception) as caught:
-        await _call(
-            h.mcp, "add_keyword",
-            {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
-             "keyword_text": "ivf", "match_type": "BROAD"},
-        )
-    assert "broad match is not permitted" in str(caught.value)
 
-
-async def test_broad_match_is_fine_on_automated_bidding(linked) -> None:
-    h = linked(Tier.LEAD)
-    h.reader.bidding_strategy = "TARGET_CPA"
     payload = await _call(
         h.mcp, "add_keyword",
         {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
          "keyword_text": "ivf", "match_type": "BROAD"},
     )
+
     assert payload["plan_id"]
+    assert "WARNING" in payload["preview"]
+    assert "broad match" in payload["preview"].lower()
+    assert h.executor.applied == []
 
 
-async def test_a_keyword_is_refused_once_the_campaign_moves_to_manual_cpc(linked) -> None:
-    """Broad match was legitimate when drafted, because the ad group was on an
-    automated strategy. Moving it to manual CPC before confirming makes the
-    same keyword the thing rules.block_broad_match_with_manual_cpc forbids."""
+async def test_no_broad_match_warning_on_automated_bidding(linked) -> None:
     h = linked(Tier.LEAD)
-    h.reader.bidding_strategy = "MAXIMIZE_CONVERSIONS"
-    draft = await _call(
+    h.reader.bidding_strategy = "TARGET_CPA"
+
+    payload = await _call(
         h.mcp, "add_keyword",
         {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
-         "keyword_text": "fertility clinic", "match_type": "BROAD"},
+         "keyword_text": "ivf", "match_type": "BROAD"},
     )
 
-    h.reader.bidding_strategy = "MANUAL_CPC"
-
-    with pytest.raises(Exception) as caught:
-        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
-
-    assert "broad match" in str(caught.value).lower()
-    assert h.executor.applied == []
+    assert payload["plan_id"]
+    assert "broad match" not in payload["preview"].lower()
 
 
 async def test_a_new_keyword_is_created_paused(linked) -> None:
@@ -729,9 +696,9 @@ async def test_a_wildly_larger_bid_is_still_refused(linked) -> None:
     with pytest.raises(Exception) as caught:
         await _call(
             h.mcp, "update_ad_group_bid",
-            {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 201},
+            {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 5000},
         )
-    assert "exceeds the limit" in str(caught.value)
+    assert "backstop" in str(caught.value)
     assert h.executor.applied == []
 
 
@@ -915,8 +882,7 @@ async def test_the_kill_switch_hides_every_phase5_tool(tmp_path) -> None:
     tiers = MutableTier(Tier.LEAD)
     guard = Guard(settings=settings, policy_store=policy_store, tier_resolver=tiers,
                   audit_log=audit_log, spend_ledger=DailySpendLedger(audit_log),
-                  managed_accounts=FakeManagedAccounts(),
-                  reader=FakeBudgetReader())
+                  managed_accounts=FakeManagedAccounts())
     caller = CallerBox()
     mcp = FastMCP(name="test")
     mcp.add_middleware(
@@ -932,3 +898,33 @@ async def test_the_kill_switch_hides_every_phase5_tool(tmp_path) -> None:
     for tool in ("update_campaign_budget", "add_negative_keyword", "add_keyword",
                  "update_ad_group_bid", "create_responsive_search_ad"):
         assert tool not in names
+
+
+async def test_the_budget_preview_shows_todays_running_total(linked) -> None:
+    """Information, not a limit.
+
+    The daily ceiling used to REFUSE past a percentage of the account's
+    total, which blocked ordinary work - raising five campaigns for a
+    seasonal push stopped after the second. The number is still worth
+    seeing, so the person approving gets it and decides.
+    """
+    h = linked(Tier.OPERATOR)
+    payload = await _call(
+        h.mcp, "update_campaign_budget",
+        {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 120},
+    )
+    assert "increases today would total" in payload["preview"]
+
+
+async def test_many_budget_raises_in_one_day_are_not_blocked(linked) -> None:
+    """A seasonal push across campaigns. Trivial in the Google Ads UI, and it
+    must be trivial here - this is exactly what the daily ceiling blocked."""
+    h = linked(Tier.OPERATOR)
+    for _ in range(5):
+        draft = await _call(
+            h.mcp, "update_campaign_budget",
+            {"customer_id": ACCOUNT, "campaign_id": CAMPAIGN, "new_daily_budget": 200},
+        )
+        await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert len(h.executor.applied) == 5

@@ -1,16 +1,15 @@
 """The spending rules, and the pure functions that evaluate them.
 
-There is no policy file, so there is nothing here about parsing, hot-reload,
-or a refused edit. What is left is the part that was always the point: given
-a snapshot and a proposed change, is it allowed, and exactly where is the
-boundary.
+The design principle: a person should be able to do here what they could
+already do in the Google Ads UI. The UI has no guardrails - the control there
+is the human. Here the human is still the control, but sees a preview first
+and must accept it.
 
-The rules are now RELATIVE, which is what let the config file go. Both of
-them scale with the account rather than with a number somebody typed:
+So there is very little left to refuse, and these tests are mostly about
+proving that ordinary work is NOT blocked:
 
-    per change   the increase may not exceed max_increase_percent
-    per day      this user's total increases today may not exceed a
-                 percentage of the account's own total daily budget
+    per change   an increase past `max_increase_percent`, which is a typo
+                 backstop set far above normal work - not an operating limit
 """
 
 from __future__ import annotations
@@ -22,24 +21,17 @@ import pytest
 
 from gads_write.auth.tiers import Tier
 from gads_write.safety.policy import (
-    DAILY_INCREASE_PERCENT_BY_TIER,
     Policy,
     PolicyStore,
     build_policy,
     evaluate_bid_change,
     evaluate_budget_change,
-    evaluate_match_type_against_bidding,
+    broad_match_warning,
     evaluate_operation,
 )
 from gads_write.settings import Settings
 
-# The account every case below is measured against: 10,000 total daily budget.
-# At the fixed tier percentages that makes the ceilings 1,000 for an operator
-# and 2,500 for a lead.
-ACCOUNT_TOTAL = Decimal(10_000)
-
-
-def _settings(tmp_path: Path, *, max_increase_percent: int = 100) -> Settings:
+def _settings(tmp_path: Path, *, max_increase_percent: int = 1000) -> Settings:
     return Settings(
         env="test",
         host="127.0.0.1",
@@ -58,12 +50,11 @@ def _settings(tmp_path: Path, *, max_increase_percent: int = 100) -> Settings:
     )
 
 
-def _policy(*, max_increase_percent: int = 100, total=ACCOUNT_TOTAL) -> Policy:
-    policy = build_policy(
+def _policy(*, max_increase_percent: int = 1000) -> Policy:
+    return build_policy(
         max_increase_percent=Decimal(max_increase_percent),
         allowed_final_url_domains=frozenset({"indiraivf.com"}),
     ).for_account(currency_code="INR", timezone="Asia/Kolkata")
-    return policy.with_account_budget(total)
 
 
 # ---------------------------------------------------------------------------
@@ -80,20 +71,12 @@ def test_the_increase_percent_comes_from_settings(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("tier", [Tier.NONE, Tier.READONLY])
 def test_non_writing_tiers_are_pinned_to_zero_in_code(tier: Tier) -> None:
-    """Not trusted to any table. There is no file to omit their block now,
-    but pinning here is what makes the guarantee independent of how
-    DAILY_INCREASE_PERCENT_BY_TIER is edited."""
+    """Not trusted to any table or setting. A zero backstop refuses every
+    increase, which is what `none` and `readonly` mean. Pinning it here makes
+    the guarantee independent of GADS_MAX_INCREASE_PERCENT."""
     limits = _policy().limits_for(tier)
     assert limits.budget.max_increase_percent == Decimal(0)
-    assert limits.budget.max_total_increase_percent_of_account == Decimal(0)
     assert limits.bids.max_increase_percent == Decimal(0)
-
-
-def test_a_lead_has_more_daily_headroom_than_an_operator() -> None:
-    assert (
-        DAILY_INCREASE_PERCENT_BY_TIER[Tier.LEAD]
-        > DAILY_INCREASE_PERCENT_BY_TIER[Tier.OPERATOR]
-    )
 
 
 def test_the_store_exposes_no_reload_error(tmp_path: Path) -> None:
@@ -131,16 +114,16 @@ def test_blocked_operation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# budget: the per-change percentage
+# budget: the typo backstop, and everything it deliberately does NOT block
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "new_units, allowed",
     [
-        ("2000", True),  # exactly +100%, inclusive
-        ("2000.01", False),  # a hair over
-        ("1500", True),
+        ("11000", True),   # exactly +1000%, inclusive
+        ("11000.01", False),
+        ("5000", True),
     ],
 )
 def test_increase_percent_boundary(new_units: str, allowed: bool) -> None:
@@ -150,41 +133,62 @@ def test_increase_percent_boundary(new_units: str, allowed: bool) -> None:
     assert verdict.allowed is allowed
 
 
-def test_the_percentage_is_relative_so_it_holds_at_any_scale() -> None:
-    """The property that let the absolute caps go: one rule, correct for a
-    tiny campaign and a huge one, with nothing to configure."""
-    policy = _policy(total=Decimal(10_000_000))
+def test_ordinary_work_is_not_blocked() -> None:
+    """The whole point of raising the backstop.
+
+    A campaign sitting at 500 from a test, raised to 5,000 for a festive
+    push, is a ten-second job in the Google Ads UI. Under the old 100% cap it
+    took four days. It must go through in one step.
+    """
     assert evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units="100", new_units="200"
-    ).allowed
-    assert evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units="100000", new_units="200000"
-    ).allowed
-    assert not evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units="100000", new_units="300000"
+        _policy(), tier=Tier.OPERATOR, current_units="500", new_units="5000"
     ).allowed
 
 
-def test_there_is_no_absolute_ceiling_on_a_single_budget() -> None:
-    """max_daily is gone. A large budget on a large account is ordinary, and
-    refusing it was refusing every real campaign this server manages."""
+def test_a_stray_digit_is_still_caught() -> None:
+    """What the backstop is actually for.
+
+    The server never sees what the person ASKED for - a tool call carries a
+    number, never the conversation - so magnitude is all it can judge. 5,000
+    and 500,000 look alike to someone approving in a hurry.
+    """
     verdict = evaluate_budget_change(
-        _policy(total=Decimal(1_000_000)),
-        tier=Tier.LEAD,
-        current_units="50000",
-        new_units="60000",
+        _policy(), tier=Tier.OPERATOR, current_units="500", new_units="500000"
     )
-    assert verdict.allowed
+    assert not verdict.allowed
+    assert "backstop" in verdict.describe()
+
+
+def test_a_large_budget_on_a_large_account_is_ordinary() -> None:
+    assert evaluate_budget_change(
+        _policy(), tier=Tier.LEAD, current_units="50000", new_units="60000"
+    ).allowed
+
+
+def test_the_backstop_is_relative_so_it_holds_at_any_scale() -> None:
+    for current, new in (("100", "1000"), ("100000", "1000000")):
+        assert evaluate_budget_change(
+            _policy(), tier=Tier.LEAD, current_units=current, new_units=new
+        ).allowed
+
+
+def test_there_is_no_daily_ceiling_any_more() -> None:
+    """It blocked ordinary work: raising five campaigns for a seasonal push
+    stopped after the second. The running total is shown on the preview
+    instead, and the person approving decides."""
+    for _ in range(10):
+        assert evaluate_budget_change(
+            _policy(), tier=Tier.OPERATOR, current_units="1000", new_units="2000"
+        ).allowed
 
 
 def test_a_decrease_is_never_blocked() -> None:
-    """There is no minimum any more. Lowering a budget is the one change that
-    can only ever reduce spend, so refusing it protected nothing."""
+    """There is no minimum. Lowering a budget is the one change that can only
+    ever reduce spend, so refusing it protected nothing."""
     for new_units in ("1", "0.01", "500"):
-        verdict = evaluate_budget_change(
+        assert evaluate_budget_change(
             _policy(), tier=Tier.OPERATOR, current_units="1000", new_units=new_units
-        )
-        assert verdict.allowed, new_units
+        ).allowed, new_units
 
 
 def test_zero_is_still_refused() -> None:
@@ -201,115 +205,10 @@ def test_raising_from_zero_is_refused_rather_than_treated_as_zero_percent() -> N
     assert "undefined" in verdict.describe()
 
 
-# ---------------------------------------------------------------------------
-# budget: the daily ceiling
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "already_today, allowed",
-    [
-        ("0", True),
-        ("900", True),  # 900 + 100 = 1000, exactly the operator ceiling
-        ("900.01", False),
-    ],
-)
-def test_daily_ceiling_boundary(already_today: str, allowed: bool) -> None:
-    verdict = evaluate_budget_change(
-        _policy(),
-        tier=Tier.OPERATOR,
-        current_units="1000",
-        new_units="1100",  # +100
-        already_increased_today_units=already_today,
-    )
-    assert verdict.allowed is allowed
-
-
-def test_the_ceiling_scales_with_the_account() -> None:
-    """The whole point of expressing it as a percentage: the same rule is
-    right for a small account and a large one, with nothing to update."""
-    small = evaluate_budget_change(
-        _policy(total=Decimal(1_000)),
-        tier=Tier.OPERATOR,
-        current_units="1000",
-        new_units="1200",  # +200, over 10% of 1,000
-    )
-    large = evaluate_budget_change(
-        _policy(total=Decimal(100_000)),
-        tier=Tier.OPERATOR,
-        current_units="1000",
-        new_units="1200",  # +200, well under 10% of 100,000
-    )
-    assert not small.allowed
-    assert large.allowed
-
-
-def test_the_ceiling_counts_the_proposed_change_too() -> None:
-    """Otherwise the last change of the day is always free."""
-    verdict = evaluate_budget_change(
-        _policy(),
-        tier=Tier.OPERATOR,
-        current_units="1000",
-        new_units="1600",  # +600
-        already_increased_today_units="600",  # 1,200 total, over 1,000
-    )
-    assert not verdict.allowed
-
-
-def test_a_lead_has_a_higher_ceiling_than_an_operator() -> None:
-    # +1,500: over the operator's 1,000 ceiling, under the lead's 2,500.
-    change = dict(current_units="2000", new_units="3500", already_increased_today_units="0")
-    assert not evaluate_budget_change(_policy(), tier=Tier.OPERATOR, **change).allowed
-    assert evaluate_budget_change(_policy(), tier=Tier.LEAD, **change).allowed
-
-
-def test_an_unknown_account_total_refuses_rather_than_skipping_the_ceiling() -> None:
-    """`None` means the read failed. Skipping the rule would silently turn a
-    Google hiccup into an unbounded change."""
-    policy = _policy().with_account_budget(None)
-    verdict = evaluate_budget_change(
-        policy, tier=Tier.OPERATOR, current_units="1000", new_units="1100"
-    )
-    assert not verdict.allowed
-    assert "could not be established" in verdict.describe()
-
-
-def test_a_zero_account_total_is_zero_headroom_not_no_ceiling() -> None:
-    """The one fail-OPEN direction this rule could have had.
-
-    An account with no live budget has no base to measure a percentage
-    against. Skipping the ceiling would have permitted an increase of any
-    size; the correct reading is that there is no headroom at all.
-    """
-    policy = _policy(total=Decimal(0))
-    verdict = evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units="1000", new_units="1100"
-    )
-    assert not verdict.allowed
-    assert "no live daily budget" in verdict.describe()
-
-
-def test_a_zero_account_total_still_permits_a_decrease() -> None:
-    policy = _policy(total=Decimal(0))
-    assert evaluate_budget_change(
-        policy, tier=Tier.LEAD, current_units="1000", new_units="500"
-    ).allowed
-
-
-def test_an_unknown_account_total_still_permits_a_decrease() -> None:
-    """A decrease returns before the ceiling is consulted, so a failed read
-    never blocks the one change that can only reduce spend."""
-    policy = _policy().with_account_budget(None)
-    assert evaluate_budget_change(
-        policy, tier=Tier.OPERATOR, current_units="1000", new_units="500"
-    ).allowed
-
-
 def test_readonly_tier_is_refused_everything() -> None:
-    verdict = evaluate_budget_change(
+    assert not evaluate_budget_change(
         _policy(), tier=Tier.READONLY, current_units="1000", new_units="1001"
-    )
-    assert not verdict.allowed
+    ).allowed
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +218,7 @@ def test_readonly_tier_is_refused_everything() -> None:
 
 @pytest.mark.parametrize(
     "new_units, allowed",
-    [("100", True), ("200", True), ("200.01", False)],
+    [("100", True), ("1100", True), ("1100.01", False)],
 )
 def test_bid_increase_percent_boundary(new_units: str, allowed: bool) -> None:
     verdict = evaluate_bid_change(
@@ -361,26 +260,42 @@ def test_raising_a_bid_from_zero_is_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_broad_match_blocked_on_manual_cpc() -> None:
-    verdict = evaluate_match_type_against_bidding(
-        _policy(), match_type="BROAD", bidding_strategy="MANUAL_CPC"
+def test_broad_match_on_manual_cpc_warns_rather_than_refusing() -> None:
+    """The Google Ads UI permits this, so this server does too.
+
+    It used to be refused outright. Refusing something the UI allows is the
+    kind of block that makes people work around the tool; saying plainly why
+    it is risky and letting them decide is the position the UI leaves them
+    in, with more information rather than less.
+    """
+    warning = broad_match_warning(
+        match_type="BROAD", bidding_strategy="MANUAL_CPC"
     )
-    assert not verdict.allowed
+    assert warning is not None
+    assert "broad match" in warning.lower()
 
 
 @pytest.mark.parametrize(
     "match_type, strategy",
-    [("PHRASE", "MANUAL_CPC"), ("EXACT", "MANUAL_CPC"), ("BROAD", "MAXIMIZE_CONVERSIONS")],
+    [
+        ("PHRASE", "MANUAL_CPC"),
+        ("EXACT", "MANUAL_CPC"),
+        ("BROAD", "MAXIMIZE_CONVERSIONS"),
+    ],
 )
-def test_other_combinations_are_permitted(match_type: str, strategy: str) -> None:
-    assert evaluate_match_type_against_bidding(
-        _policy(), match_type=match_type, bidding_strategy=strategy
-    ).allowed
+def test_no_warning_for_other_combinations(match_type: str, strategy: str) -> None:
+    assert broad_match_warning(
+        match_type=match_type, bidding_strategy=strategy
+    ) is None
+
+
+def test_an_unreadable_bidding_strategy_produces_no_warning() -> None:
+    """Failing to establish an ADVISORY fact is not a reason to block a change
+    the UI would have allowed."""
+    assert broad_match_warning(match_type="BROAD", bidding_strategy="") is None
 
 
 def test_the_structural_rules_are_fixed_rather_than_configurable() -> None:
-    """These used to be settings. A setting nobody should ever change is not
+    """This used to be a setting. A setting nobody should ever change is not
     a setting - and "new keywords start ENABLED" is not a thing anyone wants."""
-    rules = _policy().rules
-    assert rules.new_entities_start_paused is True
-    assert rules.block_broad_match_with_manual_cpc is True
+    assert _policy().rules.new_entities_start_paused is True
