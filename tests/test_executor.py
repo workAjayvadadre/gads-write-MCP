@@ -18,6 +18,7 @@ The two things most worth asserting here:
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -40,7 +41,19 @@ BUDGET_RESOURCE = f"customers/{ACCOUNT}/campaignBudgets/777"
 
 
 class RecordingService:
-    """Delegates to the real service client; records every mutate_* call."""
+    """Delegates to the real service client; records every mutate_* call.
+
+    The fake BINDS AGAINST THE REAL METHOD SIGNATURE before recording, which
+    is the whole point. It used to be `def _mutate(**kwargs)`, which accepted
+    absolutely anything - so the executor passing `partial_failure=` and
+    `validate_only=` as keyword arguments looked fine here for the entire life
+    of the project, and only failed on the first real mutation ever attempted.
+    The generated clients take those as fields on the REQUEST, not as kwargs.
+
+    `Signature.bind` raises TypeError on exactly the arguments the real client
+    would reject, so that class of bug now fails the build instead of
+    production.
+    """
 
     def __init__(self, real, recorder: dict) -> None:
         self._real = real
@@ -50,9 +63,20 @@ class RecordingService:
         if not name.startswith("mutate"):
             return getattr(self._real, name)
 
-        def _mutate(**kwargs):
+        real_method = getattr(self._real, name)
+
+        def _mutate(*args, **kwargs):
+            # Raises TypeError for any argument the real client would refuse.
+            inspect.signature(real_method).bind(*args, **kwargs)
+
             self._recorder["method"] = name
             self._recorder["call"] = kwargs
+            # The request is a dict or a proto; normalise so assertions can
+            # read fields without caring which.
+            payload = kwargs.get("request") or (args[0] if args else {})
+            self._recorder["request"] = (
+                payload if isinstance(payload, dict) else payload
+            )
             if self._recorder.get("raise"):
                 raise self._recorder["raise"]
             names = self._recorder.get("resource_names", ["customers/x/things/1"])
@@ -108,7 +132,7 @@ async def _apply(operation: str, payload: dict, *, validate_only: bool = False):
 
 
 def _sent(rec) -> object:
-    return rec["call"]["operations"][0]
+    return rec["request"]["operations"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -261,12 +285,12 @@ async def test_an_rsa_without_urls_is_refused(rec) -> None:
 )
 async def test_partial_failure_is_off_for_every_operation(rec, operation, payload) -> None:
     await _apply(operation, payload)
-    assert rec["call"]["partial_failure"] is False
+    assert rec["request"]["partial_failure"] is False
 
 
 async def test_validate_only_returns_no_resource_names(rec) -> None:
     result = await _apply("pause_campaign", {"campaign_id": "55"}, validate_only=True)
-    assert rec["call"]["validate_only"] is True
+    assert rec["request"]["validate_only"] is True
     assert result.success is True
     assert result.resource_names == ()
     assert result.details["validate_only"] is True

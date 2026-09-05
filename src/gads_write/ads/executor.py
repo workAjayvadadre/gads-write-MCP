@@ -200,14 +200,27 @@ class GoogleAdsExecutor(Executor):
         from google.ads.googleads.errors import GoogleAdsException
 
         try:
+            # Both flags go in the REQUEST, never as keyword arguments. The
+            # generated clients accept only (request, customer_id, operations,
+            # retry, timeout, metadata) as kwargs; `partial_failure` and
+            # `validate_only` are fields on the request message. Passing them
+            # as kwargs raises TypeError before anything reaches Google, which
+            # is how the first live mutation this server ever attempted failed.
+            #
+            # A plain dict is coerced by the client into whichever
+            # Mutate*Request type that service expects, so this stays generic
+            # across all six services rather than naming each type.
             return call(
-                customer_id=request.customer_id,
-                # All-or-nothing. With partial_failure the API returns 200 and
-                # buries per-operation errors in the response body, which is
-                # exactly how a "successful" mutation silently does nothing.
-                partial_failure=False,
-                validate_only=request.validate_only,
-                **kwargs,
+                request={
+                    "customer_id": request.customer_id,
+                    # All-or-nothing. With partial_failure the API returns 200
+                    # and buries per-operation errors in the response body,
+                    # which is exactly how a "successful" mutation silently
+                    # does nothing.
+                    "partial_failure": False,
+                    "validate_only": request.validate_only,
+                    **kwargs,
+                }
             )
         except GoogleAdsException as exc:
             raise ExecutorError(_describe(exc)) from exc

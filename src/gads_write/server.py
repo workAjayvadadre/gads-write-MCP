@@ -298,7 +298,7 @@ async def health_check() -> dict:
         },
         "server": {
             "name": "gads-write-mcp",
-            "phase": "4 - pause/enable campaigns, two-step confirm",
+            "phase": "6 - all write tools live; two-step draft then confirm",
             "environment": SETTINGS.env,
             "base_url": SETTINGS.base_url,
             "google_ads_api_version": API_VERSION,
