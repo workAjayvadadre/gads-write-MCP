@@ -64,6 +64,8 @@ from .operations import (
     validate_campaign_status_args,
 )
 
+from .registry import annotations_for
+
 logger = logging.getLogger(__name__)
 
 # tool name -> the status it will set. Mirrors
@@ -345,7 +347,7 @@ def register_write_tools(
     # budgets
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('update_campaign_budget'))
     async def update_campaign_budget(
         customer_id: str, campaign_id: str, new_daily_budget: float
     ) -> dict:
@@ -463,7 +465,7 @@ def register_write_tools(
     # negative keywords
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('add_negative_keyword'))
     async def add_negative_keyword(
         customer_id: str,
         keyword_text: str,
@@ -560,7 +562,7 @@ def register_write_tools(
     # keywords
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('add_keyword'))
     async def add_keyword(
         customer_id: str, ad_group_id: str, keyword_text: str, match_type: str
     ) -> dict:
@@ -643,7 +645,7 @@ def register_write_tools(
     # bids
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('update_ad_group_bid'))
     async def update_ad_group_bid(
         customer_id: str, ad_group_id: str, new_max_cpc: float
     ) -> dict:
@@ -716,7 +718,7 @@ def register_write_tools(
     # responsive search ads
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('create_responsive_search_ad'))
     async def create_responsive_search_ad(
         customer_id: str,
         ad_group_id: str,
@@ -800,7 +802,7 @@ def register_write_tools(
             extra={"created_status": status, "ad_group_id": ad_group.ad_group_id},
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('pause_campaign'))
     async def pause_campaign(customer_id: str, campaign_id: str) -> dict:
         """Draft a change that pauses one campaign. Does NOT pause it.
 
@@ -810,7 +812,7 @@ def register_write_tools(
         """
         return await _draft_status_change("pause_campaign", customer_id, campaign_id)
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('enable_campaign'))
     async def enable_campaign(customer_id: str, campaign_id: str) -> dict:
         """Draft a change that enables one campaign. Does NOT enable it.
 

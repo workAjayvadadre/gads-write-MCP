@@ -54,6 +54,8 @@ from ..safety.validators import (
     validate_row_limit,
 )
 
+from .registry import annotations_for
+
 logger = logging.getLogger(__name__)
 
 # How many accounts list_accounts will describe in one call. There is no
@@ -130,7 +132,7 @@ def register_read_tools(
     # list_accounts
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('list_accounts'))
     async def list_accounts() -> dict:
         """List the Google Ads accounts you may work with, and your access on each.
 
@@ -205,7 +207,7 @@ def register_read_tools(
     # get_campaign_performance
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('get_campaign_performance'))
     async def get_campaign_performance(
         customer_id: str,
         days: int = DEFAULT_REPORT_DAYS,
@@ -297,7 +299,7 @@ def register_read_tools(
     # get_search_terms
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('get_search_terms'))
     async def get_search_terms(
         customer_id: str,
         days: int = DEFAULT_REPORT_DAYS,

@@ -62,6 +62,55 @@ def unknown_tool_spec(name: str) -> ToolSpec:
     return ToolSpec(name=name, required_tier=Tier.LEAD, writes=True, operation=name)
 
 
+def annotations_for(name: str) -> dict[str, object]:
+    """MCP annotations for a tool, derived from its registry entry.
+
+    Clients use these to group tools and to decide what needs approval:
+    Claude's connector settings render "Read-only tools" and "Write tools" as
+    separate blocks, each with one allow / ask / deny switch. Without them
+    every tool lands in a single "Other tools" bucket and a person wanting
+    "ask me before anything changes" must set that tool by tool.
+
+    That matters here specifically. Claude's connector does not support MCP
+    elicitation, so `GADS_REQUIRE_HUMAN_CONFIRMATION` is false in production
+    and the server can no longer force an approval prompt itself. These hints
+    are what let the CLIENT be configured to ask instead. A client may ignore
+    a hint, so this is not a server guarantee - it is the difference between
+    an approval step being one setting and being twelve.
+
+    Derived, never hand-written, so `writes` and `readOnlyHint` cannot drift
+    apart: the gate and the client read one source.
+
+    The destructive/read-only split follows what each tool actually does:
+
+      reads                  touch nothing
+      draft writes           create a PLAN. They do not touch Google Ads, so
+                             they are not read-only but they are not
+                             destructive either
+      confirm_and_apply      the ONLY tool that mutates an account
+
+    Marking the drafts destructive would train people to dismiss the prompt
+    that actually matters.
+    """
+    spec = spec_for(name)
+    # An unregistered tool is assumed to be the worst thing it could be, the
+    # same way spec_for() already assumes lead+writes. `applies_plan` keeps
+    # its literal meaning on ToolSpec ("carries a plan_id"); the caution
+    # lives here rather than being smuggled into that field.
+    destructive = spec.applies_plan or not is_registered(name)
+    return {
+        "readOnlyHint": not spec.writes,
+        # Only the apply step changes anything in Google Ads.
+        "destructiveHint": destructive,
+        # Plans are single-use and consumed before execution, so repeating an
+        # apply is refused rather than being a no-op. Reads may be repeated
+        # freely; a draft creates a new plan each time.
+        "idempotentHint": not spec.writes,
+        # Everything here reaches Google Ads, which this server does not own.
+        "openWorldHint": True,
+    }
+
+
 def spec_for(name: str) -> ToolSpec:
     return _REGISTRY.get(name) or unknown_tool_spec(name)
 

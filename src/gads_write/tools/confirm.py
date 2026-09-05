@@ -67,6 +67,8 @@ from ..auth.identity import current_caller
 from ..safety.plans import PlanError, PlanStore
 from .operations import OPERATIONS, ReadKind, read_current
 
+from .registry import annotations_for
+
 logger = logging.getLogger(__name__)
 
 
@@ -122,7 +124,7 @@ def register_confirm_tool(
 ) -> None:
     """Define confirm_and_apply on `mcp`."""
 
-    @mcp.tool
+    @mcp.tool(annotations=annotations_for('confirm_and_apply'))
     async def confirm_and_apply(plan_id: str, ctx: Context) -> dict:
         """Apply a previously drafted change. THIS ONE ACTUALLY CHANGES THINGS.
 

@@ -47,6 +47,7 @@ from .safety.plans import PlanStore
 from .safety.policy import PolicyStore
 from .safety.spend import DailySpendLedger
 from .settings import ConfigError, Settings, load_settings
+from .tools.registry import annotations_for
 from .tools.confirm import register_confirm_tool
 from .tools.reads import register_read_tools
 from .tools.writes import register_write_tools
@@ -256,7 +257,7 @@ register_confirm_tool(
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool
+@mcp.tool(annotations=annotations_for('health_check'))
 async def health_check() -> dict:
     """Report who you are, what you may do, and whether writes are enabled.
 
