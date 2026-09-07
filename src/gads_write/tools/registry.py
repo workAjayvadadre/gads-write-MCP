@@ -161,6 +161,17 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="get_search_terms", required_tier=Tier.READONLY, writes=False)
     )
 
+    # Discovery. Every write tool needs an id, and the performance report
+    # cannot supply one for a campaign or ad group that has never served -
+    # it filters on segments.date, so Google returns no rows for it. Without
+    # these two, finding an id meant opening the Google Ads UI.
+    register(
+        ToolSpec(name="list_campaigns", required_tier=Tier.READONLY, writes=False)
+    )
+    register(
+        ToolSpec(name="list_ad_groups", required_tier=Tier.READONLY, writes=False)
+    )
+
     # --- Phase 4 writes ----------------------------------------------------
     # `writes=True` puts these behind the kill switch: GADS_WRITE_ENABLED
     # false hides them from tools/list and refuses them on tools/call.

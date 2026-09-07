@@ -266,6 +266,28 @@ class AdsReader(Protocol):
         self, *, customer_id: str, start_date: str, end_date: str, limit: int
     ) -> tuple[CampaignRow, ...]: ...
 
+    async def list_campaigns(self, customer_id: str) -> tuple[CampaignSummary, ...]:
+        """Every campaign in the account, whether or not it has ever served.
+
+        Deliberately NOT a performance report. `campaign_performance` filters
+        on `segments.date`, so Google returns rows only for campaign-days that
+        have data - which makes a newly created or long-dormant campaign
+        invisible. Every write tool needs an id, so that left no way to find
+        one without opening the Google Ads UI.
+        """
+        ...
+
+    async def list_ad_groups(
+        self, *, customer_id: str, campaign_id: str | None = None
+    ) -> tuple[AdGroupSummary, ...]:
+        """Ad groups in the account, optionally within one campaign.
+
+        Same reason as `list_campaigns`: `add_keyword` and
+        `update_ad_group_bid` both need an ad_group_id, and nothing else here
+        returns one for an ad group that has never served.
+        """
+        ...
+
     async def campaign_by_id(
         self, *, customer_id: str, campaign_id: str
     ) -> CampaignSummary | None:
@@ -488,6 +510,51 @@ class GoogleAdsReader(AdsReader):
             for row in rows
         )
 
+    async def list_campaigns(self, customer_id: str) -> tuple[CampaignSummary, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        # No date segment, so campaigns with no statistics still come back.
+        query = (
+            f"SELECT {CAMPAIGN_FIELDS} "
+            "FROM campaign "
+            "WHERE campaign.status != 'REMOVED' "
+            "ORDER BY campaign.name "
+            f"LIMIT {MAX_ROWS}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return tuple(_campaign_summary(row) for row in rows)
+
+    async def list_ad_groups(
+        self, *, customer_id: str, campaign_id: str | None = None
+    ) -> tuple[AdGroupSummary, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        where = ["ad_group.status != 'REMOVED'", "campaign.status != 'REMOVED'"]
+        if campaign_id is not None:
+            safe_campaign = _literal(campaign_id, field="campaign_id")
+            where.append(f"campaign.id = {safe_campaign}")
+
+        query = (
+            "SELECT ad_group.id, ad_group.name, ad_group.status, "
+            "ad_group.cpc_bid_micros, "
+            "campaign.id, campaign.name, campaign.bidding_strategy_type "
+            "FROM ad_group "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY campaign.name, ad_group.name "
+            f"LIMIT {MAX_ROWS}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return tuple(
+            AdGroupSummary(
+                ad_group_id=str(row.ad_group.id),
+                name=row.ad_group.name or "",
+                status=_enum_name(row.ad_group.status),
+                campaign_id=str(row.campaign.id),
+                campaign_name=row.campaign.name or "",
+                cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
+                bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+            )
+            for row in rows
+        )
+
     async def campaign_by_id(
         self, *, customer_id: str, campaign_id: str
     ) -> CampaignSummary | None:
@@ -495,10 +562,7 @@ class GoogleAdsReader(AdsReader):
         safe_campaign = _literal(campaign_id, field="campaign_id")
 
         query = (
-            "SELECT campaign.id, campaign.name, campaign.status, "
-            "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
-            "campaign_budget.resource_name, campaign_budget.id, "
-            "campaign_budget.amount_micros, campaign_budget.reference_count "
+            f"SELECT {CAMPAIGN_FIELDS} "
             "FROM campaign "
             f"WHERE campaign.id = {safe_campaign} "
             "LIMIT 1"
@@ -507,18 +571,7 @@ class GoogleAdsReader(AdsReader):
         if not rows:
             return None
 
-        row = rows[0]
-        return CampaignSummary(
-            campaign_id=str(row.campaign.id),
-            name=row.campaign.name or "",
-            status=_enum_name(row.campaign.status),
-            channel_type=_enum_name(row.campaign.advertising_channel_type),
-            daily_budget_micros=int(row.campaign_budget.amount_micros or 0),
-            budget_resource_name=row.campaign_budget.resource_name or "",
-            budget_id=str(row.campaign_budget.id or ""),
-            budget_reference_count=int(row.campaign_budget.reference_count or 0),
-            bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
-        )
+        return _campaign_summary(rows[0])
 
     async def ad_group_by_id(
         self, *, customer_id: str, ad_group_id: str
@@ -595,6 +648,33 @@ class GoogleAdsReader(AdsReader):
             )
             for row in rows
         )
+
+
+# The campaign fields every campaign read selects. One constant so a field
+# added for the single-campaign lookup cannot go missing from the listing,
+# which would surface as an AttributeError on a row rather than a clear error.
+CAMPAIGN_FIELDS = (
+    "campaign.id, campaign.name, campaign.status, "
+    "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
+    "campaign_budget.resource_name, campaign_budget.id, "
+    "campaign_budget.amount_micros, campaign_budget.reference_count"
+)
+
+
+def _campaign_summary(row: Any) -> CampaignSummary:
+    """Map one campaign row. Shared by `campaign_by_id` and `list_campaigns`
+    so the two can never disagree about a field."""
+    return CampaignSummary(
+        campaign_id=str(row.campaign.id),
+        name=row.campaign.name or "",
+        status=_enum_name(row.campaign.status),
+        channel_type=_enum_name(row.campaign.advertising_channel_type),
+        daily_budget_micros=int(row.campaign_budget.amount_micros or 0),
+        budget_resource_name=row.campaign_budget.resource_name or "",
+        budget_id=str(row.campaign_budget.id or ""),
+        budget_reference_count=int(row.campaign_budget.reference_count or 0),
+        bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+    )
 
 
 def _enum_name(value: object) -> str:

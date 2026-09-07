@@ -91,6 +91,13 @@ def _today_in_timezone(timezone_name: str) -> date:
     return date.fromisoformat(stamp)
 
 
+def _customer_only(customer_id: str) -> ValidationResult:
+    """The whole validation for a tool whose only argument is an account."""
+    result = ValidationResult()
+    result.extend(validate_customer_id(customer_id))
+    return result
+
+
 def register_read_tools(
     mcp: Any,
     *,
@@ -202,6 +209,100 @@ def register_read_tools(
                 f"this tool describes at most {MAX_ACCOUNTS_LISTED} per call."
             )
         return result
+
+    # ------------------------------------------------------------------
+    # list_campaigns / list_ad_groups
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("list_campaigns"))
+    async def list_campaigns(customer_id: str) -> dict:
+        """Every campaign in an account, including ones that have never run.
+
+        Use this to find a campaign_id. Unlike get_campaign_performance this
+        is not a report and carries no metrics, so it also shows paused and
+        newly created campaigns that have never served.
+        """
+        decision = await _gate(
+            tool="list_campaigns",
+            customer_id=str(customer_id).strip(),
+            arguments={"customer_id": customer_id},
+            validate=lambda _: _customer_only(customer_id),
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        rows = await reader.list_campaigns(str(customer_id).strip())
+        return {
+            "ok": True,
+            "customer_id": str(customer_id).strip(),
+            "currency_code": code,
+            "campaign_count": len(rows),
+            "campaigns": [
+                {
+                    "campaign_id": row.campaign_id,
+                    "name": row.name,
+                    "status": row.status,
+                    "channel_type": row.channel_type,
+                    "daily_budget": _money(row.daily_budget_micros, code),
+                    "daily_budget_micros": row.daily_budget_micros,
+                    "bidding_strategy": row.bidding_strategy_type,
+                    # A shared budget cannot be changed through this server:
+                    # the preview would name one campaign and change several.
+                    "budget_is_shared": row.budget_reference_count > 1,
+                }
+                for row in rows
+            ],
+        }
+
+    @mcp.tool(annotations=annotations_for("list_ad_groups"))
+    async def list_ad_groups(
+        customer_id: str, campaign_id: str | None = None
+    ) -> dict:
+        """Ad groups in an account, optionally within one campaign.
+
+        Use this to find an ad_group_id, which add_keyword and
+        update_ad_group_bid both require. Shows ad groups that have never
+        served, which the performance reports cannot.
+        """
+        def validate(_: Policy) -> ValidationResult:
+            result = _customer_only(customer_id)
+            if campaign_id is not None:
+                result.extend(
+                    validate_numeric_id(campaign_id, field_name="campaign_id")
+                )
+            return result
+
+        decision = await _gate(
+            tool="list_ad_groups",
+            customer_id=str(customer_id).strip(),
+            arguments={"customer_id": customer_id, "campaign_id": campaign_id},
+            validate=validate,
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        rows = await reader.list_ad_groups(
+            customer_id=str(customer_id).strip(),
+            campaign_id=None if campaign_id is None else str(campaign_id).strip(),
+        )
+        return {
+            "ok": True,
+            "customer_id": str(customer_id).strip(),
+            "ad_group_count": len(rows),
+            "ad_groups": [
+                {
+                    "ad_group_id": row.ad_group_id,
+                    "name": row.name,
+                    "status": row.status,
+                    "campaign_id": row.campaign_id,
+                    "campaign_name": row.campaign_name,
+                    "max_cpc": _money(row.cpc_bid_micros, code),
+                    "max_cpc_micros": row.cpc_bid_micros,
+                    "bidding_strategy": row.bidding_strategy_type,
+                }
+                for row in rows
+            ],
+        }
 
     # ------------------------------------------------------------------
     # get_campaign_performance

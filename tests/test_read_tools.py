@@ -21,7 +21,14 @@ import pytest
 from conftest import FakeManagedAccounts
 from fastmcp import Client, FastMCP
 
-from gads_write.ads.reads import AccountSummary, AdsReadError, CampaignRow, SearchTermRow
+from gads_write.ads.reads import (
+    AccountSummary,
+    AdGroupSummary,
+    AdsReadError,
+    CampaignRow,
+    CampaignSummary,
+    SearchTermRow,
+)
 from gads_write.auth.tiers import Tier
 from gads_write.mcp_middleware import TierMiddleware
 from gads_write.safety.audit import AuditLog
@@ -61,6 +68,8 @@ class FakeReader:
         self.unreachable: set[str] = set()
         self.campaign_calls: list[dict] = []
         self.search_term_calls: list[dict] = []
+        self.list_campaign_calls: list[str] = []
+        self.list_ad_group_calls: list[dict] = []
 
     async def accessible_customer_ids(self):
         return (ACCOUNT,)
@@ -80,6 +89,48 @@ class FakeReader:
 
     async def access_role(self, *, customer_id: str, email: str):
         return "READ_ONLY"
+
+    async def list_campaigns(self, customer_id: str):
+        self.list_campaign_calls.append(customer_id)
+        return (
+            CampaignSummary(
+                campaign_id="900",
+                name="ZZ-MCP-TEST-DO-NOT-USE",
+                status="ENABLED",
+                channel_type="SEARCH",
+                daily_budget_micros=100_000_000,
+                budget_resource_name="customers/1/campaignBudgets/7",
+                budget_id="7",
+                budget_reference_count=1,
+                bidding_strategy_type="MANUAL_CPC",
+            ),
+            CampaignSummary(
+                campaign_id="901",
+                name="Shares A Budget",
+                status="PAUSED",
+                channel_type="SEARCH",
+                daily_budget_micros=500_000_000,
+                budget_resource_name="customers/1/campaignBudgets/8",
+                budget_id="8",
+                budget_reference_count=3,
+                bidding_strategy_type="MANUAL_CPC",
+            ),
+        )
+
+    async def list_ad_groups(self, *, customer_id: str, campaign_id=None):
+        self.list_ad_group_calls.append({"customer_id": customer_id,
+                                         "campaign_id": campaign_id})
+        return (
+            AdGroupSummary(
+                ad_group_id="4242",
+                name="Core",
+                status="PAUSED",
+                campaign_id="900",
+                campaign_name="ZZ-MCP-TEST-DO-NOT-USE",
+                cpc_bid_micros=20_000_000,
+                bidding_strategy_type="MANUAL_CPC",
+            ),
+        )
 
     async def campaign_performance(self, **kwargs):
         self.campaign_calls.append(kwargs)
@@ -444,3 +495,79 @@ async def test_an_explicit_range_is_passed_through_untouched(harness) -> None:
 
     call = reader.campaign_calls[-1]
     assert (call["start_date"], call["end_date"]) == ("2026-08-01", "2026-08-31")
+
+
+# ---------------------------------------------------------------------------
+# discovery - finding an id without opening the Google Ads UI
+# ---------------------------------------------------------------------------
+
+
+async def test_list_campaigns_shows_campaigns_that_have_never_served(harness) -> None:
+    """The gap these tools exist to close.
+
+    get_campaign_performance filters on segments.date, so Google returns no
+    rows for a campaign with no statistics - a newly created or long-paused
+    one is simply invisible. Every write tool needs a campaign_id, so there
+    was no way to obtain one from this server at all.
+    """
+    mcp, _, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        result = await client.call_tool("list_campaigns", {"customer_id": ACCOUNT})
+    body = json.loads(result.content[0].text)
+
+    names = [c["name"] for c in body["campaigns"]]
+    assert "ZZ-MCP-TEST-DO-NOT-USE" in names
+    assert body["campaign_count"] == 2
+
+
+async def test_list_campaigns_flags_a_shared_budget(harness) -> None:
+    """A shared budget cannot be changed through this server - the preview
+    would name one campaign and change several. Saying so in the listing
+    saves a refusal later."""
+    mcp, _, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        result = await client.call_tool("list_campaigns", {"customer_id": ACCOUNT})
+    by_name = {c["name"]: c for c in json.loads(result.content[0].text)["campaigns"]}
+
+    assert by_name["ZZ-MCP-TEST-DO-NOT-USE"]["budget_is_shared"] is False
+    assert by_name["Shares A Budget"]["budget_is_shared"] is True
+
+
+async def test_list_ad_groups_returns_the_id_the_write_tools_need(harness) -> None:
+    mcp, _, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        result = await client.call_tool("list_ad_groups", {"customer_id": ACCOUNT})
+    body = json.loads(result.content[0].text)
+
+    assert body["ad_groups"][0]["ad_group_id"] == "4242"
+    assert body["ad_groups"][0]["campaign_name"] == "ZZ-MCP-TEST-DO-NOT-USE"
+
+
+async def test_list_ad_groups_passes_the_campaign_filter_through(harness) -> None:
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "list_ad_groups", {"customer_id": ACCOUNT, "campaign_id": "900"}
+        )
+    assert reader.list_ad_group_calls[-1]["campaign_id"] == "900"
+
+
+async def test_a_malformed_campaign_filter_is_refused(harness) -> None:
+    mcp, reader, _ = harness(Tier.READONLY)
+    with pytest.raises(Exception):
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "list_ad_groups", {"customer_id": ACCOUNT, "campaign_id": "not-a-number"}
+            )
+    assert reader.list_ad_group_calls == []
+
+
+async def test_discovery_goes_through_the_gate_like_every_other_read(harness) -> None:
+    """An unmanaged account must not be listable either - otherwise this
+    becomes a way to enumerate any account the caller's own Google login can
+    reach, through our developer token."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    with pytest.raises(Exception):
+        async with Client(mcp) as client:
+            await client.call_tool("list_campaigns", {"customer_id": "9999999999"})
+    assert reader.list_campaign_calls == []
