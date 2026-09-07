@@ -299,3 +299,51 @@ def test_the_structural_rules_are_fixed_rather_than_configurable() -> None:
     """This used to be a setting. A setting nobody should ever change is not
     a setting - and "new keywords start ENABLED" is not a thing anyone wants."""
     assert _policy().rules.new_entities_start_paused is True
+
+
+# ---------------------------------------------------------------------------
+# the backstop switched off
+# ---------------------------------------------------------------------------
+
+
+def _uncapped() -> Policy:
+    return build_policy(
+        max_increase_percent=None, allowed_final_url_domains=frozenset()
+    ).for_account(currency_code="INR", timezone="Asia/Kolkata")
+
+
+def test_no_backstop_means_any_increase_is_allowed() -> None:
+    """Deliberate: the server cannot see what was ASKED for, only the number
+    that arrived, so it judges magnitude and never intent. Where the client
+    prompts on write tools it shows the actual figure, which catches a wrong
+    number of any size - and this rule then adds nothing."""
+    assert evaluate_budget_change(
+        _uncapped(), tier=Tier.LEAD, current_units="100", new_units="1000000"
+    ).allowed
+    assert evaluate_bid_change(
+        _uncapped(), tier=Tier.LEAD, current_units="10", new_units="99999"
+    ).allowed
+
+
+def test_switching_it_off_does_not_unpin_the_non_writing_tiers() -> None:
+    """`none` and `readonly` are pinned to zero in code, independent of the
+    setting. Turning the backstop off must not promote anybody."""
+    for tier in (Tier.NONE, Tier.READONLY):
+        assert not evaluate_budget_change(
+            _uncapped(), tier=tier, current_units="100", new_units="101"
+        ).allowed, tier
+
+
+def test_the_rules_that_are_not_the_backstop_still_hold() -> None:
+    """Zero, negatives and rises from zero are refused because they are
+    incoherent, not because of a magnitude limit."""
+    uncapped = _uncapped()
+    assert not evaluate_budget_change(
+        uncapped, tier=Tier.LEAD, current_units="100", new_units="0"
+    ).allowed
+    assert not evaluate_budget_change(
+        uncapped, tier=Tier.LEAD, current_units="0", new_units="100"
+    ).allowed
+    assert not evaluate_bid_change(
+        uncapped, tier=Tier.LEAD, current_units="10", new_units="0"
+    ).allowed

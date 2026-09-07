@@ -80,14 +80,15 @@ class PolicyError(RuntimeError):
 
 @dataclass(frozen=True)
 class BudgetLimits:
-    # The only budget rule left. Relative, so it never needs tuning, and set
-    # high enough to be a typo backstop rather than an operating limit.
-    max_increase_percent: Decimal
+    # The only budget rule left, and `None` means there is none: the change
+    # is judged solely by whoever approves the preview. Relative when set,
+    # so it never needs tuning per account.
+    max_increase_percent: Decimal | None
 
 
 @dataclass(frozen=True)
 class BidLimits:
-    max_increase_percent: Decimal
+    max_increase_percent: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,7 @@ BLOCKED_OPERATIONS = frozenset(
 
 def build_policy(
     *,
-    max_increase_percent: Decimal,
+    max_increase_percent: Decimal | None,
     allowed_final_url_domains: frozenset[str],
 ) -> "Policy":
     """Assemble the policy from settings and the constants above.
@@ -314,6 +315,11 @@ def evaluate_budget_change(
             "once, then adjust it here."
         )
 
+    if limits.max_increase_percent is None:
+        # The backstop is switched off. Magnitude is not judged here at all;
+        # the control is the person who approves the preview.
+        return PolicyVerdict.allow()
+
     increase_percent = percent_change(current, proposed)
     if increase_percent > limits.max_increase_percent:
         return PolicyVerdict.deny(
@@ -359,7 +365,10 @@ def evaluate_bid_change(
             )
         else:
             increase_percent = percent_change(current, proposed)
-            if increase_percent > limits.max_increase_percent:
+            if (
+                limits.max_increase_percent is not None
+                and increase_percent > limits.max_increase_percent
+            ):
                 reasons.append(
                     f"a {increase_percent}% increase is past the "
                     f"{limits.max_increase_percent}% safety backstop "

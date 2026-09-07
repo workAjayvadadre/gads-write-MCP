@@ -76,13 +76,21 @@ class Settings:
     # deliberate act, like the kill switch.
     require_human_confirmation: bool = True
 
-    # A TYPO BACKSTOP, not an operating limit. The server never sees what the
-    # person actually asked for - a tool call carries a number, never the
-    # conversation - so it can only judge magnitude. 1000 means "nothing may
-    # jump more than elevenfold in one change", which ordinary work never
-    # meets and a stray digit always does. Raising a budget from 500 to 5,000
-    # is fine; 500 to 500,000 is not.
-    max_increase_percent: Decimal = Decimal(1000)
+    # A TYPO BACKSTOP, not an operating limit, and `None` switches it off.
+    #
+    # The server never sees what the person actually ASKED for - a tool call
+    # carries a number, never the conversation - so it can judge magnitude
+    # and never intent. That makes it a poor substitute for the real control,
+    # which is a person reading the number before it is applied.
+    #
+    # A client configured to prompt on write tools shows the arguments - the
+    # actual figure the model chose - and so catches a wrong number of ANY
+    # size, not merely one past a percentage. Where that is set up this rule
+    # adds nothing, and turning it off is reasonable.
+    #
+    # The default stays on because a fresh deploy has no such prompt
+    # configured, and something should stand between a model and a budget.
+    max_increase_percent: Decimal | None = Decimal(1000)
 
     # Hosts a new ad's final URL may point at. Deployment-specific and not
     # derivable: Google cannot tell us which domains are yours. Exact host
@@ -138,6 +146,10 @@ def _resolve(path_str: str) -> Path:
 # room to loosen that deliberately while still refusing a value that is not a
 # limit at all, which is how the control gets disabled by accident.
 MAX_SANE_INCREASE_PERCENT = Decimal(10_000)
+
+# Spellings that switch the backstop off. A word rather than a number, so it
+# cannot be reached by a slipped digit and reads unmistakably in .env.
+DISABLE_WORDS = frozenset({"off", "none", "unlimited", "no"})
 
 
 def _validate_config_files(roles_path: Path) -> list[str]:
@@ -282,36 +294,45 @@ def load_settings(*, env_file: Path | None = None) -> Settings:
     roles_path = _resolve(_env("GADS_ROLES_PATH", "config/roles.yaml") or "config/roles.yaml")
     audit_log_path = _resolve(_env("GADS_AUDIT_LOG_PATH", "logs/audit.jsonl") or "logs/audit.jsonl")
 
-    # The typo backstop. Deliberately far above ordinary work; see the field
-    # comment on Settings and safety/policy.py for why it is not a limit.
-    raw_increase = _env("GADS_MAX_INCREASE_PERCENT", "1000") or "1000"
-    max_increase_percent = Decimal(1000)
-    try:
-        max_increase_percent = Decimal(raw_increase)
-        # `is_finite()` is the check that matters, not `< 0`. Decimal happily
-        # parses "inf" and "nan": Infinity passes a negativity test, and then
-        # every `increase > limit` comparison is False, so a single typo in
-        # .env silently disables the only money control left. NaN is worse -
-        # it compares False both ways.
-        if not max_increase_percent.is_finite() or max_increase_percent < 0:
-            raise ValueError
-    except (ValueError, ArithmeticError):
-        problems.append(
-            f"GADS_MAX_INCREASE_PERCENT must be a finite, non-negative number, "
-            f"got {raw_increase!r}. It is a percentage: 100 means a change may "
-            "at most multiply a budget or a bid elevenfold."
-        )
+    # The typo backstop, which can be switched off entirely. See the field
+    # comment on Settings and safety/policy.py for why it is not a limit and
+    # why a client-side approval prompt is the better control.
+    raw_increase = (_env("GADS_MAX_INCREASE_PERCENT", "1000") or "1000").strip()
+    max_increase_percent: Decimal | None = Decimal(1000)
+
+    if raw_increase.lower() in DISABLE_WORDS:
+        # Deliberate, and visible in .env. What stands between a model and a
+        # budget is then the preview and whoever approves it.
+        max_increase_percent = None
     else:
-        if max_increase_percent > MAX_SANE_INCREASE_PERCENT:
-            # Same reasoning as the tier cache ceiling below: a number this
-            # large is not a loose limit, it is no limit, and it arrives by
-            # typo rather than by intent. 1000 already permits an elevenfold
-            # increase in a single change.
+        try:
+            max_increase_percent = Decimal(raw_increase)
+            # `is_finite()` is the check that matters, not `< 0`. Decimal
+            # happily parses "inf" and "nan": Infinity passes a negativity
+            # test, and then every `increase > limit` comparison is False, so
+            # a single typo would silently disable the rule while looking
+            # like it was on. NaN is worse - it compares False both ways.
+            # Switching it off must be spelled out, never achieved by typo.
+            if not max_increase_percent.is_finite() or max_increase_percent < 0:
+                raise ValueError
+        except (ValueError, ArithmeticError):
+            max_increase_percent = Decimal(1000)
             problems.append(
-                f"GADS_MAX_INCREASE_PERCENT is {max_increase_percent}, which "
-                f"is not a limit at all. The maximum accepted is "
-                f"{MAX_SANE_INCREASE_PERCENT}."
+                f"GADS_MAX_INCREASE_PERCENT must be a finite, non-negative "
+                f"number, or one of {sorted(DISABLE_WORDS)} to switch it off. "
+                f"Got {raw_increase!r}."
             )
+        else:
+            if max_increase_percent > MAX_SANE_INCREASE_PERCENT:
+                # A number this large is not a loose limit, it is no limit,
+                # and it arrives by typo rather than by intent. Say `off` if
+                # that is what you mean.
+                problems.append(
+                    f"GADS_MAX_INCREASE_PERCENT is {max_increase_percent}, "
+                    f"which is not a limit at all. The maximum accepted is "
+                    f"{MAX_SANE_INCREASE_PERCENT}; use "
+                    f"{sorted(DISABLE_WORDS)} to switch it off deliberately."
+                )
 
     # Exact host match, comma separated. Empty is allowed and means no new ad
     # can be created - which is the right default for a server that has not

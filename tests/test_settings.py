@@ -243,3 +243,20 @@ def test_a_non_finite_increase_percent_is_refused(
     env.setenv("GADS_MAX_INCREASE_PERCENT", hostile)
     with pytest.raises(ConfigError, match="GADS_MAX_INCREASE_PERCENT"):
         _load(tmp_path)
+
+
+@pytest.mark.parametrize("word", ["off", "none", "unlimited", "no", "OFF", " Off "])
+def test_the_backstop_can_be_switched_off_by_word(env, tmp_path: Path, word: str) -> None:
+    """A WORD, never a number. Switching off the only automatic money rule
+    must be spelled out - a slipped digit must never achieve it by accident,
+    which is exactly how "inf" used to disable it silently."""
+    env.setenv("GADS_MAX_INCREASE_PERCENT", word)
+    assert _load(tmp_path).max_increase_percent is None
+
+
+def test_an_absurd_number_still_refuses_and_names_the_off_switch(
+    env, tmp_path: Path
+) -> None:
+    env.setenv("GADS_MAX_INCREASE_PERCENT", "999999")
+    with pytest.raises(ConfigError, match="not a limit at all"):
+        _load(tmp_path)
