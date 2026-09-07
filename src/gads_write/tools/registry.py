@@ -172,6 +172,14 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="list_ad_groups", required_tier=Tier.READONLY, writes=False)
     )
 
+    # The general escape hatch. Everything the purpose-built reads cannot
+    # answer - ads, assets, conversions, geo, change history - without a new
+    # tool per question. Still `readonly`, still through the full gate, and
+    # still on the caller's own token, so Google decides what they may read.
+    register(
+        ToolSpec(name="run_gaql_query", required_tier=Tier.READONLY, writes=False)
+    )
+
     # --- Phase 4 writes ----------------------------------------------------
     # `writes=True` puts these behind the kill switch: GADS_WRITE_ENABLED
     # false hides them from tools/list and refuses them on tools/call.

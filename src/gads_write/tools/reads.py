@@ -46,8 +46,12 @@ from ..safety.audit import local_date_for
 from ..safety.policy import Policy, PolicyStore
 from ..safety.units import format_micros
 from ..safety.validators import (
+    MAX_GAQL_ROWS,
     MAX_REPORT_ROWS,
     ValidationResult,
+    gaql_resource,
+    validate_gaql_query,
+    with_row_limit,
     validate_customer_id,
     validate_date_range,
     validate_numeric_id,
@@ -302,6 +306,59 @@ def register_read_tools(
                 }
                 for row in rows
             ],
+        }
+
+    # ------------------------------------------------------------------
+    # run_gaql_query
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("run_gaql_query"))
+    async def run_gaql_query(customer_id: str, query: str) -> dict:
+        """Run any Google Ads Query Language (GAQL) query against an account.
+
+        The general read. Use it for anything the other tools do not cover -
+        ads, assets, conversion actions, geo and device performance, change
+        history, and so on.
+
+        GAQL is a single SELECT against one resource; it has no JOINs and no
+        subqueries. Related fields come along automatically, so
+        `SELECT campaign.name, ad_group.name FROM ad_group` works.
+
+        A LIMIT is added if you do not supply one. Resources that expose
+        people or payment details rather than advertising performance are not
+        available here.
+
+        Example:
+            SELECT campaign.id, campaign.name, campaign.status
+            FROM campaign
+            WHERE campaign.status != 'REMOVED'
+        """
+        def validate(_: Policy) -> ValidationResult:
+            result = _customer_only(customer_id)
+            result.extend(validate_gaql_query(query))
+            return result
+
+        await _gate(
+            tool="run_gaql_query",
+            customer_id=str(customer_id).strip(),
+            # The query is audited verbatim. "Who looked at what" is only
+            # answerable for a free-form read if the query itself is recorded.
+            arguments={"customer_id": customer_id, "query": query},
+            validate=validate,
+        )
+
+        rows = await reader.run_query(
+            customer_id=str(customer_id).strip(),
+            query=with_row_limit(str(query)),
+        )
+        return {
+            "ok": True,
+            "customer_id": str(customer_id).strip(),
+            "resource": gaql_resource(str(query)),
+            "row_count": len(rows),
+            # No silent truncation: if we hit the cap, say so.
+            "truncated": len(rows) >= MAX_GAQL_ROWS,
+            "rows": list(rows),
         }
 
     # ------------------------------------------------------------------

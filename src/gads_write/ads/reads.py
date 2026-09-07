@@ -266,6 +266,22 @@ class AdsReader(Protocol):
         self, *, customer_id: str, start_date: str, end_date: str, limit: int
     ) -> tuple[CampaignRow, ...]: ...
 
+    async def run_query(
+        self, *, customer_id: str, query: str
+    ) -> tuple[dict, ...]:
+        """Run a caller-supplied GAQL query and return its rows as dicts.
+
+        The one read here whose query this code does not own. The query is
+        validated in safety/validators.py before it arrives; the account has
+        already been checked against the MCC by the gate; and the call is made
+        with the CALLER'S own token, so Google enforces what they may read.
+
+        `search()` cannot mutate - the architecture test pins mutations to
+        ads/executor.py - so this widens what can be READ, never what can be
+        changed.
+        """
+        ...
+
     async def list_campaigns(self, customer_id: str) -> tuple[CampaignSummary, ...]:
         """Every campaign in the account, whether or not it has ever served.
 
@@ -506,6 +522,23 @@ class GoogleAdsReader(AdsReader):
                 clicks=int(row.metrics.clicks or 0),
                 cost_micros=int(row.metrics.cost_micros or 0),
                 conversions=float(row.metrics.conversions or 0.0),
+            )
+            for row in rows
+        )
+
+    async def run_query(
+        self, *, customer_id: str, query: str
+    ) -> tuple[dict, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        rows = await self._search_rows(customer_id=customer_id, query=str(query))
+        return tuple(
+            # Only fields the row actually carries, and enum NAMES rather than
+            # their integers - a model reading "ENABLED" needs no lookup table,
+            # and the default-filled version of this is mostly noise.
+            type(row).to_dict(
+                row,
+                including_default_value_fields=False,
+                use_integers_for_enums=False,
             )
             for row in rows
         )

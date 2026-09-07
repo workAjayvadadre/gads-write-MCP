@@ -55,6 +55,14 @@ Google Ads; there is no `mode` any more.
 - GAQL is assembled by string interpolation because the API takes a query
   string with no bound parameters. Every interpolated value is validated in
   `safety/validators.py` and asserted again by `_literal()` in `ads/reads.py`.
+  `run_gaql_query` is the one deliberate exception: the caller supplies the
+  whole query, so there is no interpolated value to assert. What holds instead
+  is that the gate has already checked the account against the MCC, the call
+  uses the CALLER'S own token so Google enforces what they may read, and
+  `search()` cannot mutate. `validate_gaql_query` refuses statement chaining
+  and a denylist of resources that expose people or payment details rather
+  than advertising performance - defence in depth over Google's own
+  permissions, not the primary control.
 - Every write tool returns a `plan_id` + preview. It does not execute.
   Execution happens only in `tools/confirm.py`, after re-evaluating policy.
 - Every tool calls `Guard.check()` before doing anything else.

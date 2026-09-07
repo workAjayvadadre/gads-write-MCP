@@ -490,3 +490,128 @@ def _duplicates(items: list[str]) -> set[str]:
             dupes.add(item.strip())
         seen.add(key)
     return dupes
+
+
+# ---------------------------------------------------------------------------
+# free-form GAQL
+# ---------------------------------------------------------------------------
+# `run_gaql_query` hands the model the query language itself, which is a
+# deliberate departure from every other read here. Those interpolate a handful
+# of validated values into a query this code owns; this one does not own the
+# query at all.
+#
+# What still holds, and it is the part that matters: the account is checked
+# against the MCC by the gate before a query runs, and every call is made with
+# the CALLER'S own OAuth token. Google therefore enforces what that person may
+# read, exactly as it does in the Google Ads UI. This validation is
+# defence-in-depth over that, not the primary control.
+#
+# Injection in the SQL sense does not apply. GAQL has no JOINs, no subqueries
+# and no statement chaining - one SELECT against one resource - and it reaches
+# Google through `search()`, which cannot mutate. The architecture test pins
+# that mutations live only in ads/executor.py.
+#
+# So what is left to check is SCOPE: which resource is being read.
+
+# Resources a read tool has no business reaching. A denylist rather than an
+# allowlist, deliberately: an allowlist would have to enumerate a hundred
+# resources to be useful and would then need maintaining every time Google
+# adds one - which is the config-file problem this project spent its life
+# removing. These are the ones that expose people and payment plumbing rather
+# than advertising performance.
+DENIED_GAQL_RESOURCES = frozenset(
+    {
+        "customer_user_access",
+        "customer_user_access_invitation",
+        "billing_setup",
+        "account_budget",
+        "account_budget_proposal",
+        "payments_account",
+        "invoice",
+    }
+)
+
+# Enough rows for any real question, few enough that one query cannot pull an
+# account's entire history into a chat.
+MAX_GAQL_ROWS = 500
+
+_SELECT_FROM = re.compile(
+    r"^\s*SELECT\s+.+?\s+FROM\s+([a-z_][a-z0-9_]*)\b", re.IGNORECASE | re.DOTALL
+)
+_LIMIT = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
+
+
+def gaql_resource(query: str) -> str | None:
+    """The resource named in the FROM clause, or None if the query is not a
+    single well-formed SELECT."""
+    match = _SELECT_FROM.match(str(query or ""))
+    return match.group(1).lower() if match else None
+
+
+def validate_gaql_query(query: object) -> ValidationResult:
+    """Check a caller-supplied GAQL query before it reaches Google."""
+    result = ValidationResult()
+    text = str(query or "").strip()
+
+    if not text:
+        result.add("query", "a GAQL query is required")
+        return result
+
+    if len(text) > 4000:
+        result.add("query", "query is unreasonably long; simplify it")
+        return result
+
+    # One statement. GAQL has no statement chaining, so a semicolon is either
+    # a mistake or an attempt at something this does not support.
+    if ";" in text:
+        result.add("query", "a query must be a single statement with no ';'")
+        return result
+
+    resource = gaql_resource(text)
+    if resource is None:
+        result.add(
+            "query",
+            "must be a single SELECT ... FROM <resource> query. GAQL has no "
+            "JOINs or subqueries; select the fields you need from one resource.",
+        )
+        return result
+
+    if resource in DENIED_GAQL_RESOURCES:
+        result.add(
+            "query",
+            f"reading {resource!r} is not available through this server. It "
+            "exposes people or payment details rather than advertising "
+            "performance; use the Google Ads UI if you genuinely need it.",
+        )
+
+    # PARAMETERS must come after LIMIT in GAQL, so a query carrying one cannot
+    # simply have a LIMIT appended. Rather than rewrite someone's clause order,
+    # refuse and let them add their own.
+    if re.search(r"\bPARAMETERS\b", text, re.IGNORECASE):
+        result.add(
+            "query",
+            "PARAMETERS is not supported here; add an explicit LIMIT instead.",
+        )
+        return result
+
+    limit = _LIMIT.search(text)
+    if limit and int(limit.group(1)) > MAX_GAQL_ROWS:
+        result.add(
+            "query",
+            f"LIMIT {limit.group(1)} is above the maximum of {MAX_GAQL_ROWS}",
+        )
+
+    return result
+
+
+def with_row_limit(query: str) -> str:
+    """The query, guaranteed to carry a LIMIT.
+
+    An unbounded query against a large account is how a chat window fills
+    with a year of data and a request times out. Validation has already
+    refused a LIMIT that is too high, so an existing one is left alone.
+    """
+    text = str(query).strip()
+    if _LIMIT.search(text):
+        return text
+    return f"{text} LIMIT {MAX_GAQL_ROWS}"

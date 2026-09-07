@@ -70,6 +70,7 @@ class FakeReader:
         self.search_term_calls: list[dict] = []
         self.list_campaign_calls: list[str] = []
         self.list_ad_group_calls: list[dict] = []
+        self.query_calls: list[dict] = []
 
     async def accessible_customer_ids(self):
         return (ACCOUNT,)
@@ -131,6 +132,10 @@ class FakeReader:
                 bidding_strategy_type="MANUAL_CPC",
             ),
         )
+
+    async def run_query(self, *, customer_id: str, query: str):
+        self.query_calls.append({"customer_id": customer_id, "query": query})
+        return ({"campaign": {"id": "900", "name": "ZZ-MCP-TEST", "status": "ENABLED"}},)
 
     async def campaign_performance(self, **kwargs):
         self.campaign_calls.append(kwargs)
@@ -571,3 +576,116 @@ async def test_discovery_goes_through_the_gate_like_every_other_read(harness) ->
         async with Client(mcp) as client:
             await client.call_tool("list_campaigns", {"customer_id": "9999999999"})
     assert reader.list_campaign_calls == []
+
+
+# ---------------------------------------------------------------------------
+# run_gaql_query - the general read
+# ---------------------------------------------------------------------------
+
+
+async def test_an_arbitrary_query_reaches_google(harness) -> None:
+    """The point of the tool: anything the purpose-built reads do not cover,
+    without adding a tool per question."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "run_gaql_query",
+            {"customer_id": ACCOUNT,
+             "query": "SELECT campaign.id, campaign.name FROM campaign"},
+        )
+    body = json.loads(result.content[0].text)
+
+    assert body["resource"] == "campaign"
+    assert body["rows"][0]["campaign"]["name"] == "ZZ-MCP-TEST"
+
+
+async def test_a_missing_limit_is_added(harness) -> None:
+    """An unbounded query against a large account fills a chat window with a
+    year of data and times out."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "run_gaql_query",
+            {"customer_id": ACCOUNT, "query": "SELECT campaign.id FROM campaign"},
+        )
+    assert "LIMIT" in reader.query_calls[-1]["query"]
+
+
+async def test_a_caller_supplied_limit_is_left_alone(harness) -> None:
+    mcp, reader, _ = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "run_gaql_query",
+            {"customer_id": ACCOUNT,
+             "query": "SELECT campaign.id FROM campaign LIMIT 7"},
+        )
+    assert reader.query_calls[-1]["query"].endswith("LIMIT 7")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT customer_user_access.email_address FROM customer_user_access",
+        "SELECT billing_setup.id FROM billing_setup",
+        "SELECT invoice.id FROM invoice",
+    ],
+)
+async def test_people_and_payment_resources_are_refused(harness, query: str) -> None:
+    """A read tool has no business reaching these. Google's own permissions
+    are the primary control - this is defence in depth over them."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    with pytest.raises(Exception):
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "run_gaql_query", {"customer_id": ACCOUNT, "query": query}
+            )
+    assert reader.query_calls == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT campaign.id FROM campaign; SELECT ad_group.id FROM ad_group",
+        "UPDATE campaign SET status = 'PAUSED'",
+        "DELETE FROM campaign",
+        "",
+        "SELECT campaign.id FROM campaign LIMIT 999999",
+    ],
+)
+async def test_a_malformed_or_unsupported_query_is_refused(
+    harness, query: str
+) -> None:
+    mcp, reader, _ = harness(Tier.READONLY)
+    with pytest.raises(Exception):
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "run_gaql_query", {"customer_id": ACCOUNT, "query": query}
+            )
+    assert reader.query_calls == []
+
+
+async def test_the_query_goes_through_the_gate(harness) -> None:
+    """An unmanaged account must not be queryable, or this becomes a way to
+    read any account the caller can reach through our developer token."""
+    mcp, reader, _ = harness(Tier.READONLY)
+    with pytest.raises(Exception):
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "run_gaql_query",
+                {"customer_id": "9999999999",
+                 "query": "SELECT campaign.id FROM campaign"},
+            )
+    assert reader.query_calls == []
+
+
+async def test_the_query_itself_is_audited(harness) -> None:
+    """"Who looked at what" is only answerable for a free-form read if the
+    query is recorded, not merely the account."""
+    mcp, _, audit_path = harness(Tier.READONLY)
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "run_gaql_query",
+            {"customer_id": ACCOUNT, "query": "SELECT campaign.id FROM campaign"},
+        )
+    line = _audit_lines(audit_path)[-1]
+    assert "SELECT campaign.id FROM campaign" in json.dumps(line)
