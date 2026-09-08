@@ -1,0 +1,496 @@
+<title>Is gads-write-mcp Safe to Ship?</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+  :root {
+    --ground:      #f7f8fa;
+    --surface:     #ffffff;
+    --ink:         #16191f;
+    --muted:       #5c6470;
+    --hairline:    #dde1e8;
+    --accent:      #2f4b7c;
+    --critical:    #b42318;
+    --critical-bg: #fdf1f0;
+    --warn:        #b54708;
+    --warn-bg:     #fdf5ec;
+    --ok:          #10614f;
+    --ok-bg:       #eef6f3;
+    --code-bg:     #f0f2f6;
+
+    --sans:  "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --mono:  "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #12151a;
+      --surface:     #191d24;
+      --ink:         #e6e9ee;
+      --muted:       #98a1ae;
+      --hairline:    #2b313b;
+      --accent:      #8fb0e0;
+      --critical:    #f97066;
+      --critical-bg: #2a1917;
+      --warn:        #f5a524;
+      --warn-bg:     #2a2016;
+      --ok:          #4fc4a6;
+      --ok-bg:       #14241f;
+      --code-bg:     #1f242c;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #12151a;
+    --surface:     #191d24;
+    --ink:         #e6e9ee;
+    --muted:       #98a1ae;
+    --hairline:    #2b313b;
+    --accent:      #8fb0e0;
+    --critical:    #f97066;
+    --critical-bg: #2a1917;
+    --warn:        #f5a524;
+    --warn-bg:     #2a2016;
+    --ok:          #4fc4a6;
+    --ok-bg:       #14241f;
+    --code-bg:     #1f242c;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.65;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 50rem;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.5rem;
+  }
+
+  h1, h2, h3, .label, .pill, th { font-family: var(--sans); }
+  h1, h2, h3 { text-wrap: balance; margin: 0; font-weight: 600; }
+  h1 { font-size: 2.4rem; line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 1.45rem; letter-spacing: -0.01em; }
+  h3 { font-size: 1.1rem; }
+  p  { margin: 0; }
+
+  code, .mono { font-family: var(--mono); font-size: 0.86em; }
+  code {
+    background: var(--code-bg);
+    padding: 0.12em 0.36em;
+    border-radius: 3px;
+    word-break: break-word;
+  }
+
+  .label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  /* ---------- header ---------- */
+  header { display: flex; flex-direction: column; gap: 1.25rem; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 0.4rem 1.25rem;
+    font-family: var(--mono); font-size: 0.78rem; color: var(--muted);
+  }
+  .rule { height: 2px; background: var(--accent); width: 3.5rem; }
+
+  /* ---------- verdict ---------- */
+  .verdict {
+    background: var(--critical-bg);
+    border: 1px solid var(--critical);
+    border-radius: 4px;
+    padding: 1.5rem 1.75rem;
+    display: flex; flex-direction: column; gap: 0.75rem;
+  }
+  .verdict h2 { color: var(--critical); font-size: 1.6rem; }
+  .verdict p { color: var(--ink); }
+
+  /* ---------- counts ---------- */
+  .counts { display: flex; flex-wrap: wrap; gap: 2.5rem; }
+  .count { display: flex; flex-direction: column; gap: 0.15rem; }
+  .count b {
+    font-family: var(--sans); font-size: 2rem; font-weight: 600;
+    line-height: 1; font-variant-numeric: tabular-nums;
+  }
+  .count.bad b  { color: var(--critical); }
+  .count.mid b  { color: var(--warn); }
+  .count.good b { color: var(--ok); }
+
+  /* ---------- sections ---------- */
+  section { display: flex; flex-direction: column; gap: 1.5rem; }
+  .intro { color: var(--muted); max-width: 60ch; }
+
+  /* ---------- the pattern diagram ---------- */
+  figure {
+    margin: 0; background: var(--surface); border: 1px solid var(--hairline);
+    border-radius: 4px; padding: 1.75rem 1.5rem 1.25rem;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .scroller { overflow-x: auto; }
+  figcaption { font-size: 0.9rem; color: var(--muted); }
+
+  /* ---------- findings ---------- */
+  .findings { display: flex; flex-direction: column; }
+  .finding {
+    display: flex; flex-direction: column; gap: 0.85rem;
+    padding: 2rem 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .finding:first-child { border-top: none; padding-top: 0.5rem; }
+  .fhead { display: flex; gap: 1rem; align-items: baseline; }
+  .num {
+    font-family: var(--mono); font-size: 1rem; font-weight: 500;
+    color: var(--accent); font-variant-numeric: tabular-nums;
+    flex: none; padding-top: 0.1rem;
+  }
+  .tags { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .pill {
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.07em;
+    text-transform: uppercase; padding: 0.2rem 0.55rem; border-radius: 99px;
+    border: 1px solid currentColor;
+  }
+  .p-crit { color: var(--critical); background: var(--critical-bg); }
+  .p-high { color: var(--warn);     background: var(--warn-bg); }
+  .p-ver  { color: var(--ok);       background: var(--ok-bg); }
+  .p-plain{ color: var(--muted); background: transparent; }
+
+  .story {
+    border-left: 2px solid var(--hairline);
+    padding-left: 1.1rem;
+    color: var(--ink);
+  }
+  .story .label { display: block; margin-bottom: 0.3rem; }
+  .where { font-size: 0.85rem; color: var(--muted); }
+
+  pre {
+    background: var(--code-bg); border-radius: 4px; padding: 0.9rem 1.1rem;
+    overflow-x: auto; margin: 0;
+    font-family: var(--mono); font-size: 0.8rem; line-height: 1.55;
+  }
+
+  /* ---------- table ---------- */
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  caption { text-align: left; color: var(--muted); font-size: 0.9rem; padding-bottom: 0.75rem; }
+  th, td { text-align: left; padding: 0.7rem 0.9rem 0.7rem 0; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  th { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 600; }
+  td.sev { white-space: nowrap; font-family: var(--sans); font-size: 0.78rem; font-weight: 600; }
+  td.sev.m { color: var(--warn); }
+  td.sev.l { color: var(--muted); }
+
+  /* ---------- solid list ---------- */
+  .solid {
+    background: var(--ok-bg); border: 1px solid var(--ok);
+    border-radius: 4px; padding: 1.5rem 1.75rem;
+    display: flex; flex-direction: column; gap: 0.85rem;
+  }
+  .solid h2 { color: var(--ok); }
+  .solid ul { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 0.4rem; }
+
+  .order { display: flex; flex-direction: column; gap: 0.6rem; }
+  .order div { display: flex; gap: 0.9rem; align-items: baseline; }
+  .order .mono { color: var(--accent); font-weight: 500; flex: none; }
+
+  footer { color: var(--muted); font-size: 0.9rem; border-top: 1px solid var(--hairline); padding-top: 1.5rem; }
+
+  @media (max-width: 34rem) {
+    body { font-size: 16px; }
+    h1 { font-size: 1.9rem; }
+    .wrap { padding-top: 2.5rem; gap: 2.5rem; }
+    .fhead { flex-direction: column; gap: 0.5rem; }
+    .counts { gap: 1.5rem; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <div class="rule"></div>
+    <h1>Is gads-write-mcp safe to ship?</h1>
+    <p class="intro">A production-readiness review of the guardrailed Google Ads write server — the one that can spend real money. Five review passes over the whole codebase: the write path, authorization, Google Ads API usage, the safety core, and the tests.</p>
+    <div class="meta">
+      <span>commit 3d7ca4b</span>
+      <span>375 tests passing</span>
+      <span>~4,900 lines under review</span>
+      <span>2 Sep 2026</span>
+    </div>
+  </header>
+
+  <div class="verdict">
+    <h2>Not yet. Seven things must be fixed first.</h2>
+    <p>The architecture is sound and the guardrails are real — this is a well-built system. But one defect can take the whole server down silently, the most important permission check has no test behind it, and three separate bugs let a budget change slip past the limits it was approved under. None are hard to fix.</p>
+  </div>
+
+  <div class="counts">
+    <div class="count bad"><b>7</b><span class="label">must fix</span></div>
+    <div class="count mid"><b>11</b><span class="label">should fix</span></div>
+    <div class="count good"><b>4</b><span class="label">verified by hand</span></div>
+  </div>
+
+  <section>
+    <h2>The pattern behind half the bugs</h2>
+    <p>Every write happens in two steps. You <strong>draft</strong> a change and get a preview plus a plan ID; nothing happens yet. Then you <strong>confirm</strong>, and only then does the mutation reach Google. The whole safety model rests on the confirm step re-checking everything, because time has passed and the world may have moved.</p>
+    <p>A fix earlier this week made confirm re-run the policy rules properly. What it didn't fix is subtler: <strong>confirm re-derives the checks, but not the things being checked against.</strong> The amount is re-read. The budget it points at, the spend figure written to the ledger, and the running total the ceiling is measured against are all still whatever they were at draft time.</p>
+
+    <figure>
+      <div class="scroller">
+        <svg viewBox="0 0 700 210" width="700" height="210" role="img" aria-label="Diagram of the draft to confirm to apply flow, showing three places where stale data enters at the confirm step">
+          <defs>
+            <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <g fill="none" stroke="currentColor" color="var(--muted)" stroke-width="1.5">
+            <line x1="128" y1="46" x2="252" y2="46" marker-end="url(#ar)"/>
+            <line x1="448" y1="46" x2="572" y2="46" marker-end="url(#ar)"/>
+          </g>
+          <g stroke="var(--hairline)" fill="var(--surface)" stroke-width="1.5">
+            <rect x="8"   y="22" width="120" height="48" rx="3"/>
+            <rect x="252" y="22" width="196" height="48" rx="3"/>
+            <rect x="572" y="22" width="120" height="48" rx="3"/>
+          </g>
+          <g font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="var(--ink)" text-anchor="middle">
+            <text x="68"  y="51">draft</text>
+            <text x="350" y="51">confirm</text>
+            <text x="632" y="51">apply</text>
+          </g>
+          <g font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--muted)" text-anchor="middle">
+            <text x="190" y="40">plan ID</text>
+            <text x="510" y="40">mutation</text>
+          </g>
+          <g stroke="var(--ok)" stroke-width="1.5" fill="none">
+            <path d="M290 70 L290 104" marker-end="url(#ar)" color="var(--ok)"/>
+          </g>
+          <text x="298" y="110" font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--ok)" font-weight="600">re-read: the current amount ✓</text>
+          <g stroke="var(--critical)" stroke-width="1.5" stroke-dasharray="4 3" fill="none" color="var(--critical)">
+            <path d="M410 70 L410 140" marker-end="url(#ar)"/>
+          </g>
+          <g font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--critical)">
+            <text x="418" y="146" font-weight="600">still trusted from draft time:</text>
+            <text x="418" y="166" font-size="11.5">which budget the change is written to</text>
+            <text x="418" y="182" font-size="11.5">the spend figure recorded in the ledger</text>
+            <text x="418" y="198" font-size="11.5">whether that budget is shared</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>Findings 4, 5 and 6 below are all this one shape — the same class of bug as the one already fixed, one layer down.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Must fix before release</h2>
+    <p class="intro">In the order I'd tackle them. Numbers are a fix sequence, not a ranking of blame.</p>
+
+    <div class="findings">
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">01</span>
+          <div>
+            <h3>A small config typo can take the server down — while the health check says everything is fine</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-crit">Critical</span>
+              <span class="pill p-plain">Confirmed bug</span>
+              <span class="pill p-ver">I reproduced this</span>
+            </div>
+          </div>
+        </div>
+        <p>The policy file is designed to be edited live. If someone writes invalid YAML, the server correctly keeps the last good version and carries on. But if the YAML is <em>valid</em> and merely mis-shaped — a tier's <code>budget:</code> block left empty — the loader raises a different kind of error than the one the safety net catches. It escapes into the live request.</p>
+        <div class="story">
+          <span class="label">What that looks like</span>
+          <p>A lead deletes four lines under <code>limits.tiers.operator.budget</code> and saves. From that moment every single tool call returns a 500 error, forever, and it never recovers on its own. Meanwhile <code>/healthz</code> — the endpoint built specifically to make silent config problems visible — returns <code>200 ok</code>, because the error was never recorded. Both documented guarantees fail at the same moment.</p>
+        </div>
+        <pre>call 1: TypeError ESCAPED -&gt; argument of type 'NoneType' is not a container or iterable
+call 2: TypeError ESCAPED -&gt; ...
+last_error: None          # so /healthz reports "ok"</pre>
+        <p class="where">policy.py:117 · policy.py:353 catches only <code>PolicyError</code> · health.py:57 reads only <code>last_error</code> · <code>settings.py</code> has the same gap, so a bad file also kills startup with a raw traceback</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">02</span>
+          <div>
+            <h3>The most important permission check has no test behind it</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-crit">Critical</span>
+              <span class="pill p-plain">Missing test</span>
+              <span class="pill p-ver">I verified the gap</span>
+            </div>
+          </div>
+        </div>
+        <p>Some tools need the higher <code>lead</code> tier — raising bids, adding keywords, creating ads. When someone confirms a plan, the server correctly checks the tier of the <em>tool that drafted it</em>, not the confirm tool. That's what stops a lead drafting an expensive change and an operator applying it.</p>
+        <p>The code does this right. Nothing tests it.</p>
+        <div class="story">
+          <span class="label">Why the existing tests miss it</span>
+          <p>Every demotion test drops the user to <code>readonly</code> — and the middleware rejects a readonly user before the confirm code ever runs. So the tests pass through a completely different door. Nobody tests a demotion from <code>lead</code> to <code>operator</code>, which is the case that matters. You could break this check and the entire 375-test suite would still go green.</p>
+        </div>
+        <p class="where">confirm.py:214 (correct) · test_write_tools.py:392, :433 and test_middleware.py:220 all demote to readonly</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">03</span>
+          <div>
+            <h3>The shared-budget guard reads the wrong field from Google</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-high">High</span>
+              <span class="pill p-plain">Confirmed bug</span>
+              <span class="pill p-ver">Verified against the v25 protos</span>
+            </div>
+          </div>
+        </div>
+        <p>A shared budget feeds several campaigns at once, so changing it affects all of them — while the preview a human approves names only one. The server refuses these outright, and that refusal is load-bearing for the whole approval model. It checks a field called <code>explicitly_shared</code>.</p>
+        <p>Google's own definition of that field, read from the installed library: <em>"Specifies whether the budget is explicitly shared. <strong>Defaults to true if unspecified in a create operation.</strong> If false, the budget was created with the intention of only being used with a single campaign."</em> That is a record of what someone <em>intended</em> when they created it — not what is true now. The field that states the fact is <code>reference_count</code>: <em>"the number of campaigns actively using the budget."</em></p>
+        <div class="story">
+          <span class="label">It fails in both directions</span>
+          <p>A budget created with <code>explicitly_shared=false</code> and later attached to three campaigns sails through the guard — a human approves a preview naming one campaign, and three campaigns' spending changes. Going the other way, a budget created through the API for a single campaign defaults to <code>true</code> and gets refused for no reason.</p>
+        </div>
+        <p class="where">reads.py:442, :460 · writes.py:362 · fix: select <code>campaign_budget.reference_count</code> and refuse when it's above 1</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">04</span>
+          <div>
+            <h3>Confirm can check one budget and change a different one</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-high">High</span>
+              <span class="pill p-plain">Confirmed bug</span>
+            </div>
+          </div>
+        </div>
+        <p>Two halves of one problem, both of which survived the earlier fix. The shared-budget flag is never re-checked at confirm — tick "shared" in the Google Ads interface inside the ten-minute window and the change still applies. And the budget's address is frozen at draft time and used as-is.</p>
+        <div class="story">
+          <span class="label">What that looks like</span>
+          <p>You draft a change to campaign X, which uses budget B. Before you confirm, someone repoints campaign X at budget C, which sits at ₹5,000/day. Confirm re-reads and sees ₹5,000, decides that going to ₹120 is a harmless <em>decrease</em>, approves it — and writes ₹120 to <strong>budget B</strong>. The policy was evaluated against a budget the mutation never touches.</p>
+        </div>
+        <p class="where">operations.py:203 reads only the amount · writes.py:430 freezes the address · executor.py:277 uses it verbatim</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">05</span>
+          <div>
+            <h3>The spend ledger records the wrong number</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-high">High</span>
+              <span class="pill p-plain">Confirmed bug</span>
+            </div>
+          </div>
+        </div>
+        <p>Each person has a daily cap on how much they can raise budgets by, and it's deliberately derived from the audit log rather than a counter in memory — so a restart can't clear it. That's a good design. But confirm writes the increase it calculated at <em>draft</em> time into the log, while the limit check uses a freshly calculated one.</p>
+        <div class="story">
+          <span class="label">What that looks like</span>
+          <p>Budget is ₹5,000. You draft a raise to ₹5,500 — the plan records ₹500. Before you confirm, someone lowers the budget to ₹4,700. Confirm re-reads, sees a 17% rise, allows it. The real increase is ₹800, but the log records ₹500. You've permanently recovered ₹300 of your daily allowance, and you can repeat it.</p>
+        </div>
+        <p class="where">confirm.py:165 reuses the plan's figure · the fresh one is computed in policy.py:459</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">06</span>
+          <div>
+            <h3>The daily cap can be stepped over by approving two changes at once</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-high">High</span>
+              <span class="pill p-plain">Confirmed bug</span>
+            </div>
+          </div>
+        </div>
+        <p>The cap is read at the moment the gate runs. Then the server pauses and asks a human to approve the change — a wait with no time limit. The spend total isn't written until after the approval comes back.</p>
+        <div class="story">
+          <span class="label">What that looks like</span>
+          <p>Your cap is ₹50/day. Draft two ₹40 raises. Call confirm on <em>both</em> before approving either. Both read the ledger at ₹0 used, both pass, both apply: ₹80 against a ₹50 cap. This needs no special tooling and no concurrency — two ordinary turns in the chat client will do it.</p>
+        </div>
+        <p class="where">guards.py:267 reads the ledger · confirm.py:237 then waits for a human · nothing serialises the two</p>
+      </article>
+
+      <article class="finding">
+        <div class="fhead">
+          <span class="num">07</span>
+          <div>
+            <h3>The shipped configuration is still placeholder</h3>
+            <div class="tags" style="margin-top:.6rem">
+              <span class="pill p-high">Release gate</span>
+              <span class="pill p-plain">Already known</span>
+            </div>
+          </div>
+        </div>
+        <p>The account allowlist in <code>config/policy.yaml</code> is still <code>"0000000000"</code>, and <code>config/roles.yaml</code> still ships <code>mode: file</code> — in which the tier resolver ignores the account entirely, so the per-account permission model the project is built around doesn't exist as configured. The single <code>lead</code> entry is lead everywhere.</p>
+        <p>Both are recorded in CLAUDE.md already. Listing them here because they're release gates, not discoveries.</p>
+        <p class="where">config/policy.yaml:19 · config/roles.yaml:23 · roles.py:199</p>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Should fix, but not blocking</h2>
+    <div class="scroller">
+      <table>
+        <caption>Eleven further findings, roughly by severity.</caption>
+        <thead>
+          <tr><th style="width:2.5rem">#</th><th>Finding</th><th style="width:5.5rem">Severity</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">08</td><td>A test named “the daily ceiling accumulates” applies 45 of a 3,000 allowance and asserts a subtraction the code performs the same way. Delete the ceiling rule and only a unit test notices.</td><td class="sev m">High</td></tr>
+          <tr><td class="mono">09</td><td><code>/healthz</code> is unauthenticated and returns the config error text verbatim — which embeds the file path and the offending value, including customer-ID entries. Its own docstring promises the opposite.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">10</td><td><code>health_check</code> is the only tool that never calls the gate. Its error text concatenates every managed customer ID for any caller, unaudited, and fires one Ads read per allowlisted account.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">11</td><td>Whether new keywords and ads start paused is decided at draft. Tighten that rule mid-plan and an enabled ad is still created.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">12</td><td>Deleting today's audit file silently resets everyone's daily cap to zero-used. No error, no log line. In-process rotation guards against logrotate, not this.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">13</td><td>The timezone setting hot-reloads and selects which ledger file is read — so editing it restores a full allowance instantly.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">14</td><td>The update-mask guard only checks that no <em>extra</em> field is named; nothing checks the field being changed is actually in it. A no-op mutation reports success.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">15</td><td>A budget's period is never read, so a custom-period budget is previewed as a daily one and measured against the daily maximum.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">16</td><td>No concurrency tests exist anywhere — the plan store, audit log, policy reload and tier cache are never exercised under contention.</td><td class="sev m">Medium</td></tr>
+          <tr><td class="mono">17</td><td>The update-mask tests assert a condition the code already raises on, so they can never fail.</td><td class="sev l">Low</td></tr>
+          <tr><td class="mono">18</td><td><code>str.isdigit()</code> accepts non-ASCII digits like <code>'१२३'</code>, and these values feed query interpolation. A second defence catches it, but use <code>isascii() and isdigit()</code>.</td><td class="sev l">Low</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="solid">
+    <h2>What's genuinely solid</h2>
+    <p>Worth stating plainly, because it's most of the system and the findings above shouldn't obscure it.</p>
+    <ul>
+      <li>Claiming a plan is a proper atomic operation — two people confirming the same plan at once cannot both succeed, and a double-apply is impossible.</li>
+      <li>Everything fails closed. An unregistered tool defaults to the highest tier, an unrecognised permission value maps to none, and a failed permission lookup refuses rather than guessing. Failures are never cached.</li>
+      <li>The <code>none</code> and <code>readonly</code> spending limits are pinned to zero in code, not trusted to the config file.</li>
+      <li>No token or secret is ever logged.</li>
+      <li>Enum lookups, resource paths, ad construction and the “don't let Google bury errors in a 200 response” setting are all correct — verified against the installed v25 library, not from memory.</li>
+      <li>Money conversion tests use literal expected values rather than recomputing them, so they can actually disagree with the code.</li>
+      <li>Human approval sits in exactly the right place: after the policy gate, before the plan is used up. A client that can't ask a human is refused rather than waved through.</li>
+    </ul>
+  </div>
+
+  <section>
+    <h2>Suggested order</h2>
+    <div class="order">
+      <div><span class="mono">01</span><span>The config crash — it's the only finding that can take the whole server down without anyone noticing.</span></div>
+      <div><span class="mono">02</span><span>The untested permission check — small, and right now nothing would catch a regression in it.</span></div>
+      <div><span class="mono">03</span><span>The wrong Google field — a one-line query change on a guard the approval model depends on.</span></div>
+      <div><span class="mono">04–06</span><span>The three staleness bugs. They're one shape and are best fixed together.</span></div>
+      <div><span class="mono">07</span><span>Real configuration, last, once everything above holds.</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Five review passes over the codebase at commit <span class="mono">3d7ca4b</span>, then hand-verification of the highest-severity claims by running code and reading the installed Google Ads v25 protobuf definitions. Findings 1, 2, 3 and the Google API checks in “what's solid” were confirmed directly rather than inferred. Nothing in the repository was modified.</p>
+  </footer>
+
+</div>

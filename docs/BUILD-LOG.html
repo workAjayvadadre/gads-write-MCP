@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gads-write-mcp Build Log</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+body { margin: 0; }
+img { max-width: 100%; }
+
+  :root {
+    --ground:      #F4F6F8;
+    --surface:     #FFFFFF;
+    --surface-2:   #EDF0F4;
+    --ink:         #18212D;
+    --muted:       #5A6675;
+    --faint:       #8994A3;
+    --rule:        #DCE2E9;
+    --accent:      #1D4E76;
+    --accent-soft: #E3EDF5;
+    --flag:        #8A5300;
+    --flag-soft:   #F7EBD8;
+    --good:        #1F6B4A;
+
+    --measure: 68ch;
+    --step-0: 0.94rem;
+    --step-1: 1.06rem;
+    --step-2: 1.35rem;
+    --step-3: 1.85rem;
+    --step-4: 2.6rem;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #101620;
+      --surface:     #161E29;
+      --surface-2:   #1E2833;
+      --ink:         #E4EAF1;
+      --muted:       #9AA6B5;
+      --faint:       #6C7887;
+      --rule:        #2A3542;
+      --accent:      #7FB2D9;
+      --accent-soft: #1B2B39;
+      --flag:        #D9A05B;
+      --flag-soft:   #2C2418;
+      --good:        #6FC49B;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #101620;
+    --surface:     #161E29;
+    --surface-2:   #1E2833;
+    --ink:         #E4EAF1;
+    --muted:       #9AA6B5;
+    --faint:       #6C7887;
+    --rule:        #2A3542;
+    --accent:      #7FB2D9;
+    --accent-soft: #1B2B39;
+    --flag:        #D9A05B;
+    --flag-soft:   #2C2418;
+    --good:        #6FC49B;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    font-size: var(--step-1);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 62rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 5rem;
+  }
+
+  /* ---------------------------------------------------------- masthead -- */
+
+  .masthead { border-bottom: 2px solid var(--ink); padding-bottom: 1.75rem; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.9rem;
+  }
+
+  h1 {
+    font-family: Spectral, Georgia, serif;
+    font-weight: 600;
+    font-size: var(--step-4);
+    line-height: 1.1;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+    margin: 0 0 0.7rem;
+  }
+
+  .standfirst {
+    color: var(--muted);
+    max-width: var(--measure);
+    margin: 0;
+    font-size: var(--step-1);
+  }
+
+  /* ------------------------------------------------------------ facts --- */
+
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+    gap: 0;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 3rem;
+  }
+
+  .fact { padding: 1.5rem 1.25rem 1.5rem 0; }
+
+  .fact dt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-bottom: 0.35rem;
+  }
+
+  .fact dd {
+    margin: 0;
+    font-family: Spectral, Georgia, serif;
+    font-size: var(--step-3);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+
+  .fact dd span { font-size: var(--step-0); font-family: "IBM Plex Sans", sans-serif; font-weight: 400; color: var(--muted); }
+
+  /* ----------------------------------------------------------- section -- */
+
+  h2 {
+    font-family: Spectral, Georgia, serif;
+    font-size: var(--step-3);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.5rem;
+    text-wrap: balance;
+  }
+
+  .section-note {
+    color: var(--muted);
+    max-width: var(--measure);
+    margin: 0 0 2rem;
+    font-size: var(--step-0);
+  }
+
+  section { margin-bottom: 3.5rem; }
+
+  /* ---------------------------------------------------------- timeline -- */
+
+  .day {
+    display: grid;
+    grid-template-columns: 10rem 1fr;
+    gap: 0 2rem;
+    padding: 1.6rem 0;
+    border-top: 1px solid var(--rule);
+    align-items: start;
+  }
+
+  .day:last-child { border-bottom: 1px solid var(--rule); }
+
+  .when { position: sticky; top: 1rem; }
+
+  .date {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--ink);
+    display: block;
+    letter-spacing: 0.01em;
+  }
+
+  .weekday {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--faint);
+    display: block;
+    margin-top: 0.15rem;
+  }
+
+  .commits {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 0.6rem;
+    display: block;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .phase {
+    display: inline-block;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 0.2rem 0.5rem;
+    border-radius: 2px;
+    margin-bottom: 0.65rem;
+  }
+
+  .day h3 {
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: var(--step-1);
+    font-weight: 600;
+    margin: 0 0 0.5rem;
+    text-wrap: balance;
+  }
+
+  .day p { margin: 0 0 0.7rem; max-width: var(--measure); color: var(--muted); font-size: var(--step-0); }
+  .day p:last-child { margin-bottom: 0; }
+  .day strong { color: var(--ink); font-weight: 600; }
+
+  ul.did { margin: 0.4rem 0 0; padding: 0; list-style: none; max-width: var(--measure); }
+
+  ul.did li {
+    position: relative;
+    padding-left: 1.1rem;
+    margin-bottom: 0.4rem;
+    font-size: var(--step-0);
+    color: var(--muted);
+  }
+
+  ul.did li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0.62em;
+    width: 5px; height: 1px;
+    background: var(--faint);
+  }
+
+  ul.did li strong { color: var(--ink); }
+
+  /* ------------------------------------------------------------ found --- */
+
+  .found {
+    border-left: 3px solid var(--flag);
+    background: var(--flag-soft);
+    padding: 0.85rem 1rem;
+    margin-top: 0.9rem;
+    max-width: var(--measure);
+  }
+
+  .found-label {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--flag);
+    display: block;
+    margin-bottom: 0.3rem;
+  }
+
+  .found p { margin: 0; color: var(--ink); font-size: var(--step-0); }
+
+  /* ------------------------------------------------------------ table --- */
+
+  .table-scroll { overflow-x: auto; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: var(--step-0);
+    min-width: 34rem;
+  }
+
+  th {
+    text-align: left;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--faint);
+    font-weight: 500;
+    padding: 0 1rem 0.6rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  td {
+    padding: 0.7rem 1rem 0.7rem 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    color: var(--muted);
+  }
+
+  td:first-child { color: var(--ink); font-weight: 500; }
+  td.num { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; }
+
+  .state {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .state.done { color: var(--good); }
+  .state.open { color: var(--flag); }
+
+  /* ----------------------------------------------------------- closing -- */
+
+  .closing {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 1.75rem;
+  }
+
+  .closing h2 { margin-top: 0; }
+  .closing ul.did { max-width: none; }
+
+  footer {
+    margin-top: 3.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--rule);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.72rem;
+    color: var(--faint);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.5rem;
+  }
+
+  @media (max-width: 46rem) {
+    .day { grid-template-columns: 1fr; gap: 0.75rem; }
+    .when { position: static; display: flex; align-items: baseline; gap: 0.75rem; }
+    .weekday, .commits { margin: 0; }
+    h1 { font-size: var(--step-3); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Engineering log &middot; 28 Aug – 7 Sep 2026</p>
+    <h1>gads-write-mcp Build Log</h1>
+    <p class="standfirst">
+      A guardrailed write server for Google Ads, letting the marketing team manage
+      campaigns in plain English through Claude — with a preview before every change
+      and an audit line after it. Built, reviewed, deployed and tested against live
+      accounts over eleven days.
+    </p>
+  </header>
+
+  <dl class="facts">
+    <div class="fact"><dt>Working days</dt><dd>9</dd></div>
+    <div class="fact"><dt>Commits</dt><dd>31</dd></div>
+    <div class="fact"><dt>Lines added</dt><dd>17,242</dd></div>
+    <div class="fact"><dt>Automated tests</dt><dd>461</dd></div>
+    <div class="fact"><dt>Tools shipped</dt><dd>15 <span>7 read / 8 write</span></dd></div>
+  </dl>
+
+  <section>
+    <h2>What was built</h2>
+    <p class="section-note">
+      An MCP server on <span style="font-family:'IBM Plex Mono',monospace">adswrite.indiraivf.in</span>,
+      separate from the existing read-only server. Team members connect Claude with their own
+      Google login; permissions come from Google Ads itself, so adding someone in the Google Ads
+      interface is all that is needed to give them access here.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Capability</th><th>Detail</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Reading</td><td>Accounts, campaigns, ad groups, performance, search terms, and free-form queries for anything else</td></tr>
+          <tr><td>Changing</td><td>Pause and enable campaigns, daily budgets, bids, keywords, negative keywords, new ads</td></tr>
+          <tr><td>Approval</td><td>Every change returns a preview first and applies only on a second, separate confirmation</td></tr>
+          <tr><td>Permissions</td><td>Read-only, operator and lead, resolved per account from each person's own Google Ads role</td></tr>
+          <tr><td>Record</td><td>Every decision logged with who, when, what was approved and which resource changed — refusals included</td></tr>
+          <tr><td>Safety</td><td>Accounts limited to those under the manager account; no delete or remove operations exist; one switch makes the whole server read-only</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Day by day</h2>
+    <p class="section-note">
+      Dates and commit counts are taken from the repository history.
+    </p>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">28 August</span>
+        <span class="weekday">Friday</span>
+        <span class="commits">1 commit</span>
+      </div>
+      <div>
+        <span class="phase">Set-up</span>
+        <h3>Project established</h3>
+        <p>
+          Repository created as a separate service from the read-only Google Ads server already
+          running, with its own process, hostname and deployment. Scope, constraints and the
+          safety requirements written down before any code.
+        </p>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">29 August</span>
+        <span class="weekday">Saturday</span>
+        <span class="commits">3 commits</span>
+      </div>
+      <div>
+        <span class="phase">Phases 1–2</span>
+        <h3>Login, permissions and the gate</h3>
+        <ul class="did">
+          <li><strong>Google sign-in</strong> — every request authenticated with the user's own Google account; no shared or stored credential anywhere in the system</li>
+          <li><strong>Permission tiers</strong> — read-only, operator and lead, with the rule that anything unrecognised gets no access rather than default access</li>
+          <li><strong>The gate</strong> — a single checkpoint every request passes through, so a check cannot be forgotten on one operation and present on another</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">31 August</span>
+        <span class="weekday">Monday</span>
+        <span class="commits">9 commits</span>
+      </div>
+      <div>
+        <span class="phase">Phases 3–5</span>
+        <h3>Reading, then the first write operations</h3>
+        <ul class="did">
+          <li><strong>Reading Google Ads</strong> — accounts, campaign performance and search term reports</li>
+          <li><strong>Permissions from Google</strong> — a person's tier now derived from their actual Google Ads role rather than a list maintained by hand</li>
+          <li><strong>Two-step changes</strong> — pause and enable built as draft-then-confirm, so nothing applies without a separate, deliberate second step</li>
+          <li><strong>The full write set</strong> — budgets, bids, keywords, negative keywords and new ads</li>
+        </ul>
+        <p>
+          The heaviest day of the project. All money-handling written in millionths of a unit,
+          the format Google requires, with a naming rule to make a missing conversion — a
+          1,000,000× error — visible in review rather than in an account.
+        </p>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">1 September</span>
+        <span class="weekday">Tuesday</span>
+        <span class="commits">2 commits</span>
+      </div>
+      <div>
+        <span class="phase">Hardening</span>
+        <h3>Closing a gap between drafting and applying</h3>
+        <p>
+          Found that the checks run when a change was drafted were stricter than those re-run when
+          it was applied — meaning an approved change could take effect under rules it had never
+          been tested against. Both steps now run identical code, with regression tests to keep
+          them that way.
+        </p>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">2 September</span>
+        <span class="weekday">Wednesday</span>
+        <span class="commits">6 commits</span>
+      </div>
+      <div>
+        <span class="phase">Phase 6</span>
+        <h3>Operations, approval and monitoring</h3>
+        <ul class="did">
+          <li><strong>Human approval enforced by the server</strong> — the server itself stops and asks a person to accept the preview, rather than trusting the client to ask</li>
+          <li><strong>Health endpoint</strong> — reports a fault to monitoring rather than running quietly on stale configuration</li>
+          <li><strong>Self-managing audit log</strong> — rotates and prunes itself, so it needs no external maintenance</li>
+          <li><strong>Two defects fixed</strong> — a malformed config crashing live requests, and a budget change that could check one budget and alter another</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">3 September</span>
+        <span class="weekday">Thursday</span>
+        <span class="commits">3 commits</span>
+      </div>
+      <div>
+        <span class="phase">Zero config</span>
+        <h3>Removing the configuration file entirely</h3>
+        <p>
+          The server had a settings file listing permitted accounts, currencies and spending
+          limits. It needed a developer for every change — which meant the marketing team could
+          not manage their own tool.
+        </p>
+        <ul class="did">
+          <li><strong>Accounts now read from Google</strong> — linking a sub-account in the Google Ads interface is enough; nothing to edit here</li>
+          <li><strong>Currency and timezone read per account</strong> — previously one setting for the whole server, which would have been wrong for any account not in rupees</li>
+          <li><strong>Spending limits made proportional</strong> — rules that scale with the account instead of fixed amounts that go stale</li>
+        </ul>
+        <div class="found">
+          <span class="found-label">Independent code review — 7 defects found</span>
+          <p>
+            Five could have allowed a change that should have been refused. The most serious: a
+            single typo in a settings value would have silently switched off the only remaining
+            spending control while appearing to leave it on. All fixed, each with a test that
+            reproduces the original fault.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">4 September</span>
+        <span class="weekday">Friday</span>
+        <span class="commits">2 commits</span>
+      </div>
+      <div>
+        <span class="phase">Design change</span>
+        <h3>Matching what the Google Ads interface already allows</h3>
+        <p>
+          Testing the rules against realistic scenarios showed several would have blocked ordinary
+          work — raising a budget for a seasonal push, for instance, would have taken four days
+          instead of one action. A tool people work around protects nothing.
+        </p>
+        <p>
+          Rules were reset around a clear principle: <strong>refuse only what cannot be undone,
+          what falls outside our accounts, or what would make the preview misleading.</strong>
+          Everything else is shown as a warning and left to the person approving — the same
+          position they are in using Google Ads directly, but with a preview and an audit trail
+          they do not get there.
+        </p>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">5 September</span>
+        <span class="weekday">Saturday</span>
+        <span class="commits">2 commits</span>
+      </div>
+      <div>
+        <span class="phase">Live testing</span>
+        <h3>First deployment and first real changes</h3>
+        <ul class="did">
+          <li><strong>Deployed and connected</strong> — sign-in, permissions and account listing all confirmed working against live Google Ads data</li>
+          <li><strong>Read figures verified</strong> — reported spend cross-checked against Google's own totals to confirm the unit conversion was correct</li>
+          <li><strong>First live change applied</strong> — a campaign paused end to end through preview, approval and audit</li>
+        </ul>
+        <div class="found">
+          <span class="found-label">Defect found in live use</span>
+          <p>
+            The very first attempted change failed. A parameter was being passed to Google in the
+            wrong position — an error that would have blocked <em>every</em> write operation, and
+            which the existing tests could not catch because the test stand-in accepted arguments
+            the real Google client rejects. Fixed, and the stand-in now checks against the real
+            interface so this class of fault fails during testing instead of in production.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="day">
+      <div class="when">
+        <span class="date">7 September</span>
+        <span class="weekday">Monday</span>
+        <span class="commits">3 commits</span>
+      </div>
+      <div>
+        <span class="phase">Usability</span>
+        <h3>Acting on what testing revealed</h3>
+        <ul class="did">
+          <li><strong>Tool grouping</strong> — read and write operations now declare themselves as such, so the connector can be set to ask before anything changes</li>
+          <li><strong>Finding things</strong> — testing showed newly created campaigns were invisible to the server, because the existing reports only return items with recorded activity. Added the means to list campaigns and ad groups directly</li>
+          <li><strong>General querying</strong> — rather than adding a tool per question, added one that answers any of them, so ads, assets, conversions and change history need no further development</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Where it stands</h2>
+    <p class="section-note">
+      Deployed and in use for reading. Write operations are proven end to end against a
+      dedicated test account and are being exercised before the wider team is onboarded.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Item</th><th>State</th><th>Note</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Deployment</td><td><span class="state done">Live</span></td><td>Running under process management behind the existing web server</td></tr>
+          <tr><td>Sign-in and permissions</td><td><span class="state done">Verified</span></td><td>Confirmed against live Google Ads with a real account</td></tr>
+          <tr><td>Reading</td><td><span class="state done">Verified</span></td><td>Figures cross-checked against Google's own reporting</td></tr>
+          <tr><td>Changing campaigns</td><td><span class="state done">Verified</span></td><td>Applied end to end on an isolated test account</td></tr>
+          <tr><td>Non-admin access</td><td><span class="state open">To confirm</span></td><td>Needs one colleague with standard or read-only access to sign in</td></tr>
+          <tr><td>Wider rollout</td><td><span class="state open">Pending</span></td><td>Follows the above</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="closing">
+    <h2>Worth noting</h2>
+    <ul class="did">
+      <li><strong>No stored credentials.</strong> Every action uses the signed-in person's own Google account, so removing someone from Google Ads removes their access here immediately, with no change required to this system.</li>
+      <li><strong>Nothing can be deleted.</strong> There are no remove operations at all. Pausing can be undone; deletion cannot, so it was left out deliberately.</li>
+      <li><strong>Every action is recorded</strong> — including refused ones, which is how a limit set too tight for real work becomes visible rather than being quietly worked around.</li>
+      <li><strong>Three rounds of review found real faults</strong> — an automated review, a live deployment, and hands-on testing each surfaced defects the previous stage had missed. The most serious two were found in the last week, both now covered by tests.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>Repository: gads-write-mcp</span>
+    <span>28 Aug – 7 Sep 2026</span>
+    <span>31 commits &middot; 461 tests</span>
+  </footer>
+
+</div>
+
+</body>
+</html>

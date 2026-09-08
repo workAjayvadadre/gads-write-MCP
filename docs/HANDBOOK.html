@@ -1,0 +1,608 @@
+<title>gads-write-mcp Handbook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground:      #f6f8f8;
+    --surface:     #ffffff;
+    --sunken:      #eef2f2;
+    --ink:         #12191a;
+    --muted:       #5a6a6c;
+    --hairline:    #d6dfdf;
+    --accent:      #0f5c5b;
+    --accent-soft: #e3efee;
+    --danger:      #a93226;
+    --danger-soft: #fbeeec;
+    --warn:        #8a5a06;
+    --warn-soft:   #fbf3e4;
+
+    --sans:  "Archivo", "Segoe UI", system-ui, sans-serif;
+    --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --mono:  "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0e1415; --surface: #151d1e; --sunken: #111a1b;
+      --ink: #e4ebea; --muted: #93a3a4; --hairline: #263435;
+      --accent: #5fb8b4; --accent-soft: #12302f;
+      --danger: #f08b7e; --danger-soft: #2b1917;
+      --warn: #dda43c; --warn-soft: #2a2114;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0e1415; --surface: #151d1e; --sunken: #111a1b;
+    --ink: #e4ebea; --muted: #93a3a4; --hairline: #263435;
+    --accent: #5fb8b4; --accent-soft: #12302f;
+    --danger: #f08b7e; --danger-soft: #2b1917;
+    --warn: #dda43c; --warn-soft: #2a2114;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground); color: var(--ink);
+    font-family: var(--serif); font-size: 17px; line-height: 1.65;
+    margin: 0; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 52rem; margin: 0 auto; padding: 3.5rem 1.5rem 6rem;
+          display: flex; flex-direction: column; gap: 3.5rem; }
+
+  h1, h2, h3, h4, .lbl, th, .pill, .toc { font-family: var(--sans); }
+  h1, h2, h3, h4 { margin: 0; text-wrap: balance; font-weight: 600; }
+  h1 { font-size: 2.5rem; line-height: 1.1; letter-spacing: -0.025em; font-weight: 700; }
+  h2 { font-size: 1.6rem; letter-spacing: -0.015em; }
+  h3 { font-size: 1.12rem; }
+  h4 { font-size: 0.95rem; }
+  p, ul, ol { margin: 0; }
+  ul, ol { padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.4rem; }
+
+  code, .mono { font-family: var(--mono); font-size: 0.85em; }
+  code { background: var(--sunken); padding: 0.1em 0.35em; border-radius: 3px; word-break: break-word; }
+  pre { background: var(--sunken); border: 1px solid var(--hairline); border-radius: 5px;
+        padding: 1rem 1.15rem; overflow-x: auto; margin: 0;
+        font-family: var(--mono); font-size: 0.79rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .cmt { color: var(--muted); }
+
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  .lbl { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.14em;
+         font-weight: 600; color: var(--muted); }
+  .rule { height: 3px; width: 3rem; background: var(--accent); }
+  section { display: flex; flex-direction: column; gap: 1.25rem; scroll-margin-top: 1.5rem; }
+  .lede { color: var(--muted); }
+
+  header .meta { display: flex; flex-wrap: wrap; gap: 0.35rem 1.25rem;
+                 font-family: var(--mono); font-size: 0.76rem; color: var(--muted); }
+
+  /* callouts */
+  .note { border-left: 3px solid var(--accent); background: var(--accent-soft);
+          padding: 1rem 1.15rem; border-radius: 0 4px 4px 0;
+          display: flex; flex-direction: column; gap: 0.5rem; }
+  .danger { border-left: 3px solid var(--danger); background: var(--danger-soft);
+            padding: 1rem 1.15rem; border-radius: 0 4px 4px 0;
+            display: flex; flex-direction: column; gap: 0.5rem; }
+  .warn { border-left: 3px solid var(--warn); background: var(--warn-soft);
+          padding: 1rem 1.15rem; border-radius: 0 4px 4px 0;
+          display: flex; flex-direction: column; gap: 0.5rem; }
+  .note .lbl { color: var(--accent); }
+  .danger .lbl { color: var(--danger); }
+  .warn .lbl { color: var(--warn); }
+
+  /* toc */
+  .toc { background: var(--surface); border: 1px solid var(--hairline); border-radius: 5px;
+         padding: 1.25rem 1.5rem; display: grid; gap: 0.45rem 2rem;
+         grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); font-size: 0.9rem; }
+  .toc a { text-decoration: none; display: flex; gap: 0.7rem; }
+  .toc a:hover { text-decoration: underline; }
+  .toc span:first-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* tables */
+  .scroller { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.65rem 0.9rem 0.65rem 0;
+           border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  th { font-size: 0.67rem; text-transform: uppercase; letter-spacing: 0.1em;
+       color: var(--muted); font-weight: 600; }
+  td.f { white-space: nowrap; }
+  td.f code { background: none; padding: 0; color: var(--accent); font-weight: 500; }
+
+  /* step list */
+  .steps { display: flex; flex-direction: column; gap: 2rem; counter-reset: s; }
+  .step { display: grid; grid-template-columns: 2.2rem 1fr; gap: 0 1rem; align-items: start; }
+  .step > .n { font-family: var(--sans); font-weight: 700; font-size: 0.95rem;
+               color: var(--accent); font-variant-numeric: tabular-nums;
+               border-top: 3px solid var(--accent); padding-top: 0.45rem; }
+  .step > .body { display: flex; flex-direction: column; gap: 0.75rem; }
+
+  figure { margin: 0; display: flex; flex-direction: column; gap: 0.75rem; }
+  figcaption { font-size: 0.85rem; color: var(--muted); }
+  .diagram { background: var(--surface); border: 1px solid var(--hairline);
+             border-radius: 5px; padding: 1.5rem 1.25rem; }
+  svg text { font-family: "Archivo", sans-serif; }
+
+  footer { border-top: 1px solid var(--hairline); padding-top: 1.5rem;
+           color: var(--muted); font-size: 0.88rem;
+           display: flex; flex-direction: column; gap: 0.6rem; }
+
+  @media (max-width: 34rem) {
+    body { font-size: 16px; }
+    h1 { font-size: 1.95rem; } h2 { font-size: 1.35rem; }
+    .wrap { padding-top: 2.25rem; gap: 2.5rem; }
+    .step { grid-template-columns: 1fr; gap: 0.5rem; }
+    .step > .n { border-top: none; padding-top: 0; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header style="display:flex;flex-direction:column;gap:1.1rem">
+    <div class="rule"></div>
+    <h1>gads-write-mcp Handbook</h1>
+    <p class="lede">How a request travels from someone typing in Claude, through Nginx, through every safety layer, to a mutation on a Google Ads account — and what you must configure to run this somewhere else.</p>
+    <div class="meta">
+      <span>Python 3.11+</span><span>FastMCP 3.4.7</span><span>Google Ads API v25</span>
+      <span>PM2 + Nginx + Ubuntu</span><span>392 tests</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <a href="#what"><span>01</span><span>What this server is</span></a>
+    <a href="#journey"><span>02</span><span>The journey of one request</span></a>
+    <a href="#layers"><span>03</span><span>Each layer, explained</span></a>
+    <a href="#write"><span>04</span><span>The two-step write</span></a>
+    <a href="#files"><span>05</span><span>Every file, and its job</span></a>
+    <a href="#config"><span>06</span><span>Configuration reference</span></a>
+    <a href="#deploy"><span>07</span><span>Deploying somewhere new</span></a>
+    <a href="#elsewhere"><span>08</span><span>Moving it to another org</span></a>
+    <a href="#gaps"><span>09</span><span>Before you turn writes on</span></a>
+  </nav>
+
+  <!-- ============================================================ -->
+  <section id="what">
+    <h2>01 &nbsp; What this server is</h2>
+    <p>An MCP server that lets someone change a Google Ads account by asking Claude in plain English — <em>"pause the brand campaign"</em>, <em>"raise the budget on X to 500"</em>. It is a separate process, on a separate hostname, from the existing read-only Google Ads MCP.</p>
+    <div class="danger">
+      <span class="lbl">The premise</span>
+      <p>This server spends real money. Every design decision in it starts from that. Guardrails are not a feature here; they are the product. A read-only server that is wrong shows a bad number. This one, if wrong, moves a budget.</p>
+    </div>
+    <p>Three ideas carry the whole design:</p>
+    <ul>
+      <li><strong>Nothing writes directly.</strong> A write tool never changes anything — it returns a preview and a plan ID. A separate call applies it, and re-checks everything first.</li>
+      <li><strong>Every call uses the caller's own Google login.</strong> There is no service account or stored refresh token anywhere. Remove someone in Google Ads and they stop working here immediately, with nothing to redeploy.</li>
+      <li><strong>Everything fails closed.</strong> An unknown tool, an unrecognised permission level, a lookup that times out — all refuse. There is no path where uncertainty means "allow".</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="journey">
+    <h2>02 &nbsp; The journey of one request</h2>
+    <p>Someone types <em>"pause the Brand – Exact campaign"</em> into Claude. Here is everything that happens, and which file owns each step.</p>
+
+    <figure>
+      <div class="diagram scroller">
+        <svg viewBox="0 0 660 620" width="660" height="620" role="img" aria-label="Vertical flow from Claude client through Nginx, FastMCP, OAuth, middleware, tool, gate, executor and audit log, back to a response">
+          <defs>
+            <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/>
+            </marker>
+          </defs>
+          <g stroke="var(--muted)" stroke-width="1.4" marker-end="url(#a)" fill="none">
+            <line x1="120" y1="52"  x2="120" y2="72"/>
+            <line x1="120" y1="116" x2="120" y2="136"/>
+            <line x1="120" y1="180" x2="120" y2="200"/>
+            <line x1="120" y1="244" x2="120" y2="264"/>
+            <line x1="120" y1="308" x2="120" y2="328"/>
+            <line x1="120" y1="372" x2="120" y2="392"/>
+            <line x1="120" y1="436" x2="120" y2="456"/>
+            <line x1="120" y1="500" x2="120" y2="520"/>
+          </g>
+
+          <!-- boxes: y, title, file -->
+          <g>
+            <rect x="14" y="8"   width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="27" font-size="13" font-weight="600" fill="var(--ink)">Claude client</text>
+            <text x="28" y="43" font-size="10.5" fill="var(--muted)">POST /mcp  ·  tools/call</text>
+
+            <rect x="14" y="72"  width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="91" font-size="13" font-weight="600" fill="var(--ink)">Nginx  :443</text>
+            <text x="28" y="107" font-size="10.5" fill="var(--muted)">TLS, no buffering, 300s</text>
+
+            <rect x="14" y="136" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="155" font-size="13" font-weight="600" fill="var(--ink)">FastMCP  :8081</text>
+            <text x="28" y="171" font-size="10.5" fill="var(--muted)">validates the OAuth token</text>
+
+            <rect x="14" y="200" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="219" font-size="13" font-weight="600" fill="var(--ink)">TierMiddleware</text>
+            <text x="28" y="235" font-size="10.5" fill="var(--muted)">coarse refusal, before the tool</text>
+
+            <rect x="14" y="264" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="283" font-size="13" font-weight="600" fill="var(--ink)">the tool function</text>
+            <text x="28" y="299" font-size="10.5" fill="var(--muted)">normalises arguments</text>
+
+            <rect x="14" y="328" width="212" height="44" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="28" y="347" font-size="13" font-weight="600" fill="var(--ink)">Guard.check()</text>
+            <text x="28" y="363" font-size="10.5" fill="var(--muted)">eight checks, in order</text>
+
+            <rect x="14" y="392" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="411" font-size="13" font-weight="600" fill="var(--ink)">reads  /  executor</text>
+            <text x="28" y="427" font-size="10.5" fill="var(--muted)">the only Google Ads calls</text>
+
+            <rect x="14" y="456" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="475" font-size="13" font-weight="600" fill="var(--ink)">audit log</text>
+            <text x="28" y="491" font-size="10.5" fill="var(--muted)">one line, always</text>
+
+            <rect x="14" y="520" width="212" height="44" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+            <text x="28" y="539" font-size="13" font-weight="600" fill="var(--ink)">response to Claude</text>
+            <text x="28" y="555" font-size="10.5" fill="var(--muted)">preview + plan_id, or refusal</text>
+          </g>
+
+          <!-- right-hand file annotations -->
+          <g font-size="10.5" fill="var(--muted)" font-family="JetBrains Mono, monospace">
+            <text x="246" y="35">— the user's own words</text>
+            <text x="246" y="99">ops/nginx.conf</text>
+            <text x="246" y="163">server.py · auth/identity.py</text>
+            <text x="246" y="227">mcp_middleware.py · tools/registry.py</text>
+            <text x="246" y="291">tools/writes.py · tools/reads.py</text>
+            <text x="246" y="355" fill="var(--accent)">safety/guards.py + policy · spend · plans</text>
+            <text x="246" y="419">ads/reads.py · ads/executor.py</text>
+            <text x="246" y="483">safety/audit.py</text>
+            <text x="246" y="547">FastMCP serialises the dict</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>Every arrow is a place a request can be refused. Nothing reaches the Google Ads API without passing all of them.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="layers">
+    <h2>03 &nbsp; Each layer, explained</h2>
+
+    <h3>Nginx — <code>ops/nginx.conf</code></h3>
+    <p>Terminates TLS and proxies to <code>127.0.0.1:8081</code>. Two defaults had to be changed, and both matter:</p>
+    <ul>
+      <li><code>proxy_buffering off</code> — the MCP endpoint streams responses as server-sent events. Buffered, they arrive in one lump at the end or not at all.</li>
+      <li><code>proxy_read_timeout 300s</code> — a tool call waiting on the Google Ads API can outlast the 60-second default and get cut off mid-response.</li>
+    </ul>
+    <p>It also sets <code>X-Forwarded-Proto</code>, without which the OAuth callback is built as <code>http://</code> and Google rejects it.</p>
+
+    <h3>FastMCP and OAuth — <code>server.py</code>, <code>auth/identity.py</code></h3>
+    <p>The whole app is constructed once at import time in <code>server.py</code> — the composition root. Nothing anywhere reaches for a global, which is exactly why the test suite can build the same objects against fakes.</p>
+    <p>FastMCP's <code>GoogleProvider</code> handles the OAuth dance and validates the token on every request. <code>auth/identity.py</code> then reads the caller's email <em>from the Google-signed token</em> — never from a tool argument or an HTTP header, both of which the caller controls.</p>
+
+    <div class="note">
+      <span class="lbl">Why MCP needs its own authorization layer</span>
+      <p>There are no URL paths in MCP. Every request is <code>POST /mcp</code> with the tool name as a string in the JSON body — so you cannot write <code>app.use('/admin', requireAdmin)</code>. <code>tools/registry.py</code> is the lookup table that replaces route-based auth, and a tool missing from it defaults to the highest tier.</p>
+    </div>
+
+    <h3>Tier middleware — <code>mcp_middleware.py</code></h3>
+    <p>Two hooks doing two genuinely different jobs, and confusing them is a real mistake:</p>
+    <ul>
+      <li><code>on_list_tools</code> filters the menu, so a read-only analyst never <em>sees</em> a budget tool and their Claude never proposes one. This is user experience.</li>
+      <li><code>on_call_tool</code> refuses the call. This is security.</li>
+    </ul>
+    <p>Both are needed: <code>tools/list</code> and <code>tools/call</code> are independent requests, so a client can call a tool it never listed or cached an hour ago before the user was demoted.</p>
+
+    <h3>The gate — <code>safety/guards.py</code></h3>
+    <p>The authoritative decision. Every tool calls it before doing anything else, and it always writes exactly one audit line. The order is deliberate:</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th style="width:2rem">#</th><th>Check</th><th>Refuses when</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">0</td><td>Registered</td><td>The tool is not in <code>registry.py</code> at all</td></tr>
+          <tr><td class="mono">1</td><td>Kill switch</td><td><code>GADS_WRITE_ENABLED=false</code> and the tool writes</td></tr>
+          <tr><td class="mono">2</td><td>Identity</td><td>No verified email on the request</td></tr>
+          <tr><td class="mono">3</td><td>Tier, for this account</td><td>Caller's role is below what the tool needs</td></tr>
+          <tr><td class="mono">4</td><td>Account allowlist</td><td>Customer ID is not in <code>policy.yaml</code></td></tr>
+          <tr><td class="mono">5</td><td>Blocked operation</td><td>Operation is on the blocklist</td></tr>
+          <tr><td class="mono">6</td><td>Field validation</td><td>Arguments are malformed</td></tr>
+          <tr><td class="mono">7–8</td><td>Policy limits + daily ceiling</td><td>Over a tier limit, or over today's spend allowance</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The ledger read comes last because it is the only check that touches the filesystem — and it only happens when a rule actually needs it.</p>
+
+    <h3>Talking to Google — <code>ads/reads.py</code>, <code>ads/executor.py</code></h3>
+    <p>Exactly two modules may talk to the Google Ads API: <code>reads.py</code> for every query, <code>executor.py</code> for every mutation. A test fails the build if a mutate call or a <code>get_service</code> appears anywhere else. One execution path means the audit log cannot be bypassed and there is one place to look when asking what could possibly have changed an account.</p>
+    <p><code>ads/client.py</code> builds a client per request from the caller's own token. There is no refresh token on disk anywhere in the repo.</p>
+
+    <h3>The audit log — <code>safety/audit.py</code></h3>
+    <p>Append-only JSON lines, one file per day (<code>logs/audit-2026-09-03.jsonl</code>), pruned in-process after <code>GADS_AUDIT_RETENTION_DAYS</code>.</p>
+    <div class="warn">
+      <span class="lbl">Do not add a logrotate rule</span>
+      <p>The per-user daily spend ceiling is <em>rebuilt from these files</em> rather than held in a counter — so a restart cannot clear someone's allowance. The flip side: an external tool that truncates or moves them silently gives everyone a fresh allowance, with no error and no log line. Rotation is in-process precisely so that no routine ops action can disable a security control.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="write">
+    <h2>04 &nbsp; The two-step write</h2>
+    <p>This is the heart of the system. A write tool does not write.</p>
+
+    <figure>
+      <div class="diagram scroller">
+        <svg viewBox="0 0 660 300" width="660" height="300" role="img" aria-label="Draft produces a plan; confirm re-runs every check, asks a human, then applies">
+          <defs>
+            <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/>
+            </marker>
+          </defs>
+
+          <rect x="8" y="30" width="190" height="86" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5"/>
+          <text x="24" y="54" font-size="13" font-weight="600" fill="var(--ink)">1 · draft</text>
+          <text x="24" y="74" font-size="10.5" fill="var(--muted)">pause_campaign(...)</text>
+          <text x="24" y="90" font-size="10.5" fill="var(--muted)">gate · read state · preview</text>
+          <text x="24" y="106" font-size="10.5" fill="var(--accent)">changes nothing</text>
+
+          <line x1="198" y1="73" x2="238" y2="73" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+          <text x="203" y="66" font-size="9.5" fill="var(--muted)" font-family="JetBrains Mono, monospace">plan_id</text>
+
+          <rect x="240" y="30" width="190" height="86" rx="4" fill="var(--surface)" stroke="var(--hairline)" stroke-width="1.5" stroke-dasharray="5 3"/>
+          <text x="256" y="54" font-size="13" font-weight="600" fill="var(--ink)">the plan</text>
+          <text x="256" y="74" font-size="10.5" fill="var(--muted)">owner-bound · expires</text>
+          <text x="256" y="90" font-size="10.5" fill="var(--muted)">single-use · in memory</text>
+          <text x="256" y="106" font-size="10.5" fill="var(--accent)">intent, never permission</text>
+
+          <line x1="430" y1="73" x2="470" y2="73" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+          <rect x="472" y="30" width="180" height="86" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="488" y="54" font-size="13" font-weight="600" fill="var(--ink)">2 · confirm</text>
+          <text x="488" y="74" font-size="10.5" fill="var(--muted)">confirm_and_apply(id)</text>
+          <text x="488" y="90" font-size="10.5" fill="var(--muted)">the only path to a</text>
+          <text x="488" y="106" font-size="10.5" fill="var(--muted)">real mutation</text>
+
+          <line x1="562" y1="116" x2="562" y2="140" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+          <rect x="240" y="142" width="412" height="140" rx="4" fill="var(--sunken)" stroke="var(--hairline)" stroke-width="1.5"/>
+          <text x="258" y="164" font-size="10" font-weight="600" fill="var(--muted)" letter-spacing="1.5">WHAT CONFIRM DOES, IN ORDER</text>
+          <g font-size="11" fill="var(--ink)">
+            <text x="258" y="186">1  check the plan is yours, unexpired, unused</text>
+            <text x="258" y="204">2  authorise again — tier, kill switch, allowlist</text>
+            <text x="258" y="222">3  re-read the account as it is NOW</text>
+            <text x="258" y="240">4  re-run every policy rule against that</text>
+            <text x="258" y="258">5  ask a human to approve the preview</text>
+            <text x="258" y="276">6  consume the plan, then apply, then audit</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>Why step 3 exists: budget and bid rules are relative — a percentage increase needs something to be a percentage <em>of</em> — while a plan stores an absolute target.</figcaption>
+    </figure>
+
+    <p>A plan carries <strong>intent, never authority</strong>. Between drafting and confirming, someone may have been demoted, the account may have left the allowlist, or a lead may have tightened <code>policy.yaml</code>. Re-checking is what makes that true rather than merely stated.</p>
+    <p>Two ordering decisions are worth knowing:</p>
+    <ul>
+      <li><strong>Approval comes after the gate, before the plan is used up.</strong> Nobody is asked to approve something policy would refuse anyway, and declining leaves the plan open rather than burning it.</li>
+      <li><strong>The plan is consumed before the mutation, not after.</strong> If the apply crashes halfway, the plan is already spent — so nobody blindly retries when we cannot know whether the change reached Google. A human has to look at the account. The alternative turns a timeout into a double-apply.</li>
+    </ul>
+    <div class="note">
+      <span class="lbl">Human approval is enforced by the server</span>
+      <p><code>confirm_and_apply</code> uses MCP elicitation to show the preview to a person and applies nothing unless they accept. A client that cannot show an approval prompt is <em>refused</em>, not waved through — failing open would leave exactly the hole this closes. Controlled by <code>GADS_REQUIRE_HUMAN_CONFIRMATION</code>, default true.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="files">
+    <h2>05 &nbsp; Every file, and its job</h2>
+
+    <h3>Entry and configuration</h3>
+    <div class="scroller"><table>
+      <tbody>
+        <tr><td class="f"><code>server.py</code></td><td>Composition root. Builds everything once, wires it explicitly, registers the tools, starts FastMCP.</td></tr>
+        <tr><td class="f"><code>settings.py</code></td><td>Reads and validates the environment. Collects <em>every</em> problem and reports them together, then refuses to start.</td></tr>
+        <tr><td class="f"><code>health.py</code></td><td>Unauthenticated <code>/healthz</code>. Returns 503 when a config reload was refused.</td></tr>
+        <tr><td class="f"><code>mcp_middleware.py</code></td><td>Filters the tool menu; refuses calls above the caller's tier.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Who is calling — <code>auth/</code></h3>
+    <div class="scroller"><table>
+      <tbody>
+        <tr><td class="f"><code>identity.py</code></td><td>Reads the caller's email and Google access token from the validated OAuth token.</td></tr>
+        <tr><td class="f"><code>tiers.py</code></td><td>The four levels: <code>none</code> → <code>readonly</code> → <code>operator</code> → <code>lead</code>.</td></tr>
+        <tr><td class="f"><code>roles.py</code></td><td>File-backed resolver, reading <code>roles.yaml</code>. Hot-reloads; keeps the last good version on a bad edit.</td></tr>
+        <tr><td class="f"><code>google_ads_roles.py</code></td><td>Resolves a tier from Google Ads itself, per account, with a short cache. Add someone in the Ads UI and they work here.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>The safety core — <code>safety/</code></h3>
+    <div class="scroller"><table>
+      <tbody>
+        <tr><td class="f"><code>guards.py</code></td><td>The gate. Runs every check in order and always writes an audit line.</td></tr>
+        <tr><td class="f"><code>policy.py</code></td><td>Loads and hot-reloads <code>policy.yaml</code>; holds the pure rule functions.</td></tr>
+        <tr><td class="f"><code>plans.py</code></td><td>Draft plans: owner-bound, time-limited, single-use, in process memory.</td></tr>
+        <tr><td class="f"><code>spend.py</code></td><td>Per-user daily ceiling, derived from the audit log rather than a counter.</td></tr>
+        <tr><td class="f"><code>audit.py</code></td><td>Append-only log, partitioned by date, prunes itself.</td></tr>
+        <tr><td class="f"><code>units.py</code></td><td>Money. Micros conversion, always <code>Decimal</code>, never float.</td></tr>
+        <tr><td class="f"><code>validators.py</code></td><td>Input validation, and the backstop against query injection.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>The tools — <code>tools/</code></h3>
+    <div class="scroller"><table>
+      <tbody>
+        <tr><td class="f"><code>registry.py</code></td><td>Which tier each tool needs, and whether it writes. Route-based auth's replacement.</td></tr>
+        <tr><td class="f"><code>reads.py</code></td><td>Read tools: accounts, campaign performance, search terms.</td></tr>
+        <tr><td class="f"><code>writes.py</code></td><td>Draft tools. Return a preview and a plan ID; change nothing.</td></tr>
+        <tr><td class="f"><code>operations.py</code></td><td>The checks for each write tool, in one place, used by <em>both</em> steps.</td></tr>
+        <tr><td class="f"><code>confirm.py</code></td><td>The only thing that applies a plan.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Google Ads — <code>ads/</code></h3>
+    <div class="scroller"><table>
+      <tbody>
+        <tr><td class="f"><code>client.py</code></td><td>Builds a per-request client from the caller's own token.</td></tr>
+        <tr><td class="f"><code>reads.py</code></td><td>The only module permitted to run a query.</td></tr>
+        <tr><td class="f"><code>executor.py</code></td><td>The only module permitted to call a mutate.</td></tr>
+        <tr><td class="f"><code>api_version.py</code></td><td>The API version pin, in one place and nowhere else.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="config">
+    <h2>06 &nbsp; Configuration reference</h2>
+    <p>Three files. <code>.env</code> holds secrets and deployment facts; the two YAML files hold policy and are hot-reloaded without a restart.</p>
+
+    <h3><code>.env</code></h3>
+    <div class="scroller"><table>
+      <thead><tr><th>Variable</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td class="f"><code>GADS_WRITE_ENABLED</code></td><td>Master kill switch. <code>false</code> makes the server read-only and hides every write tool. Default false — turning it on is deliberate.</td></tr>
+        <tr><td class="f"><code>GADS_REQUIRE_HUMAN_CONFIRMATION</code></td><td>Require a person to approve each apply. Default true.</td></tr>
+        <tr><td class="f"><code>GADS_ENV</code></td><td><code>production</code> enforces https and a signing key; <code>development</code> relaxes both.</td></tr>
+        <tr><td class="f"><code>GADS_BASE_URL</code></td><td>Must exactly match the origin registered in the Google OAuth client.</td></tr>
+        <tr><td class="f"><code>GADS_PORT</code></td><td>8081. The read-only server already uses 8000.</td></tr>
+        <tr><td class="f"><code>GADS_OAUTH_CLIENT_ID</code> / <code>_SECRET</code></td><td>The Google OAuth client.</td></tr>
+        <tr><td class="f"><code>GADS_JWT_SIGNING_KEY</code></td><td>Stable random string. Without it, every restart logs everyone out. Required in production.</td></tr>
+        <tr><td class="f"><code>GADS_DEVELOPER_TOKEN</code></td><td>Google Ads API developer token, from the MCC.</td></tr>
+        <tr><td class="f"><code>GADS_LOGIN_CUSTOMER_ID</code></td><td>Your manager (MCC) account, digits only.</td></tr>
+        <tr><td class="f"><code>GADS_TIER_CACHE_SECONDS</code></td><td>How long a resolved tier is reused. Default 60, max 900, 0 disables.</td></tr>
+        <tr><td class="f"><code>GADS_AUDIT_RETENTION_DAYS</code></td><td>Days of audit files to keep. Default 400.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><code>config/policy.yaml</code> — the money rules</h3>
+    <p>Hot-reloaded. A bad edit is refused and the last good version stays in force, with <code>/healthz</code> flipping to 503 so it does not pass silently.</p>
+    <ul>
+      <li><code>allowed_customer_ids</code> — the account allowlist. No wildcards. Nothing outside it can be read or written.</li>
+      <li><code>currency_code</code>, <code>timezone</code> — the account's own, used for display and for which day the spend ceiling counts against.</li>
+      <li><code>limits.defaults</code> and <code>limits.tiers</code> — min and max daily budget, max percentage increase, max CPC, and the per-user daily total. Tier blocks override defaults key by key.</li>
+      <li><code>rules</code> — new entities start paused, block broad match under manual CPC, allowed final URL domains.</li>
+      <li><code>blocked_operations</code>, <code>plans.ttl_seconds</code>.</li>
+    </ul>
+    <div class="note">
+      <span class="lbl">Written in code, not trusted to config</span>
+      <p>The <code>none</code> and <code>readonly</code> tiers are pinned to zero in <code>policy.py</code>. Their blocks in the YAML are documentation. A config that simply omitted them would otherwise have them inherit the permissive defaults.</p>
+    </div>
+
+    <h3><code>config/roles.yaml</code> — who is what</h3>
+    <p><code>mode: file</code> reads the <code>users:</code> map — fine for staging. <code>mode: google_ads</code> resolves each person's tier from Google Ads itself, per account, which is the operational goal: add someone in the Ads UI and they work here with no developer involvement.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="deploy">
+    <h2>07 &nbsp; Deploying somewhere new</h2>
+    <p>Ubuntu, Python 3.11+, Node for PM2, and a hostname you control. No Docker.</p>
+
+    <div class="steps">
+      <div class="step"><div class="n">01</div><div class="body">
+        <h4>Google Cloud — OAuth client</h4>
+        <p>Create an OAuth 2.0 <strong>Web application</strong> client. Add the authorised redirect URI, which must match <code>GADS_BASE_URL</code> exactly:</p>
+        <pre><code>https://YOUR-HOST/auth/callback</code></pre>
+        <p>Enable the Google Ads API on the project. On the consent screen, add the three scopes the server requests: <code>openid</code>, <code>userinfo.email</code>, and <code>https://www.googleapis.com/auth/adwords</code>.</p>
+        <div class="warn"><span class="lbl">Ask for adwords now</span><p>Adding a scope later forces every user to re-consent. The server requests all three from the start for that reason.</p></div>
+      </div></div>
+
+      <div class="step"><div class="n">02</div><div class="body">
+        <h4>Google Ads — developer token and MCC</h4>
+        <p>From your manager account, take the developer token (API Center) and the MCC customer ID, digits only, no dashes. A test-level token only works against test accounts — you need at least Basic access for real ones.</p>
+      </div></div>
+
+      <div class="step"><div class="n">03</div><div class="body">
+        <h4>The machine</h4>
+        <pre><code>git clone &lt;repo&gt; /home/ubuntu/gads-write-mcp
+cd /home/ubuntu/gads-write-mcp
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+mkdir -p logs
+.venv/bin/python -m pytest        <span class="cmt"># 392 pass, no network needed</span></code></pre>
+        <p>The editable install is required — <code>python -m gads_write.server</code> will not resolve otherwise.</p>
+      </div></div>
+
+      <div class="step"><div class="n">04</div><div class="body">
+        <h4><code>.env</code></h4>
+        <pre><code>cp .env.example .env
+python3 -c "import secrets; print(secrets.token_urlsafe(64))"   <span class="cmt"># signing key</span></code></pre>
+        <p>Fill in the OAuth client, the signing key, the developer token, the MCC ID, and your <code>GADS_BASE_URL</code>. <strong>Leave <code>GADS_WRITE_ENABLED=false</code></strong> — you turn writes on last, deliberately, once everything else is verified.</p>
+      </div></div>
+
+      <div class="step"><div class="n">05</div><div class="body">
+        <h4>Policy and roles</h4>
+        <p>Edit <code>config/policy.yaml</code>: put your real customer IDs in <code>allowed_customer_ids</code>, set the currency and timezone to the account's own, and set limits you would genuinely be comfortable with someone hitting.</p>
+        <p>Set <code>config/roles.yaml</code> to <code>mode: file</code> with one <code>lead</code> to start. Flip to <code>google_ads</code> once a real non-admin user has been verified (see §09).</p>
+      </div></div>
+
+      <div class="step"><div class="n">06</div><div class="body">
+        <h4>Nginx and TLS</h4>
+        <pre><code>sudo cp ops/nginx.conf /etc/nginx/sites-available/YOUR-HOST
+sudo ln -s /etc/nginx/sites-available/YOUR-HOST /etc/nginx/sites-enabled/
+sudo certbot --nginx -d YOUR-HOST
+sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code></pre>
+        <p>Change <code>server_name</code> and confirm <code>proxy_pass</code> matches <code>GADS_PORT</code>. Do not remove the buffering and timeout settings.</p>
+      </div></div>
+
+      <div class="step"><div class="n">07</div><div class="body">
+        <h4>PM2</h4>
+        <p>Set <code>cwd</code> in <code>ops/ecosystem.config.js</code> to the real deploy path, then:</p>
+        <pre><code>pm2 start ops/ecosystem.config.js
+pm2 save
+pm2 startup          <span class="cmt"># survive reboot</span></code></pre>
+        <div class="danger"><span class="lbl">instances must stay 1</span><p>Draft plans live in process memory. A second worker would not see a plan drafted by the first, and single-use enforcement — which is what stops a double-apply — would have a hole in it.</p></div>
+      </div></div>
+
+      <div class="step"><div class="n">08</div><div class="body">
+        <h4>Verify, in order</h4>
+        <pre><code>curl -s localhost:8081/healthz       <span class="cmt"># {"status":"ok",...}</span>
+curl -s https://YOUR-HOST/healthz    <span class="cmt"># same, through Nginx + TLS</span>
+pm2 logs gads-write-mcp</code></pre>
+        <p>Then connect from Claude as a custom connector pointed at <code>https://YOUR-HOST/mcp</code>, complete the Google login, and call <code>health_check</code>. It reports who the server thinks you are and what tier you hold.</p>
+      </div></div>
+
+      <div class="step"><div class="n">09</div><div class="body">
+        <h4>Turning writes on</h4>
+        <p>Only after everything above is verified. Set <code>GADS_WRITE_ENABLED=true</code>, <code>pm2 restart gads-write-mcp</code>, and pause one campaign that does not matter — on a test account first. Check the audit log has a line for it, then enable it again.</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="elsewhere">
+    <h2>08 &nbsp; Moving it to another org</h2>
+    <p>Nothing about this codebase is specific to one company except the configuration. There are no hardcoded customer IDs, limits, or emails in Python — a test fails the build if one appears. To repoint it:</p>
+    <div class="scroller"><table>
+      <thead><tr><th>Change</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr><td>Hostname</td><td><code>GADS_BASE_URL</code>, <code>server_name</code> in <code>ops/nginx.conf</code>, the OAuth redirect URI, DNS</td></tr>
+        <tr><td>Google identity</td><td>New OAuth client, new developer token, new MCC ID</td></tr>
+        <tr><td>Accounts and money</td><td><code>allowed_customer_ids</code>, <code>currency_code</code>, <code>timezone</code>, every limit in <code>policy.yaml</code></td></tr>
+        <tr><td>Ad copy rules</td><td><code>rules.allowed_final_url_domains</code> — the domains ads may point at</td></tr>
+        <tr><td>People</td><td><code>roles.yaml</code>, or flip to <code>google_ads</code> mode and manage it in the Ads UI</td></tr>
+        <tr><td>Deploy path</td><td><code>cwd</code> in <code>ops/ecosystem.config.js</code></td></tr>
+        <tr><td>Port</td><td><code>GADS_PORT</code> and <code>proxy_pass</code> — only if 8081 is taken</td></tr>
+      </tbody>
+    </table></div>
+    <p>Everything else — the gate, the tiers, the two-step write, the audit log — is domain-independent and needs no edits.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="gaps">
+    <h2>09 &nbsp; Before you turn writes on</h2>
+    <p>Stated plainly, because a passing test suite is not the same as production-ready.</p>
+    <div class="danger">
+      <span class="lbl">Open at the time of writing</span>
+      <ul>
+        <li><strong>The daily spend cap can be stepped over.</strong> It is read when the gate runs but not written until after the human approves. Confirm two plans before approving either and both pass the same check.</li>
+        <li><strong>Shipped config is still placeholder.</strong> The allowlist is <code>0000000000</code>, and <code>roles.yaml</code> ships <code>mode: file</code>, in which the tier resolver ignores the account — so the per-account model does not exist as configured.</li>
+      </ul>
+    </div>
+    <div class="warn">
+      <span class="lbl">Never exercised against a live account</span>
+      <p>Every test uses a fake executor or an offline client. Proto construction, enum lookups and update-mask logic are exercised for real, but no request has ever left the process. Before first live use: a real test-account ID in <code>policy.yaml</code>, then pause one campaign that does not matter.</p>
+    </div>
+    <div class="note">
+      <span class="lbl">One thing to verify on first deploy</span>
+      <p>Whether a non-admin can read their own access role from Google Ads. The whole "add them in the Ads UI and they just work" model rests on it. Have one real <code>STANDARD</code> or <code>READ_ONLY</code> user connect and call <code>health_check</code>. If it fails, the server says so loudly — an indeterminate lookup refuses rather than guessing — and <code>roles.yaml</code> in <code>mode: file</code> keeps the team working meanwhile.</p>
+    </div>
+  </section>
+
+  <footer>
+    <p><strong>Day-to-day commands</strong></p>
+    <pre><code>.venv/bin/python -m pytest              <span class="cmt"># no network, no credentials</span>
+curl -s localhost:8081/healthz          <span class="cmt"># 200 ok / 503 degraded</span>
+pm2 restart gads-write-mcp              <span class="cmt"># picks up .env and config/*.yaml</span>
+pm2 logs gads-write-mcp</code></pre>
+    <p>Policy and roles hot-reload on save — a restart is only needed for <code>.env</code> changes.</p>
+  </footer>
+
+</div>

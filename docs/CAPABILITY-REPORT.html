@@ -1,0 +1,284 @@
+<title>What This Server Can Do Now</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --ground:#f7f8fa; --surface:#fff; --sunken:#edeff4; --ink:#141821; --muted:#5a6273;
+    --hairline:#d9dde5; --accent:#1b4d8f; --accent-soft:#e7eef8;
+    --yes:#136c48; --yes-soft:#e8f4ef; --no:#a5342a; --no-soft:#fbeeec;
+    --part:#8a5a06; --part-soft:#fbf3e4;
+    --sans:"Archivo","Segoe UI",system-ui,sans-serif;
+    --serif:"Source Serif 4",Georgia,serif;
+    --mono:"JetBrains Mono","Cascadia Mono",Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    --ground:#0f1117; --surface:#171a23; --sunken:#12151c; --ink:#e6e9f0; --muted:#98a0b2;
+    --hairline:#272c38; --accent:#7aa9e8; --accent-soft:#152233;
+    --yes:#5ec79c; --yes-soft:#12241d; --no:#f0897b; --no-soft:#2a1817;
+    --part:#dda43c; --part-soft:#2a2114;
+  }}
+  :root[data-theme="dark"]{
+    --ground:#0f1117; --surface:#171a23; --sunken:#12151c; --ink:#e6e9f0; --muted:#98a0b2;
+    --hairline:#272c38; --accent:#7aa9e8; --accent-soft:#152233;
+    --yes:#5ec79c; --yes-soft:#12241d; --no:#f0897b; --no-soft:#2a1817;
+    --part:#dda43c; --part-soft:#2a2114;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--ground);color:var(--ink);font-family:var(--serif);
+       font-size:17px;line-height:1.63;margin:0;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:53rem;margin:0 auto;padding:3.5rem 1.5rem 6rem;
+        display:flex;flex-direction:column;gap:3.25rem}
+  h1,h2,h3,.lbl,th,.pill{font-family:var(--sans)}
+  h1,h2,h3{margin:0;text-wrap:balance;font-weight:600}
+  h1{font-size:2.45rem;line-height:1.1;letter-spacing:-.025em;font-weight:700}
+  h2{font-size:1.55rem;letter-spacing:-.015em}
+  h3{font-size:1.06rem;margin-top:.5rem}
+  p,ul,ol{margin:0} ul,ol{padding-left:1.15rem;display:flex;flex-direction:column;gap:.35rem}
+  code{font-family:var(--mono);font-size:.84em;background:var(--sunken);
+       padding:.1em .35em;border-radius:3px;word-break:break-word}
+  a{color:var(--accent);text-underline-offset:2px}
+  a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px}
+  .lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.14em;font-weight:600;color:var(--muted)}
+  .rule{height:3px;width:3rem;background:var(--accent)}
+  section{display:flex;flex-direction:column;gap:1.3rem;scroll-margin-top:1.5rem}
+  .lede{color:var(--muted)}
+  header .meta{display:flex;flex-wrap:wrap;gap:.35rem 1.2rem;font-family:var(--mono);
+               font-size:.75rem;color:var(--muted)}
+  .note{border-left:3px solid var(--accent);background:var(--accent-soft);padding:.95rem 1.1rem;
+        border-radius:0 4px 4px 0;display:flex;flex-direction:column;gap:.45rem}
+  .warnbox{border-left:3px solid var(--part);background:var(--part-soft);padding:.95rem 1.1rem;
+        border-radius:0 4px 4px 0;display:flex;flex-direction:column;gap:.45rem}
+  .note .lbl{color:var(--accent)} .warnbox .lbl{color:var(--part)}
+  .scroller{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:.9rem}
+  th,td{text-align:left;padding:.6rem .85rem .6rem 0;border-bottom:1px solid var(--hairline);vertical-align:top}
+  th{font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:600}
+  td.m{white-space:nowrap;font-family:var(--mono);font-size:.8rem;color:var(--accent)}
+  .pill{font-size:.63rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+        padding:.14rem .48rem;border-radius:99px;border:1px solid currentColor;white-space:nowrap}
+  .p-yes{color:var(--yes);background:var(--yes-soft)}
+  .p-part{color:var(--part);background:var(--part-soft)}
+  .p-no{color:var(--no);background:var(--no-soft)}
+  .cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr))}
+  .card{background:var(--surface);border:1px solid var(--hairline);border-radius:6px;
+        padding:1.1rem 1.2rem;display:flex;flex-direction:column;gap:.5rem}
+  .card h3{margin:0;font-size:1rem}
+  .card p{font-size:.92rem}
+  .big{display:flex;flex-wrap:wrap;gap:2.5rem}
+  .stat{display:flex;flex-direction:column;gap:.1rem}
+  .stat b{font-family:var(--sans);font-size:2rem;font-weight:600;line-height:1;
+          font-variant-numeric:tabular-nums;color:var(--accent)}
+  .toc{background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
+       padding:1.15rem 1.4rem;display:grid;gap:.4rem 2rem;
+       grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));font-size:.88rem;font-family:var(--sans)}
+  .toc a{text-decoration:none;display:flex;gap:.65rem}
+  .toc a:hover{text-decoration:underline}
+  .toc span:first-child{color:var(--muted);font-variant-numeric:tabular-nums}
+  footer{border-top:1px solid var(--hairline);padding-top:1.4rem;color:var(--muted);
+         font-size:.88rem;display:flex;flex-direction:column;gap:.6rem}
+  @media(max-width:34rem){h1{font-size:1.9rem}h2{font-size:1.3rem}.wrap{padding-top:2.25rem;gap:2.4rem}
+    .big{gap:1.5rem}}
+</style>
+
+<div class="wrap">
+
+<header style="display:flex;flex-direction:column;gap:1rem">
+  <div class="rule"></div>
+  <h1>What this server can do now</h1>
+  <p class="lede">A plain-English account of what your Google Ads write server covers today, how much of a normal working day it replaces, and how it sits next to Supermetrics and the other connectors you already have.</p>
+  <div class="meta"><span>16 tools</span><span>commit 11b78ba</span><span>8 Sep 2026</span></div>
+</header>
+
+<div class="big">
+  <div class="stat"><b>7</b><span class="lbl">read tools</span></div>
+  <div class="stat"><b>8</b><span class="lbl">change tools</span></div>
+  <div class="stat"><b>~70%</b><span class="lbl">of daily work covered</span></div>
+  <div class="stat"><b>1</b><span class="lbl">channel (Google Ads)</span></div>
+</div>
+
+<nav class="toc">
+  <a href="#does"><span>01</span><span>Everything it does today</span></a>
+  <a href="#daily"><span>02</span><span>Your working day, covered</span></a>
+  <a href="#gaps"><span>03</span><span>What still needs the UI</span></a>
+  <a href="#supermetrics"><span>04</span><span>Next to Supermetrics</span></a>
+  <a href="#market"><span>05</span><span>Next to everything else</span></a>
+  <a href="#verdict"><span>06</span><span>What to use for what</span></a>
+</nav>
+
+<!-- ============================================ -->
+<section id="does">
+  <h2>01 &nbsp; Everything it does today</h2>
+
+  <h3>Reading — anyone with Google Ads access</h3>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:14rem">Tool</th><th>What it gives you</th></tr></thead>
+    <tbody>
+      <tr><td class="m">list_accounts</td><td>Which accounts you may work with, and your access level on each</td></tr>
+      <tr><td class="m">list_campaigns</td><td>Campaigns in an account, so you can refer to them by name</td></tr>
+      <tr><td class="m">list_ad_groups</td><td>Ad groups within a campaign</td></tr>
+      <tr><td class="m">get_campaign_performance</td><td>Cost, clicks, impressions and conversions per campaign, any date range</td></tr>
+      <tr><td class="m">get_search_terms</td><td>What people actually typed before seeing your ads, costliest first</td></tr>
+      <tr><td class="m">run_gaql_query</td><td><strong>Anything else at all</strong> — see below</td></tr>
+      <tr><td class="m">health_check</td><td>Who the server thinks you are and what you may do</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note">
+    <span class="lbl">The one that changes the picture</span>
+    <p><code>run_gaql_query</code> lets Claude write its own query against Google's reporting language. That means <strong>any reporting question is answerable without anyone building a new tool</strong> — ad-level performance, device and geography splits, conversion actions, assets, change history, hourly breakdowns. You ask in English; Claude writes the query.</p>
+    <p>Blocked from it: the resources that expose people and payment plumbing rather than advertising performance — user access lists, billing setups, invoices, payment accounts.</p>
+  </div>
+
+  <h3>Changing things — needs Standard or Admin access in Google Ads</h3>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:14rem">Tool</th><th>What it does</th><th style="width:6rem">Access</th></tr></thead>
+    <tbody>
+      <tr><td class="m">pause_campaign</td><td>Stops a campaign spending</td><td>Standard</td></tr>
+      <tr><td class="m">enable_campaign</td><td>Starts it again</td><td>Standard</td></tr>
+      <tr><td class="m">update_campaign_budget</td><td>Changes a daily budget</td><td>Standard</td></tr>
+      <tr><td class="m">add_negative_keyword</td><td>Blocks a search term, at campaign or ad group level</td><td>Standard</td></tr>
+      <tr><td class="m">add_keyword</td><td>Adds a keyword, created paused</td><td>Admin</td></tr>
+      <tr><td class="m">update_ad_group_bid</td><td>Changes an ad group's max CPC</td><td>Admin</td></tr>
+      <tr><td class="m">create_responsive_search_ad</td><td>Writes a new search ad, created paused</td><td>Admin</td></tr>
+      <tr><td class="m">create_campaign</td><td>Creates a paused Search campaign shell</td><td>Admin</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Every one of these returns a <strong>preview and nothing else</strong>. A separate approval step applies it, and that step re-checks everything against the account as it stands at that moment. Nothing is ever removed or deleted — pausing is reversible, deletion is not, so there are no delete tools at all.</p>
+</section>
+
+<!-- ============================================ -->
+<section id="daily">
+  <h2>02 &nbsp; Your working day, covered</h2>
+  <p>Taking a normal day of Google Ads account management, task by task.</p>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:19rem">Daily task</th><th style="width:7rem">Covered?</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Check yesterday's performance</td><td><span class="pill p-yes">Fully</span></td><td>Faster than the UI — ask in English, get a ranked answer</td></tr>
+      <tr><td>Review search terms</td><td><span class="pill p-yes">Fully</span></td><td>Costliest first, filterable to one campaign</td></tr>
+      <tr><td>Add negative keywords</td><td><span class="pill p-yes">Fully</span></td><td>The most common daily job, end to end</td></tr>
+      <tr><td>Adjust budgets</td><td><span class="pill p-yes">Fully</span></td><td>With the old value shown next to the new one</td></tr>
+      <tr><td>Pause / resume campaigns</td><td><span class="pill p-yes">Fully</span></td><td></td></tr>
+      <tr><td>Adjust ad group bids</td><td><span class="pill p-yes">Fully</span></td><td>Ad group level only, not per keyword</td></tr>
+      <tr><td>Add keywords</td><td><span class="pill p-yes">Fully</span></td><td>Created paused so nothing spends unreviewed</td></tr>
+      <tr><td>Write new ad copy</td><td><span class="pill p-yes">Fully</span></td><td>Claude drafts the headlines; you approve them</td></tr>
+      <tr><td>Ad-hoc analysis</td><td><span class="pill p-yes">Fully</span></td><td>Any question, via the general query tool</td></tr>
+      <tr><td>Check what changed and by whom</td><td><span class="pill p-yes">Fully</span></td><td>Both Google's change history and this server's own audit log</td></tr>
+      <tr><td>Launch a new campaign</td><td><span class="pill p-part">Partly</span></td><td>Creates the shell — paused, Search only, own budget. Targeting, ad groups, keywords and ads are still built in the UI</td></tr>
+      <tr><td>Pause a single keyword or ad</td><td><span class="pill p-no">No</span></td><td>Campaign-level pausing only. A real gap for daily work</td></tr>
+      <tr><td>Edit an existing ad</td><td><span class="pill p-no">No</span></td><td>You can create a new one, not change one</td></tr>
+      <tr><td>Location, language, schedule targeting</td><td><span class="pill p-no">No</span></td><td>UI only</td></tr>
+      <tr><td>Sitelinks, callouts, other assets</td><td><span class="pill p-no">No</span></td><td>UI only</td></tr>
+      <tr><td>Audiences and remarketing</td><td><span class="pill p-no">No</span></td><td>UI only</td></tr>
+      <tr><td>Shopping, Performance Max, Display, Video</td><td><span class="pill p-no">No</span></td><td>Search campaigns only, throughout</td></tr>
+      <tr><td>Conversion tracking setup</td><td><span class="pill p-no">No</span></td><td>Readable, not editable</td></tr>
+      <tr><td>Experiments and drafts</td><td><span class="pill p-no">No</span></td><td>UI only</td></tr>
+      <tr><td>Google's recommendations</td><td><span class="pill p-no">No</span></td><td>Readable via a query, not actionable</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Roughly 70% of routine day-to-day management</strong>, and close to 100% of the reporting and analysis side. What is missing clusters in two places: <em>building</em> things (targeting, assets, campaign structure) and <em>campaign types other than Search</em>.</p>
+</section>
+
+<!-- ============================================ -->
+<section id="gaps">
+  <h2>03 &nbsp; What still needs the UI</h2>
+  <p>Two gaps are worth calling out because they affect ordinary work rather than edge cases.</p>
+  <div class="cards">
+    <div class="card">
+      <h3>Pausing a keyword or an ad</h3>
+      <p>You can pause a whole campaign, but not one bad keyword or one underperforming ad. That is a routine action, and today it means opening the UI. Probably the highest-value tool still missing.</p>
+    </div>
+    <div class="card">
+      <h3>Finishing a new campaign</h3>
+      <p><code>create_campaign</code> makes a paused shell with a budget and a bidding strategy. Everything that makes it a real campaign — locations, ad groups, keywords, ads — is then partly here and partly in the UI. Useful, but not yet an end-to-end launch.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<section id="supermetrics">
+  <h2>04 &nbsp; Next to Supermetrics</h2>
+  <p>These two are often lumped together as "an AI connector for ads", but they are built for different jobs and it shows.</p>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:15rem"></th><th>This server</th><th>Supermetrics</th></tr></thead>
+    <tbody>
+      <tr><td>Built for</td><td>Making changes safely</td><td>Getting data out, everywhere</td></tr>
+      <tr><td>Channels</td><td>Google Ads only</td><td>150+ sources — Meta, LinkedIn, GA4, TikTok, and so on</td></tr>
+      <tr><td>Reporting depth</td><td>Any Google Ads question</td><td>Any question, across every channel, joined together</td></tr>
+      <tr><td>Cross-channel view</td><td><span class="pill p-no">No</span></td><td><span class="pill p-yes">Yes</span> — its main strength</td></tr>
+      <tr><td>Dashboards, scheduled feeds</td><td><span class="pill p-no">No</span></td><td><span class="pill p-yes">Yes</span></td></tr>
+      <tr><td>Can change campaigns</td><td><span class="pill p-yes">Yes</span>, 8 operations</td><td><span class="pill p-part">Some</span> — create and update campaigns</td></tr>
+      <tr><td>Preview before every change</td><td><span class="pill p-yes">Always</span></td><td><span class="pill p-no">No equivalent</span></td></tr>
+      <tr><td>Human must approve each change</td><td><span class="pill p-yes">Enforced</span></td><td><span class="pill p-no">No</span></td></tr>
+      <tr><td>Permissions</td><td>Your own Google Ads role, per account</td><td>Supermetrics team and licence settings</td></tr>
+      <tr><td>Audit trail of changes</td><td><span class="pill p-yes">Every change and refusal</span></td><td><span class="pill p-no">Not for ad changes</span></td></tr>
+      <tr><td>Cost</td><td>Server hosting only</td><td>Per-seat licence</td></tr>
+      <tr><td>Maturity</td><td>Bespoke, never yet run live</td><td>Established commercial product</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note">
+    <span class="lbl">The honest summary</span>
+    <p>Supermetrics is a <strong>reporting</strong> product that has added some campaign management. This is a <strong>campaign management</strong> product with reporting attached. If you want one number that combines Google, Meta and LinkedIn spend, Supermetrics wins outright and this server cannot help. If you want someone to change a budget without being able to do it wrong, Supermetrics has no answer and this does.</p>
+  </div>
+
+  <h3>The difference that actually matters</h3>
+  <p>Supermetrics can change a campaign. What it does not have is the thing this server was built entirely around: <strong>a change is drafted, shown to a person in plain English, approved, and recorded.</strong> Nothing here can be applied by an AI acting alone, and every attempt — successful or refused — is written down against the person who made it.</p>
+  <p>For reading data, that machinery is overhead. For spending money, it is the whole point.</p>
+</section>
+
+<!-- ============================================ -->
+<section id="market">
+  <h2>05 &nbsp; Next to everything else</h2>
+  <div class="scroller"><table>
+    <thead><tr><th style="width:16rem">Option</th><th>What it is</th><th>Where it stands</th></tr></thead>
+    <tbody>
+      <tr><td>Google's own Ads MCP<br><span style="color:var(--muted);font-size:.85em">the read-only one you already run</span></td><td>Official, maintained by Google</td><td>Reads only. This server is deliberately separate so writes never touch it</td></tr>
+      <tr><td>Community Google Ads MCPs</td><td>Open-source servers, varying quality</td><td>Usually a thin API wrapper — often with a stored credential shared by everyone and no approval step. The convenient, risky shape</td></tr>
+      <tr><td>Meta / other channel MCPs</td><td>One connector per platform</td><td>Complementary. Different channel, no overlap</td></tr>
+      <tr><td>Google Ads Editor</td><td>Desktop bulk-editing tool</td><td>Still far better for large structural changes. Not conversational</td></tr>
+      <tr><td>Google Ads scripts / API</td><td>Automation you write yourself</td><td>More powerful, needs a developer, no human-in-the-loop by default</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Where this one is genuinely unusual</h3>
+  <ul>
+    <li><strong>No stored credential.</strong> Every call uses the individual's own Google login. Remove someone in Google Ads and they lose access here immediately, with nothing to redeploy. Most connectors share one service credential, so everyone has the same power and the audit trail says "the connector did it".</li>
+    <li><strong>Permissions come from Google Ads itself,</strong> per account. Someone can be an admin on one account and read-only on another, and this respects that automatically.</li>
+    <li><strong>Approval is enforced by the server,</strong> not by the AI's good behaviour. A client that cannot show an approval prompt is refused rather than allowed through.</li>
+    <li><strong>Nothing can be deleted.</strong> Not a policy — there is simply no tool for it.</li>
+  </ul>
+  <p>That combination is not something the off-the-shelf options offer. It is also the reason this took real effort to build rather than being an afternoon's API wrapper.</p>
+</section>
+
+<!-- ============================================ -->
+<section id="verdict">
+  <h2>06 &nbsp; What to use for what</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>Use this server</h3>
+      <p>Daily Google Ads management — search terms, negatives, budgets, pausing, bids, keywords, ad copy. Any Google Ads question. Anything where a person should see and approve a change before it happens.</p>
+    </div>
+    <div class="card">
+      <h3>Use Supermetrics</h3>
+      <p>Anything spanning more than one channel. Recurring reports and dashboards. Feeding a warehouse or a spreadsheet. Comparing Google against Meta in a single view.</p>
+    </div>
+    <div class="card">
+      <h3>Use the Google Ads UI</h3>
+      <p>Building campaigns properly — targeting, assets, audiences. Anything outside Search. Pausing individual keywords or ads. Experiments.</p>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <span class="lbl">Before any of this is real</span>
+    <p>This server has <strong>never been run against a live Google Ads account.</strong> Every test uses a stand-in. The capabilities above are what the code does; whether it does them correctly against Google's real API is genuinely unknown until someone pauses one campaign that does not matter and checks the result.</p>
+    <p>Everything else in this report assumes that goes well.</p>
+  </div>
+
+  <p>The strategic position is worth stating plainly: <strong>this is not competing with Supermetrics, and it should not try to.</strong> Adding 150 data sources would take years and produce something worse than what already exists. What it has that nothing on the market has is a safe, audited, per-person way to let a team change Google Ads by asking. Deepening that — pausing keywords and ads, finishing the campaign-creation flow — is worth far more than widening it.</p>
+</section>
+
+<footer>
+  <p>Written against commit <code>11b78ba</code>. This codebase is moving quickly — four tools were added in the last few commits alone — so re-check the tool list before relying on any specific gap named here.</p>
+</footer>
+
+</div>
