@@ -31,6 +31,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The server icon ships inside the package, not just in a checkout, so that
+# a non-editable install still has it. See branding.py.
+[tool.setuptools.package-data]
+gads_write = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

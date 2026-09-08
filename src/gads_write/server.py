@@ -45,6 +45,7 @@ from .safety.audit import AuditLog
 from .safety.guards import Guard
 from .safety.plans import PlanStore
 from .safety.policy import PolicyStore
+from .branding import server_icons
 from .safety.spend import DailySpendLedger
 from .settings import ConfigError, Settings, load_settings
 from .tools.registry import annotations_for
@@ -205,7 +206,16 @@ except ConfigError as exc:
     raise SystemExit(1) from exc
 
 
-mcp = FastMCP(name="gads-write-mcp", auth=_build_auth_provider(SETTINGS))
+mcp = FastMCP(
+    name="gads-write-mcp",
+    auth=_build_auth_provider(SETTINGS),
+    # Advertised in the `initialize` handshake so a client can show the
+    # server with its own identity rather than a generic placeholder. The
+    # icon is embedded as a data URI - see branding.py for why it is not a
+    # URL. Both are cosmetic: neither affects what any tool can do.
+    website_url=str(SETTINGS.base_url),
+    icons=server_icons(),
+)
 
 # Registered before any tool so it wraps every one of them.
 mcp.add_middleware(
