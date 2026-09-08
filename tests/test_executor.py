@@ -81,6 +81,25 @@ class RecordingService:
             if self._recorder.get("raise"):
                 raise self._recorder["raise"]
             names = self._recorder.get("resource_names", ["customers/x/things/1"])
+            if name == "mutate":
+                # The bulk, atomic form. Its response is shaped differently:
+                # one entry per operation, each naming which resource it was.
+                return SimpleNamespace(
+                    mutate_operation_responses=[
+                        SimpleNamespace(
+                            campaign_budget_result=SimpleNamespace(
+                                resource_name="customers/x/campaignBudgets/1"
+                            ),
+                            campaign_result=SimpleNamespace(resource_name=""),
+                        ),
+                        SimpleNamespace(
+                            campaign_budget_result=SimpleNamespace(resource_name=""),
+                            campaign_result=SimpleNamespace(
+                                resource_name="customers/x/campaigns/2"
+                            ),
+                        ),
+                    ]
+                )
             return SimpleNamespace(
                 results=[SimpleNamespace(resource_name=n) for n in names]
             )
@@ -371,28 +390,99 @@ async def test_a_google_ads_exception_becomes_a_readable_error(rec) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_the_budget_is_created_before_the_campaign(rec) -> None:
-    """A campaign cannot exist without a budget, and a budget is a separate
-    resource, so this is the one operation here making TWO mutations. Order
-    matters: the campaign references the resource name the budget call
-    returned, so reversing them cannot work."""
+async def test_the_budget_and_campaign_go_in_ONE_request(rec) -> None:
+    """The fix for a real failure in production.
+
+    This was two calls: create the budget, then the campaign. When the second
+    failed - and it did, on the first live attempt, with `field_error:
+    REQUIRED` - the first had already committed, leaving an orphaned budget in
+    the account. Reporting the orphan was not good enough; a write server must
+    not be able to leave debris.
+
+    `GoogleAdsService.mutate` applies its operations as one transaction when
+    partial_failure is off. Either both resources exist or neither does.
+    """
     await _apply(
         "create_campaign",
         {"name": "ZZ Test", "budget_micros": 100_000_000,
          "bidding_strategy": "MANUAL_CPC"},
     )
-    assert rec["methods"] == ["mutate_campaign_budgets", "mutate_campaigns"]
+    assert rec["methods"] == ["mutate"], (
+        "campaign creation must be a single atomic mutate, not one call per "
+        f"resource - got {rec['methods']}"
+    )
+
+
+async def test_a_failure_leaves_nothing_behind(rec) -> None:
+    """The atomicity regression test.
+
+    A failing mutate must leave NO objects. Because both operations travel in
+    one request, there is no window in which the budget exists and the
+    campaign does not - so a failure cannot orphan anything, and there is
+    nothing for the error message to have to name.
+    """
+    real_send = GoogleAdsExecutor._send
+
+    def failing_send(call, request, **kwargs):
+        raise ExecutorError("field_error: REQUIRED")
+
+    GoogleAdsExecutor._send = staticmethod(failing_send)
+    try:
+        with pytest.raises(ExecutorError) as caught:
+            await _apply(
+                "create_campaign",
+                {"name": "ZZ Test", "budget_micros": 100_000_000,
+                 "bidding_strategy": "MANUAL_CPC"},
+            )
+    finally:
+        GoogleAdsExecutor._send = staticmethod(real_send)
+
+    # Nothing was sent piecemeal, so nothing can be stranded.
+    assert rec.get("methods") is None or rec["methods"] == []
+    # And the message says nothing about leftovers, because there are none.
+    message = str(caught.value)
+    assert "orphan" not in message.lower()
+    assert "already created" not in message.lower()
+
+
+async def test_the_budget_operation_comes_first_in_the_request(rec) -> None:
+    """Order still matters inside the single request: the campaign references
+    the budget by a temporary resource name, and Google resolves operations in
+    the order given."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MANUAL_CPC"},
+    )
+    ops = rec["request"]["mutate_operations"]
+    assert ops[0].campaign_budget_operation.create.name == "ZZ Test - budget"
+    assert ops[1].campaign_operation.create.name == "ZZ Test"
+
+
+async def test_the_campaign_points_at_the_budget_created_alongside_it(rec) -> None:
+    """A temporary negative id, resolved by Google within the request. There
+    is no real id to reference until the request has run, which is what makes
+    the two operations expressible together at all."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MANUAL_CPC"},
+    )
+    ops = rec["request"]["mutate_operations"]
+    budget_name = ops[0].campaign_budget_operation.create.resource_name
+    assert ops[1].campaign_operation.create.campaign_budget == budget_name
+    assert budget_name.endswith("/-1")
 
 
 async def test_a_created_campaign_is_paused_and_search_only(rec) -> None:
-    """It cannot spend: paused, no ad groups, and search partners, Display
-    and YouTube all off. A preview that omitted those would be lying."""
+    """It cannot spend: paused, no ad groups, and search partners, Display and
+    YouTube all off. A preview omitting those would be lying."""
     await _apply(
         "create_campaign",
         {"name": "ZZ Test", "budget_micros": 100_000_000,
          "bidding_strategy": "MANUAL_CPC"},
     )
-    campaign = rec["request"]["operations"][0].create
+    campaign = rec["request"]["mutate_operations"][1].campaign_operation.create
 
     assert campaign.status.name == "PAUSED"
     assert campaign.advertising_channel_type.name == "SEARCH"
@@ -400,6 +490,22 @@ async def test_a_created_campaign_is_paused_and_search_only(rec) -> None:
     assert campaign.network_settings.target_search_network is False
     assert campaign.network_settings.target_content_network is False
     assert campaign.network_settings.target_partner_search_network is False
+
+
+async def test_the_eu_political_declaration_is_set(rec) -> None:
+    """Mandatory on create, and the reason the first live attempt came back
+    `field_error: REQUIRED`. Left unset it defaults to UNSPECIFIED, which
+    Google rejects."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MANUAL_CPC"},
+    )
+    campaign = rec["request"]["mutate_operations"][1].campaign_operation.create
+    assert (
+        campaign.contains_eu_political_advertising.name
+        == "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING"
+    )
 
 
 async def test_the_budget_it_creates_is_never_shared(rec) -> None:
@@ -411,10 +517,9 @@ async def test_the_budget_it_creates_is_never_shared(rec) -> None:
         {"name": "ZZ Test", "budget_micros": 100_000_000,
          "bidding_strategy": "MAXIMIZE_CLICKS"},
     )
-    # The campaign call is last; assert on what the budget call carried by
-    # re-running with only the budget service recorded is not possible here,
-    # so this asserts the campaign points at a budget resource at all.
-    assert rec["request"]["operations"][0].create.campaign_budget
+    budget = rec["request"]["mutate_operations"][0].campaign_budget_operation.create
+    assert budget.explicitly_shared is False
+    assert budget.amount_micros == 100_000_000
 
 
 @pytest.mark.parametrize("strategy", ["MANUAL_CPC", "MAXIMIZE_CLICKS"])
@@ -424,14 +529,13 @@ async def test_both_supported_strategies_are_accepted(rec, strategy: str) -> Non
         {"name": "ZZ Test", "budget_micros": 100_000_000,
          "bidding_strategy": strategy},
     )
-    campaign = rec["request"]["operations"][0].create
+    campaign = rec["request"]["mutate_operations"][1].campaign_operation.create
     assert campaign.name == "ZZ Test"
 
 
 async def test_an_unsupported_strategy_is_refused(rec) -> None:
     """Target CPA and Target ROAS each need their own target figure - another
-    question to ask and another way to get it wrong. Refused until asked
-    for."""
+    question to ask and another way to get it wrong."""
     with pytest.raises(ExecutorError, match="bidding strategy"):
         await _apply(
             "create_campaign",
@@ -447,40 +551,3 @@ async def test_a_campaign_with_no_budget_is_refused(rec) -> None:
             {"name": "ZZ Test", "budget_micros": 0,
              "bidding_strategy": "MANUAL_CPC"},
         )
-
-
-async def test_a_failed_campaign_call_reports_the_orphan_budget(rec) -> None:
-    """The failure this operation uniquely has.
-
-    The budget commits first. If the campaign call then fails, the budget is
-    already in the account and there is no delete operation in this server to
-    tidy it with - deliberately, since inventing one here would make failure
-    handling the first irreversible thing it could do. So it must be REPORTED,
-    with its resource name, rather than left for someone to wonder about.
-    """
-    from google.ads.googleads.errors import GoogleAdsException
-
-    calls = {"n": 0}
-    real_send = GoogleAdsExecutor._send
-
-    def failing_send(call, request, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:                     # the budget succeeds
-            return real_send(call, request, **kwargs)
-        raise ExecutorError("DUPLICATE_CAMPAIGN_NAME")
-
-    GoogleAdsExecutor._send = staticmethod(failing_send)
-    try:
-        with pytest.raises(ExecutorError) as caught:
-            await _apply(
-                "create_campaign",
-                {"name": "ZZ Test", "budget_micros": 100_000_000,
-                 "bidding_strategy": "MANUAL_CPC"},
-            )
-    finally:
-        GoogleAdsExecutor._send = staticmethod(real_send)
-
-    message = str(caught.value)
-    assert "DUPLICATE_CAMPAIGN_NAME" in message
-    assert "already created" in message
-    assert "customers/" in message          # names the orphan resource

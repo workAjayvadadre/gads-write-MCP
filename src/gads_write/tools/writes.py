@@ -716,6 +716,7 @@ def register_write_tools(
                 f"  type             : Search, Google Search only",
                 f"                     (search partners, Display and YouTube off)",
                 f"  budget           : its own, not shared with any campaign",
+                f"  EU political ads : declared as NOT political advertising",
                 "",
                 "  It will have no ad groups, keywords or ads, so it cannot",
                 "  spend anything. Add those, and set locations, languages and",

@@ -954,6 +954,8 @@ async def test_a_campaign_draft_previews_every_setting(linked) -> None:
     assert "PAUSED" in preview
     assert "Google Search only" in preview
     assert "not shared" in preview
+    # A declaration made on the person's behalf must be visible, not implied.
+    assert "EU political" in preview
     assert "Manual CPC" in preview
     assert h.executor.applied == []          # drafting creates nothing
 
