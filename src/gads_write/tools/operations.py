@@ -49,6 +49,8 @@ from ..safety.policy import (
 from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
     ValidationResult,
+    validate_bidding_strategy,
+    validate_campaign_name,
     validate_customer_id,
     validate_keyword_text,
     validate_match_type,
@@ -344,6 +346,32 @@ def recheck_bid(
     )
 
 
+def validate_create_campaign_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Shape of the arguments for a new campaign.
+
+    There are no defaults here, deliberately. The server cannot see whether
+    the person was asked for a bidding strategy or whether one was chosen for
+    them, so the next best thing is to leave the model nothing safe to fall
+    back on: every value must be supplied, and every value appears on the
+    preview.
+    """
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(validate_campaign_name(arguments.get("name")))
+    result.extend(validate_bidding_strategy(arguments.get("bidding_strategy")))
+
+    try:
+        budget = coerce_units(arguments.get("daily_budget"), field="daily_budget")
+    except MoneyError as exc:
+        result.add("daily_budget", str(exc))
+        return result
+    if budget <= 0:
+        result.add("daily_budget", f"a daily budget must be above zero, got {budget}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # the table
 # ---------------------------------------------------------------------------
@@ -363,6 +391,9 @@ OPERATIONS: dict[str, OperationChecks] = {
         spend_delta=budget_spend_delta,
     ),
     "add_negative_keyword": OperationChecks(validate=validate_negative_keyword_args),
+    # No recheck and no read: a new campaign is measured against nothing that
+    # already exists, so there is no current state to re-establish at confirm.
+    "create_campaign": OperationChecks(validate=validate_create_campaign_args),
     "add_keyword": OperationChecks(
         validate=validate_keyword_args,
     ),

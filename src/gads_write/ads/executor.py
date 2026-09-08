@@ -118,7 +118,17 @@ CREATE_OPERATIONS: frozenset[str] = frozenset(
         "add_ad_group_negative_keyword",
         "add_keyword",
         "create_responsive_search_ad",
+        "create_campaign",
     }
+)
+
+# Bidding strategies this server will create a campaign with. Two, not the
+# seventeen the API offers: Manual CPC needs no extra value and Maximize
+# Clicks needs only an optional ceiling, whereas Target CPA and Target ROAS
+# each require their own target figure - another question to ask and another
+# way to get it wrong. Add one when somebody asks for it with a reason.
+CAMPAIGN_BIDDING_STRATEGIES: frozenset[str] = frozenset(
+    {"MANUAL_CPC", "MAXIMIZE_CLICKS"}
 )
 
 # The complete list of mutations this server can perform. If it is not here,
@@ -167,6 +177,7 @@ class GoogleAdsExecutor(Executor):
         handler = {
             "pause_campaign": self._set_campaign_status,
             "enable_campaign": self._set_campaign_status,
+            "create_campaign": self._create_campaign,
             "update_campaign_budget": self._update_campaign_budget,
             "update_ad_group_bid": self._update_ad_group_bid,
             "add_campaign_negative_keyword": self._add_campaign_negative_keyword,
@@ -396,6 +407,125 @@ class GoogleAdsExecutor(Executor):
             response,
             request,
             {"keyword": text, "match_type": match_type, "status": status},
+        )
+
+    def _create_campaign(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Create a paused Search campaign, and the budget it needs.
+
+        The only operation here that makes TWO mutations. A campaign cannot
+        exist without a budget, and a budget is a separate resource, so this
+        creates the budget first and then the campaign that references it.
+
+        If the second call fails the first has already committed, leaving an
+        unused budget in the account. That is reported explicitly rather than
+        cleaned up: this server has no delete operation, deliberately, and
+        inventing one here to tidy a failure would be the first irreversible
+        thing it could do. An orphan budget costs nothing - it is a number in
+        a table until a campaign points at it - and the message says exactly
+        what was left behind.
+        """
+        name = str(request.payload.get("name") or "").strip()
+        budget_micros = int(request.payload.get("budget_micros") or 0)
+        strategy = str(request.payload.get("bidding_strategy") or "").strip().upper()
+
+        if not name:
+            raise ExecutorError("a campaign needs a name")
+        if budget_micros <= 0:
+            raise ExecutorError("a campaign needs a daily budget above zero")
+        if strategy not in CAMPAIGN_BIDDING_STRATEGIES:
+            raise ExecutorError(
+                f"unsupported bidding strategy {strategy!r}; this server "
+                f"creates campaigns with {sorted(CAMPAIGN_BIDDING_STRATEGIES)}"
+            )
+
+        # ---- 1. the budget --------------------------------------------------
+        budget_service = client.get_service("CampaignBudgetService")
+        budget_op = client.get_type("CampaignBudgetOperation")
+        budget = budget_op.create
+        # Google requires budget names to be unique within an account, and a
+        # campaign name is already unique, so this cannot collide unless the
+        # campaign name would have anyway.
+        budget.name = f"{name} - budget"
+        budget.amount_micros = budget_micros
+        budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+        # NOT shared. A shared budget cannot be edited through this server at
+        # all - the preview would name one campaign and change several - so
+        # creating one here would produce a campaign whose budget we then
+        # refuse to touch.
+        budget.explicitly_shared = False
+
+        budget_response = self._send(
+            budget_service.mutate_campaign_budgets, request, operations=[budget_op]
+        )
+        budget_resource = budget_response.results[0].resource_name
+
+        if request.validate_only:
+            # validate_only returns no resource name, so there is nothing to
+            # attach a campaign to. Stop here rather than send a second call
+            # that would fail for an unrelated reason.
+            return MutationResult(
+                success=True,
+                resource_names=(),
+                details={"validate_only": True, "operation": request.operation},
+            )
+
+        # ---- 2. the campaign ------------------------------------------------
+        try:
+            campaign_service = client.get_service("CampaignService")
+            campaign_op = client.get_type("CampaignOperation")
+            campaign = campaign_op.create
+            campaign.name = name
+            campaign.campaign_budget = budget_resource
+            # Always paused. A campaign this server created has no ad groups,
+            # no keywords and no ads, so it could not serve anyway - but the
+            # status is what a person sees in the Google Ads UI, and it should
+            # say plainly that nothing is live.
+            campaign.status = client.enums.CampaignStatusEnum.PAUSED
+            campaign.advertising_channel_type = (
+                client.enums.AdvertisingChannelTypeEnum.SEARCH
+            )
+
+            # Google Search only. Search partners, Display and YouTube are all
+            # off: each is a separate audience with its own cost profile, and
+            # a preview that did not mention them would be lying by omission.
+            campaign.network_settings.target_google_search = True
+            campaign.network_settings.target_search_network = False
+            campaign.network_settings.target_content_network = False
+            campaign.network_settings.target_partner_search_network = False
+
+            if strategy == "MANUAL_CPC":
+                campaign.manual_cpc.enhanced_cpc_enabled = False
+            else:  # MAXIMIZE_CLICKS
+                # Google calls this TargetSpend in the API and "Maximize
+                # clicks" in the UI. No target value is set: leaving it unset
+                # means "spend the budget", which is what the UI does.
+                campaign.target_spend = client.get_type("TargetSpend")
+
+            response = self._send(
+                campaign_service.mutate_campaigns, request, operations=[campaign_op]
+            )
+        except ExecutorError as exc:
+            # The budget is already committed. Say so, with its resource name,
+            # so whoever picks this up can find it rather than wondering.
+            raise ExecutorError(
+                f"{exc} The budget was already created and is still in the "
+                f"account, unused: {budget_resource}. Nothing else changed. "
+                "Delete it in the Google Ads UI if you do not want it."
+            ) from exc
+
+        return MutationResult(
+            success=True,
+            resource_names=tuple(r.resource_name for r in response.results)
+            + (budget_resource,),
+            details={
+                "operation": "create_campaign",
+                "name": name,
+                "status": "PAUSED",
+                "bidding_strategy": strategy,
+                "budget_resource_name": budget_resource,
+            },
         )
 
     def _create_responsive_search_ad(

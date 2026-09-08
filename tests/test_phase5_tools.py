@@ -928,3 +928,80 @@ async def test_many_budget_raises_in_one_day_are_not_blocked(linked) -> None:
         await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
 
     assert len(h.executor.applied) == 5
+
+
+# ---------------------------------------------------------------------------
+# create_campaign
+# ---------------------------------------------------------------------------
+
+
+async def test_a_campaign_draft_previews_every_setting(linked) -> None:
+    """Including the ones the person did not choose.
+
+    A preview listing only name, budget and bidding would be lying by
+    omission: paused, search-only and not-shared are decisions too, and the
+    reader has no other way to know them.
+    """
+    h = linked(Tier.LEAD)
+    draft = await _call(
+        h.mcp, "create_campaign",
+        {"customer_id": ACCOUNT, "name": "ZZ New Campaign",
+         "daily_budget": 100, "bidding_strategy": "MANUAL_CPC"},
+    )
+    preview = draft["preview"]
+
+    assert "ZZ New Campaign" in preview
+    assert "PAUSED" in preview
+    assert "Google Search only" in preview
+    assert "not shared" in preview
+    assert "Manual CPC" in preview
+    assert h.executor.applied == []          # drafting creates nothing
+
+
+async def test_creating_a_campaign_needs_lead(linked) -> None:
+    """A new campaign is a spending surface that did not exist before, unlike
+    every other write which adjusts something already created."""
+    h = linked(Tier.OPERATOR)
+    with pytest.raises(Exception):
+        await _call(
+            h.mcp, "create_campaign",
+            {"customer_id": ACCOUNT, "name": "ZZ New Campaign",
+             "daily_budget": 100, "bidding_strategy": "MANUAL_CPC"},
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"name": "", "daily_budget": 100, "bidding_strategy": "MANUAL_CPC"},
+        {"name": "ZZ", "daily_budget": 0, "bidding_strategy": "MANUAL_CPC"},
+        {"name": "ZZ", "daily_budget": -5, "bidding_strategy": "MANUAL_CPC"},
+        {"name": "ZZ", "daily_budget": 100, "bidding_strategy": "TARGET_ROAS"},
+        {"name": "ZZ", "daily_budget": 100, "bidding_strategy": ""},
+    ],
+)
+async def test_incomplete_or_unsupported_arguments_are_refused(linked, bad) -> None:
+    """No defaults anywhere. The server cannot tell whether the person was
+    asked for a value or whether one was chosen for them, so the next best
+    thing is to leave nothing safe to fall back on."""
+    h = linked(Tier.LEAD)
+    with pytest.raises(Exception):
+        await _call(h.mcp, "create_campaign", {"customer_id": ACCOUNT, **bad})
+    assert h.executor.applied == []
+
+
+async def test_confirming_a_campaign_creates_it(linked) -> None:
+    h = linked(Tier.LEAD)
+    draft = await _call(
+        h.mcp, "create_campaign",
+        {"customer_id": ACCOUNT, "name": "ZZ New Campaign",
+         "daily_budget": 100, "bidding_strategy": "MAXIMIZE_CLICKS"},
+    )
+    applied = await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
+
+    assert applied["applied"] is True
+    assert len(h.executor.applied) == 1
+    request = h.executor.applied[0]
+    assert request.operation == "create_campaign"
+    # Whole rupees in, micros out - the 1,000,000x rule.
+    assert request.payload["budget_micros"] == 100_000_000

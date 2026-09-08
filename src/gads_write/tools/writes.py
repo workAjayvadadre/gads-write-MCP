@@ -642,6 +642,106 @@ def register_write_tools(
         )
 
     # ------------------------------------------------------------------
+    # create_campaign
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("create_campaign"))
+    async def create_campaign(
+        customer_id: str,
+        name: str,
+        daily_budget: float,
+        bidding_strategy: str,
+    ) -> dict:
+        """Draft a new Search campaign. Does NOT create it.
+
+        Every value is required and nothing is assumed - ASK THE PERSON for
+        the name, the budget and the bidding strategy rather than choosing
+        any of them yourself.
+
+        `bidding_strategy` is MANUAL_CPC (you set bids yourself) or
+        MAXIMIZE_CLICKS (Google spends the budget on clicks).
+        `daily_budget` is in whole currency units, never micros.
+
+        The campaign is created PAUSED, on Google Search only, with its own
+        budget. It will have no ad groups, keywords or ads, so it cannot
+        spend until someone builds it out. Locations, languages and schedules
+        are set afterwards in the Google Ads UI.
+
+        Returns a preview and a plan_id; nothing is created until
+        confirm_and_apply.
+        """
+        customer_id = str(customer_id).strip()
+        name = str(name).strip()
+        bidding_strategy = str(bidding_strategy).strip().upper()
+
+        arguments = {
+            "customer_id": customer_id,
+            "name": name,
+            "daily_budget": str(daily_budget),
+            "bidding_strategy": bidding_strategy,
+        }
+
+        caller, _ = await _authorise("create_campaign", customer_id, arguments)
+
+        try:
+            budget_units = coerce_units(daily_budget, field="daily_budget")
+        except MoneyError as exc:
+            raise ToolError(f"{exc}. Nothing was created.") from exc
+
+        decision = await _decide(
+            "create_campaign",
+            customer_id,
+            arguments,
+            validate=_validator("create_campaign", arguments),
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        strategy_label = {
+            "MANUAL_CPC": "Manual CPC - you set the bids",
+            "MAXIMIZE_CLICKS": "Maximize Clicks - Google spends the budget on clicks",
+        }.get(bidding_strategy, bidding_strategy)
+
+        # Everything this creates, and everything it deliberately does not.
+        # A preview that listed only the three chosen values would be lying by
+        # omission: the fixed settings are decisions too, and the reader has
+        # no way to know them otherwise.
+        preview = "\n".join(
+            [
+                f"Account {customer_id}",
+                f"CREATE a new campaign {name!r}",
+                f"  daily budget     : {format_units(budget_units, code)}",
+                f"  bidding          : {strategy_label}",
+                f"  status           : PAUSED",
+                f"  type             : Search, Google Search only",
+                f"                     (search partners, Display and YouTube off)",
+                f"  budget           : its own, not shared with any campaign",
+                "",
+                "  It will have no ad groups, keywords or ads, so it cannot",
+                "  spend anything. Add those, and set locations, languages and",
+                "  schedules, in the Google Ads UI.",
+            ]
+        )
+
+        return _park(
+            caller=caller,
+            tool="create_campaign",
+            customer_id=customer_id,
+            arguments=arguments,
+            preview=preview,
+            policy=policy,
+            metadata={
+                "operation": "create_campaign",
+                "payload": {
+                    "name": name,
+                    "budget_micros": to_micros(budget_units),
+                    "bidding_strategy": bidding_strategy,
+                },
+            },
+            extra={"created_status": "PAUSED"},
+        )
+
+    # ------------------------------------------------------------------
     # bids
     # ------------------------------------------------------------------
 

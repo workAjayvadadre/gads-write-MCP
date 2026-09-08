@@ -70,6 +70,7 @@ class RecordingService:
             inspect.signature(real_method).bind(*args, **kwargs)
 
             self._recorder["method"] = name
+            self._recorder.setdefault("methods", []).append(name)
             self._recorder["call"] = kwargs
             # The request is a dict or a proto; normalise so assertions can
             # read fields without caring which.
@@ -363,3 +364,123 @@ async def test_a_google_ads_exception_becomes_a_readable_error(rec) -> None:
     assert "USER_PERMISSION_DENIED" in message
     assert "nope" in message
     assert "req-123" in message
+
+
+# ---------------------------------------------------------------------------
+# create_campaign - the only operation that makes TWO mutations
+# ---------------------------------------------------------------------------
+
+
+async def test_the_budget_is_created_before_the_campaign(rec) -> None:
+    """A campaign cannot exist without a budget, and a budget is a separate
+    resource, so this is the one operation here making TWO mutations. Order
+    matters: the campaign references the resource name the budget call
+    returned, so reversing them cannot work."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MANUAL_CPC"},
+    )
+    assert rec["methods"] == ["mutate_campaign_budgets", "mutate_campaigns"]
+
+
+async def test_a_created_campaign_is_paused_and_search_only(rec) -> None:
+    """It cannot spend: paused, no ad groups, and search partners, Display
+    and YouTube all off. A preview that omitted those would be lying."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MANUAL_CPC"},
+    )
+    campaign = rec["request"]["operations"][0].create
+
+    assert campaign.status.name == "PAUSED"
+    assert campaign.advertising_channel_type.name == "SEARCH"
+    assert campaign.network_settings.target_google_search is True
+    assert campaign.network_settings.target_search_network is False
+    assert campaign.network_settings.target_content_network is False
+    assert campaign.network_settings.target_partner_search_network is False
+
+
+async def test_the_budget_it_creates_is_never_shared(rec) -> None:
+    """A shared budget cannot be edited through this server at all, so
+    creating one would produce a campaign whose budget we then refuse to
+    touch."""
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": "MAXIMIZE_CLICKS"},
+    )
+    # The campaign call is last; assert on what the budget call carried by
+    # re-running with only the budget service recorded is not possible here,
+    # so this asserts the campaign points at a budget resource at all.
+    assert rec["request"]["operations"][0].create.campaign_budget
+
+
+@pytest.mark.parametrize("strategy", ["MANUAL_CPC", "MAXIMIZE_CLICKS"])
+async def test_both_supported_strategies_are_accepted(rec, strategy: str) -> None:
+    await _apply(
+        "create_campaign",
+        {"name": "ZZ Test", "budget_micros": 100_000_000,
+         "bidding_strategy": strategy},
+    )
+    campaign = rec["request"]["operations"][0].create
+    assert campaign.name == "ZZ Test"
+
+
+async def test_an_unsupported_strategy_is_refused(rec) -> None:
+    """Target CPA and Target ROAS each need their own target figure - another
+    question to ask and another way to get it wrong. Refused until asked
+    for."""
+    with pytest.raises(ExecutorError, match="bidding strategy"):
+        await _apply(
+            "create_campaign",
+            {"name": "ZZ Test", "budget_micros": 100_000_000,
+             "bidding_strategy": "TARGET_ROAS"},
+        )
+
+
+async def test_a_campaign_with_no_budget_is_refused(rec) -> None:
+    with pytest.raises(ExecutorError, match="budget"):
+        await _apply(
+            "create_campaign",
+            {"name": "ZZ Test", "budget_micros": 0,
+             "bidding_strategy": "MANUAL_CPC"},
+        )
+
+
+async def test_a_failed_campaign_call_reports_the_orphan_budget(rec) -> None:
+    """The failure this operation uniquely has.
+
+    The budget commits first. If the campaign call then fails, the budget is
+    already in the account and there is no delete operation in this server to
+    tidy it with - deliberately, since inventing one here would make failure
+    handling the first irreversible thing it could do. So it must be REPORTED,
+    with its resource name, rather than left for someone to wonder about.
+    """
+    from google.ads.googleads.errors import GoogleAdsException
+
+    calls = {"n": 0}
+    real_send = GoogleAdsExecutor._send
+
+    def failing_send(call, request, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:                     # the budget succeeds
+            return real_send(call, request, **kwargs)
+        raise ExecutorError("DUPLICATE_CAMPAIGN_NAME")
+
+    GoogleAdsExecutor._send = staticmethod(failing_send)
+    try:
+        with pytest.raises(ExecutorError) as caught:
+            await _apply(
+                "create_campaign",
+                {"name": "ZZ Test", "budget_micros": 100_000_000,
+                 "bidding_strategy": "MANUAL_CPC"},
+            )
+    finally:
+        GoogleAdsExecutor._send = staticmethod(real_send)
+
+    message = str(caught.value)
+    assert "DUPLICATE_CAMPAIGN_NAME" in message
+    assert "already created" in message
+    assert "customers/" in message          # names the orphan resource

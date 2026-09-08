@@ -243,6 +243,17 @@ def _register_builtin_tools() -> None:
             operation="update_ad_group_bid",
         )
     )
+    # lead only. A new campaign is a spending surface that did not exist
+    # before, unlike every other write here which adjusts something a person
+    # already decided to create.
+    register(
+        ToolSpec(
+            name="create_campaign",
+            required_tier=Tier.LEAD,
+            writes=True,
+            operation="create_campaign",
+        )
+    )
     register(
         ToolSpec(
             name="create_responsive_search_ad",

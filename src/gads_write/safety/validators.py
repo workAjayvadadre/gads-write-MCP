@@ -615,3 +615,50 @@ def with_row_limit(query: str) -> str:
     if _LIMIT.search(text):
         return text
     return f"{text} LIMIT {MAX_GAQL_ROWS}"
+
+
+# ---------------------------------------------------------------------------
+# creating a campaign
+# ---------------------------------------------------------------------------
+
+# Google's own limit on a campaign name. Verified on the API's System Limits
+# page against CampaignError.DUPLICATE_CAMPAIGN_NAME being a separate error -
+# length and uniqueness are different failures.
+MAX_CAMPAIGN_NAME = 255
+
+# What this server will create. Two of the seventeen the API offers; see
+# ads/executor.py:CAMPAIGN_BIDDING_STRATEGIES for why.
+CAMPAIGN_BIDDING_STRATEGIES = ("MANUAL_CPC", "MAXIMIZE_CLICKS")
+
+
+def validate_campaign_name(name: object) -> ValidationResult:
+    result = ValidationResult()
+    text = str(name or "").strip()
+    if not text:
+        result.add("name", "a campaign needs a name")
+        return result
+    if len(text) > MAX_CAMPAIGN_NAME:
+        result.add(
+            "name",
+            f"a campaign name may be at most {MAX_CAMPAIGN_NAME} characters, "
+            f"got {len(text)}",
+        )
+    # Control characters would be accepted by Google and then render as
+    # nothing in the UI, producing a campaign nobody can find by name.
+    if any(unicodedata.category(ch).startswith("C") for ch in text):
+        result.add("name", "a campaign name may not contain control characters")
+    return result
+
+
+def validate_bidding_strategy(strategy: object) -> ValidationResult:
+    result = ValidationResult()
+    text = str(strategy or "").strip().upper()
+    if text not in CAMPAIGN_BIDDING_STRATEGIES:
+        result.add(
+            "bidding_strategy",
+            f"bidding_strategy must be one of "
+            f"{list(CAMPAIGN_BIDDING_STRATEGIES)}, got {strategy!r}. "
+            "Manual CPC lets you set bids yourself; Maximize Clicks lets "
+            "Google spend the budget on clicks.",
+        )
+    return result
