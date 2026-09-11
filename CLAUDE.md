@@ -267,6 +267,19 @@ against a future edit that sets an extra field without thinking.
 "successful" call can change nothing. All-or-nothing plus an exception is the
 behaviour we want.
 
+**Every write tool sits at `operator`, because a STANDARD user can do all of
+it in the Google Ads UI.** Four of them - `add_keyword`, `update_ad_group_bid`,
+`create_responsive_search_ad`, `create_campaign` - were `lead` on the reasoning
+that they create new spending surface or raise what a click costs. That
+predates the parity decision and does not survive it: requiring Admin for a
+change Standard can make in the UI is a restriction the UI does not have, and
+restrictions the UI does not have are what send people back to the UI. What a
+Standard user cannot do there is manage users and manage billing, and there is
+no tool here for either - so no write tool needs `lead` at all.
+`tests/test_annotations.py` enforces that, and the tier mechanism itself is
+covered against a synthetic lead-only tool so moving a real one cannot delete
+the coverage.
+
 **`pause` and `enable` are both `operator`, and they are not symmetric.**
 Pausing stops spend and is always safe; enabling resumes it, and in Phase 4
 it is the only tool that can cause money to be spent, carrying no amount for

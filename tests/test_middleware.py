@@ -64,6 +64,12 @@ def _registry():
     # registered here - these tests now run against the production specs
     # rather than hand-made copies of them.
     register(ToolSpec(name="get_campaigns", required_tier=Tier.READONLY, writes=False))
+    # A synthetic lead-only tool. No REAL write tool requires `lead` any more -
+    # a Standard Google Ads user can do all of them in the UI - but the tier
+    # mechanism still has to work, so it is exercised against a tool invented
+    # for the purpose rather than against a production spec that may move.
+    register(ToolSpec(name="lead_only_thing", required_tier=Tier.LEAD, writes=True,
+                      operation="lead_only_thing"))
     yield
     reset_for_tests()
 
@@ -99,6 +105,10 @@ def _server(tmp_path, resolver, *, write_enabled: bool = True) -> FastMCP:
     async def create_responsive_search_ad() -> str:
         return "made an ad"
 
+    @mcp.tool
+    async def lead_only_thing() -> str:
+        return "something only a lead may do"
+
     return mcp
 
 
@@ -118,20 +128,28 @@ async def test_readonly_does_not_see_write_tools(tmp_path) -> None:
     assert "update_campaign_budget" not in names
 
 
-async def test_operator_sees_operator_tools_but_not_lead_tools(tmp_path) -> None:
+async def test_an_operator_sees_every_real_write_tool(tmp_path) -> None:
+    """Parity with the Google Ads UI: a STANDARD user can create and edit
+    campaigns, keywords, ads, budgets and bids there, so every write tool here
+    is reachable at `operator`."""
     names = await _names(_server(tmp_path, MutableTierResolver(Tier.OPERATOR)))
     assert "update_campaign_budget" in names
-    assert "create_responsive_search_ad" not in names
+    assert "create_responsive_search_ad" in names
+
+
+async def test_the_tier_mechanism_still_filters(tmp_path) -> None:
+    """No production write tool needs `lead`, so this is checked against a
+    synthetic one - otherwise moving a real tool's tier would silently delete
+    the only coverage of the filter itself."""
+    names = await _names(_server(tmp_path, MutableTierResolver(Tier.OPERATOR)))
+    assert "lead_only_thing" not in names
 
 
 async def test_lead_sees_everything(tmp_path) -> None:
     names = await _names(_server(tmp_path, MutableTierResolver(Tier.LEAD)))
-    assert names == {
-        "health_check",
-        "get_campaigns",
-        "update_campaign_budget",
-        "create_responsive_search_ad",
-    }
+    assert "lead_only_thing" in names
+    assert "get_campaigns" in names
+    assert "health_check" in names
 
 
 async def test_tier_none_sees_only_health_check(tmp_path) -> None:

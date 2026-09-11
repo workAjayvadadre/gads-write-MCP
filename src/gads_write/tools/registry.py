@@ -224,13 +224,19 @@ def _register_builtin_tools() -> None:
             operation="add_negative_keyword",
         )
     )
-    # lead: the three that create new spending surface or raise what a click
-    # costs. A new keyword or ad reaches an audience nobody has reviewed, and
-    # a bid change has no daily ceiling behind it the way a budget does.
+    # Also operator. These were `lead` on the reasoning that they create new
+    # spending surface or raise what a click costs - but a STANDARD user can
+    # do every one of them in the Google Ads UI, and requiring Admin here is a
+    # restriction the UI does not have. That reasoning predates the parity
+    # decision and does not survive it.
+    #
+    # What a Standard user cannot do in the UI is manage users and manage
+    # billing. There is no tool here for either, which is why no write tool
+    # needs `lead` at all. tests/test_annotations.py enforces that.
     register(
         ToolSpec(
             name="add_keyword",
-            required_tier=Tier.LEAD,
+            required_tier=Tier.OPERATOR,
             writes=True,
             operation="add_keyword",
         )
@@ -238,18 +244,19 @@ def _register_builtin_tools() -> None:
     register(
         ToolSpec(
             name="update_ad_group_bid",
-            required_tier=Tier.LEAD,
+            required_tier=Tier.OPERATOR,
             writes=True,
             operation="update_ad_group_bid",
         )
     )
-    # lead only. A new campaign is a spending surface that did not exist
-    # before, unlike every other write here which adjusts something a person
-    # already decided to create.
+    # Operator, like the rest. A new campaign IS a spending surface that did
+    # not exist before - but a Standard user creates them in the Google Ads UI
+    # every day, and this one arrives PAUSED with no ad groups, keywords or
+    # ads, so it cannot spend until a person builds it out there.
     register(
         ToolSpec(
             name="create_campaign",
-            required_tier=Tier.LEAD,
+            required_tier=Tier.OPERATOR,
             writes=True,
             operation="create_campaign",
         )
@@ -257,7 +264,7 @@ def _register_builtin_tools() -> None:
     register(
         ToolSpec(
             name="create_responsive_search_ad",
-            required_tier=Tier.LEAD,
+            required_tier=Tier.OPERATOR,
             writes=True,
             operation="create_responsive_search_ad",
         )

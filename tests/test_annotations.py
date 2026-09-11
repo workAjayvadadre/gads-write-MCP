@@ -95,3 +95,46 @@ def test_an_unregistered_tool_gets_the_most_cautious_annotations() -> None:
     ann = annotations_for("something_nobody_registered")
     assert ann["readOnlyHint"] is False
     assert ann["destructiveHint"] is True
+
+
+# ---------------------------------------------------------------------------
+# parity with the Google Ads UI access levels
+# ---------------------------------------------------------------------------
+
+
+def test_no_write_tool_requires_more_than_a_standard_google_ads_user() -> None:
+    """The design principle, made enforceable.
+
+    A person should be able to do here what they could already do in the
+    Google Ads UI. A STANDARD user there can create and edit campaigns, ad
+    groups, keywords, ads, budgets and bids - everything this server writes.
+    The only things Standard cannot do in the UI are manage users and manage
+    billing, and there is no tool here for either.
+
+    Requiring ADMIN for a change Standard can make in the UI is a restriction
+    the UI does not have, which is exactly what makes people work around the
+    tool. Four tools used to sit at `lead` on the reasoning that they create
+    spending surface or raise what a click costs; that predates the parity
+    decision and does not survive it.
+    """
+    from gads_write.auth.tiers import Tier
+
+    too_strict = [
+        name
+        for name, spec in all_specs().items()
+        if spec.writes and spec.required_tier is Tier.LEAD
+    ]
+    assert not too_strict, (
+        "these require Admin but a Standard Google Ads user can do them in "
+        f"the UI: {sorted(too_strict)}"
+    )
+
+
+def test_reads_still_need_only_read_only_access() -> None:
+    """The other half of parity: a READ_ONLY user in the UI can see campaigns,
+    reports and search terms, so they can here."""
+    from gads_write.auth.tiers import Tier
+
+    for name, spec in all_specs().items():
+        if not spec.writes and name != "health_check":
+            assert spec.required_tier is Tier.READONLY, name

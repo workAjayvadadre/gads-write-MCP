@@ -665,15 +665,18 @@ async def test_an_overlong_keyword_is_refused(linked) -> None:
     assert "80" in str(caught.value)
 
 
-async def test_an_operator_cannot_add_keywords(linked) -> None:
+async def test_an_operator_can_add_keywords(linked) -> None:
+    """Parity: a STANDARD user adds keywords in the Google Ads UI every day.
+    This required Admin until the parity decision, which was a restriction the
+    UI does not have."""
     h = linked(Tier.OPERATOR)
-    with pytest.raises(Exception) as caught:
-        await _call(
-            h.mcp, "add_keyword",
-            {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
-             "keyword_text": "ivf", "match_type": "EXACT"},
-        )
-    assert "requires tier lead" in str(caught.value)
+    draft = await _call(
+        h.mcp, "add_keyword",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP,
+         "keyword_text": "ivf", "match_type": "EXACT"},
+    )
+    assert draft["plan_id"]
+    assert h.executor.applied == []
 
 
 # ===========================================================================
@@ -715,7 +718,7 @@ async def test_a_bid_within_the_relative_cap_drafts(linked) -> None:
     assert h.executor.applied == []
 
 
-async def test_an_operator_cannot_confirm_a_lead_drafted_ad(linked) -> None:
+async def test_a_demoted_user_cannot_confirm_their_own_draft(linked) -> None:
     """The same property, on a tool whose rules are absolute.
 
     Deliberately an RSA and not a bid. A bid re-reads the ad group, so it is
@@ -724,14 +727,18 @@ async def test_an_operator_cannot_confirm_a_lead_drafted_ad(linked) -> None:
     tool is actually enforced. Without this test that gate could be changed
     to check confirm_and_apply's own tier and nothing would notice.
     """
-    h = linked(Tier.LEAD)
+    h = linked(Tier.OPERATOR)
     draft = await _call(
         h.mcp, "create_responsive_search_ad",
         {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "headlines": HEADLINES,
          "descriptions": DESCRIPTIONS, "final_urls": URLS},
     )
 
-    h.tiers.tier = Tier.OPERATOR   # demoted in Google Ads between the steps
+    # Demoted in Google Ads between the two steps. Operator -> readonly now
+    # that every write tool sits at operator; the property under test is the
+    # same, namely that confirm enforces the DRAFTING tool's tier rather than
+    # confirm_and_apply's own.
+    h.tiers.tier = Tier.READONLY
 
     with pytest.raises(Exception) as caught:
         await _call(h.mcp, "confirm_and_apply", {"plan_id": draft["plan_id"]})
@@ -756,14 +763,17 @@ async def test_an_operator_can_still_confirm_an_operator_tier_plan(linked) -> No
     assert len(h.executor.applied) == 1
 
 
-async def test_an_operator_cannot_change_bids(linked) -> None:
+async def test_an_operator_can_change_bids(linked) -> None:
+    """Parity again. A bid has no daily ceiling behind it, which is why it
+    stayed at `lead` longest - but a Standard user changes bids in the UI, so
+    requiring Admin here only pushed them back to the UI."""
     h = linked(Tier.OPERATOR)
-    with pytest.raises(Exception) as caught:
-        await _call(
-            h.mcp, "update_ad_group_bid",
-            {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 60},
-        )
-    assert "requires tier lead" in str(caught.value)
+    draft = await _call(
+        h.mcp, "update_ad_group_bid",
+        {"customer_id": ACCOUNT, "ad_group_id": AD_GROUP, "new_max_cpc": 30},
+    )
+    assert draft["plan_id"]
+    assert h.executor.applied == []
 
 
 # ===========================================================================
@@ -960,16 +970,19 @@ async def test_a_campaign_draft_previews_every_setting(linked) -> None:
     assert h.executor.applied == []          # drafting creates nothing
 
 
-async def test_creating_a_campaign_needs_lead(linked) -> None:
-    """A new campaign is a spending surface that did not exist before, unlike
-    every other write which adjusts something already created."""
+async def test_an_operator_can_create_a_campaign(linked) -> None:
+    """A new campaign IS a spending surface that did not exist before - but a
+    Standard user creates them in the UI, and this one arrives PAUSED with no
+    ad groups, keywords or ads, so it cannot spend until somebody builds it
+    out there."""
     h = linked(Tier.OPERATOR)
-    with pytest.raises(Exception):
-        await _call(
-            h.mcp, "create_campaign",
-            {"customer_id": ACCOUNT, "name": "ZZ New Campaign",
-             "daily_budget": 100, "bidding_strategy": "MANUAL_CPC"},
-        )
+    draft = await _call(
+        h.mcp, "create_campaign",
+        {"customer_id": ACCOUNT, "name": "ZZ Parity Test",
+         "daily_budget": 100, "bidding_strategy": "MANUAL_CPC"},
+    )
+    assert draft["plan_id"]
+    assert h.executor.applied == []
 
 
 @pytest.mark.parametrize(
