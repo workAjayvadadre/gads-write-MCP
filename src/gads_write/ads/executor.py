@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -103,6 +104,19 @@ AD_GROUP_STATUS_OPERATIONS: dict[str, str] = {
     "enable_ad_group": "ENABLED",
 }
 
+# operation name -> the AdGroupCriterionStatus enum member it sets.
+# REMOVED absent, for the third time and the same reason.
+KEYWORD_STATUS_OPERATIONS: dict[str, str] = {
+    "pause_keyword": "PAUSED",
+    "enable_keyword": "ENABLED",
+}
+
+# operation name -> the AdGroupAdStatus enum member it sets.
+AD_STATUS_OPERATIONS: dict[str, str] = {
+    "pause_ad": "PAUSED",
+    "enable_ad": "ENABLED",
+}
+
 # Per-operation update-mask allowlists.
 #
 # An update mask says which fields to overwrite, and a mask naming a field
@@ -126,6 +140,27 @@ UPDATE_MASK_ALLOWLIST: dict[str, frozenset[str]] = {
     # per-operation lists exist to catch.
     "pause_ad_group": frozenset({"resource_name", "status"}),
     "enable_ad_group": frozenset({"resource_name", "status"}),
+    # Keywords: three operations on AdGroupCriterion, three separate entries,
+    # so a bid change can never legally carry `status` and vice versa.
+    "pause_keyword": frozenset({"resource_name", "status"}),
+    "enable_keyword": frozenset({"resource_name", "status"}),
+    "update_keyword_bid": frozenset({"resource_name", "cpc_bid_micros"}),
+    # Ads.
+    "pause_ad": frozenset({"resource_name", "status"}),
+    "enable_ad": frozenset({"resource_name", "status"}),
+    # The only operation that may write a campaign's NAME or its dates. It
+    # deliberately cannot carry `status`, which is pause_campaign's business,
+    # nor `campaign_budget`, which is update_campaign_budget's.
+    #
+    # The mask is derived from fields actually set, so updating only the name
+    # produces only `name` - an omitted date is never blanked. The flip side,
+    # recorded because it is a real limitation rather than an oversight: there
+    # is therefore NO WAY to CLEAR an end date through this server. Clearing a
+    # field means naming it in the mask while leaving it unset, which is
+    # exactly the mechanism `_seal_mask` exists to make impossible.
+    "update_campaign": frozenset(
+        {"resource_name", "name", "start_date_time", "end_date_time"}
+    ),
     # The one operation that carries BOTH creates and an update. The location
     # criteria are creates and need no mask; the campaign-level presence
     # setting is an update and does, so the operation is listed here rather
@@ -285,6 +320,12 @@ class GoogleAdsExecutor(Executor):
             "enable_campaign": self._set_campaign_status,
             "pause_ad_group": self._set_ad_group_status,
             "enable_ad_group": self._set_ad_group_status,
+            "pause_keyword": self._set_keyword_status,
+            "enable_keyword": self._set_keyword_status,
+            "pause_ad": self._set_ad_status,
+            "enable_ad": self._set_ad_status,
+            "update_keyword_bid": self._update_keyword_bid,
+            "update_campaign": self._update_campaign,
             "create_campaign": self._create_campaign,
             "create_ad_group": self._create_ad_group,
             "add_location_target": self._add_location_target,
@@ -421,6 +462,141 @@ class GoogleAdsExecutor(Executor):
 
         response = self._send(service.mutate_ad_groups, request, operations=[operation])
         return self._finish(response, request, {"new_status": status_name})
+
+    def _set_keyword_status(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Pause or enable one keyword.
+
+        Addressed by BOTH ids. An ad_group_criterion resource name is
+        `customers/X/adGroupCriteria/{ad_group_id}~{criterion_id}` - criterion
+        ids are unique within an ad group, not within an account - so a
+        criterion id on its own would address the wrong keyword, silently.
+        """
+        status_name = KEYWORD_STATUS_OPERATIONS[request.operation]
+        ad_group_id = _digits(request.payload, "ad_group_id")
+        criterion_id = _digits(request.payload, "criterion_id")
+
+        service = client.get_service("AdGroupCriterionService")
+        operation = client.get_type("AdGroupCriterionOperation")
+        criterion = operation.update
+        criterion.resource_name = service.ad_group_criterion_path(
+            request.customer_id, ad_group_id, criterion_id
+        )
+        criterion.status = client.enums.AdGroupCriterionStatusEnum[status_name]
+        self._seal_mask(request.operation, operation, criterion, client)
+
+        response = self._send(
+            service.mutate_ad_group_criteria, request, operations=[operation]
+        )
+        return self._finish(response, request, {"new_status": status_name})
+
+    def _update_keyword_bid(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Change one keyword's own max CPC. Mirrors _update_ad_group_bid."""
+        ad_group_id = _digits(request.payload, "ad_group_id")
+        criterion_id = _digits(request.payload, "criterion_id")
+        cpc_bid_micros = _micros(request.payload, "cpc_bid_micros")
+
+        service = client.get_service("AdGroupCriterionService")
+        operation = client.get_type("AdGroupCriterionOperation")
+        criterion = operation.update
+        criterion.resource_name = service.ad_group_criterion_path(
+            request.customer_id, ad_group_id, criterion_id
+        )
+        criterion.cpc_bid_micros = cpc_bid_micros
+        self._seal_mask(request.operation, operation, criterion, client)
+
+        response = self._send(
+            service.mutate_ad_group_criteria, request, operations=[operation]
+        )
+        return self._finish(response, request, {"new_cpc_bid_micros": cpc_bid_micros})
+
+    def _set_ad_status(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Pause or enable one ad.
+
+        Addressed by both ids for the same reason as a keyword: an ad_group_ad
+        resource name is `customers/X/adGroupAds/{ad_group_id}~{ad_id}`.
+        """
+        status_name = AD_STATUS_OPERATIONS[request.operation]
+        ad_group_id = _digits(request.payload, "ad_group_id")
+        ad_id = _digits(request.payload, "ad_id")
+
+        service = client.get_service("AdGroupAdService")
+        operation = client.get_type("AdGroupAdOperation")
+        ad_group_ad = operation.update
+        ad_group_ad.resource_name = service.ad_group_ad_path(
+            request.customer_id, ad_group_id, ad_id
+        )
+        ad_group_ad.status = client.enums.AdGroupAdStatusEnum[status_name]
+        self._seal_mask(request.operation, operation, ad_group_ad, client)
+
+        response = self._send(
+            service.mutate_ad_group_ads, request, operations=[operation]
+        )
+        return self._finish(response, request, {"new_status": status_name})
+
+    def _update_campaign(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Change a campaign's name and/or its run dates. Nothing else.
+
+        The dates are `start_date_time` and `end_date_time`, NOT `start_date`
+        and `end_date` - those do not exist in Google Ads API v25. Both are
+        strings in the CUSTOMER'S timezone in "yyyy-MM-dd HH:mm:ss" form, per
+        the v25 Campaign proto, which also specifies the time components this
+        uses: 00:00:00 to start a day and 23:59:59 to end one.
+
+        The caller supplies plain dates and tools/writes.py composes the
+        timestamps, so there is exactly one place that knows the format.
+        """
+        campaign_id = _digits(request.payload, "campaign_id")
+        name = request.payload.get("name")
+        start_date_time = request.payload.get("start_date_time")
+        end_date_time = request.payload.get("end_date_time")
+
+        if name is None and start_date_time is None and end_date_time is None:
+            raise ExecutorError(
+                "update_campaign needs at least one of name, start_date_time or "
+                "end_date_time; a mutation that changes nothing is refused"
+            )
+
+        service = client.get_service("CampaignService")
+        operation = client.get_type("CampaignOperation")
+        campaign = operation.update
+        campaign.resource_name = service.campaign_path(
+            request.customer_id, campaign_id
+        )
+
+        # Only fields actually supplied are set, which is what keeps the
+        # derived mask from naming - and therefore blanking - the others.
+        if name is not None:
+            text = str(name).strip()
+            if not text:
+                raise ExecutorError("a campaign name must not be empty")
+            campaign.name = text
+        if start_date_time is not None:
+            campaign.start_date_time = _date_time(start_date_time, "start_date_time")
+        if end_date_time is not None:
+            campaign.end_date_time = _date_time(end_date_time, "end_date_time")
+
+        self._seal_mask(request.operation, operation, campaign, client)
+
+        response = self._send(
+            service.mutate_campaigns, request, operations=[operation]
+        )
+        return self._finish(
+            response,
+            request,
+            {
+                "new_name": name,
+                "new_start_date_time": start_date_time,
+                "new_end_date_time": end_date_time,
+            },
+        )
 
     def _update_campaign_budget(
         self, request: MutationRequest, client: Any
@@ -929,6 +1105,26 @@ def _status(payload: dict[str, Any]) -> str:
             "of scope for v1."
         )
     return status
+
+
+_DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def _date_time(value: object, field: str) -> str:
+    """Assert a campaign timestamp is in the exact form v25 documents.
+
+    "yyyy-MM-dd HH:mm:ss", in the customer's timezone. Backstop only - tools
+    validate the date and compose the timestamp - but the format is the kind
+    of detail that silently becomes an opaque Google rejection, so it is
+    checked before anything is sent.
+    """
+    text = str(value).strip()
+    if not _DATE_TIME.fullmatch(text):
+        raise ExecutorError(
+            f"{field} must be 'yyyy-MM-dd HH:mm:ss' in the account's timezone, "
+            f"got {text!r}"
+        )
+    return text
 
 
 def _describe(exc: Any) -> str:

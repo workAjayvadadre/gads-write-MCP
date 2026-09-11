@@ -694,6 +694,50 @@ MAX_LOCATIONS_PER_CHANGE = 20
 _LOCATION_QUERY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .,&-]*$")
 
 
+def validate_campaign_schedule(
+    start_date: object, end_date: object, *, current_start: str = ""
+) -> ValidationResult:
+    """A campaign's run dates, as plain ISO dates from the caller.
+
+    Each is optional - this tool changes only what it is given - but whatever
+    arrives has to be a real date, and an end before a start is a campaign
+    that can never run. When only the end date is supplied, it is checked
+    against the campaign's CURRENT start date so that a nonsense pairing is
+    still caught.
+
+    Google stores these as `start_date_time` / `end_date_time` strings in the
+    account's timezone; composing the timestamp is ads/executor.py's job, and
+    the format lives in exactly one place there.
+    """
+    result = ValidationResult()
+    has_start = start_date is not None and str(start_date).strip() != ""
+    has_end = end_date is not None and str(end_date).strip() != ""
+
+    if has_start:
+        result.extend(validate_iso_date(start_date, field_name="start_date"))
+    if has_end:
+        result.extend(validate_iso_date(end_date, field_name="end_date"))
+    if not result.ok:
+        return result
+
+    start_text = str(start_date).strip() if has_start else current_start
+    if has_end and start_text:
+        try:
+            start = date.fromisoformat(start_text)
+        except ValueError:
+            # The campaign's own stored start was unreadable. Not the caller's
+            # fault and not worth refusing their end date over.
+            return result
+        end = date.fromisoformat(str(end_date).strip())
+        if end < start:
+            result.add(
+                "end_date",
+                f"{end} is before the start date {start}, so the campaign could "
+                "never run",
+            )
+    return result
+
+
 def validate_location_query(text: object) -> ValidationResult:
     """A place name to search for, safe to put inside a GAQL LIKE pattern.
 

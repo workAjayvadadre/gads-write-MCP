@@ -291,3 +291,53 @@ def test_too_many_locations_for_one_preview_are_refused() -> None:
     at_limit = [str(n) for n in range(MAX_LOCATIONS_PER_CHANGE)]
     assert validate_geo_target_ids(at_limit).ok
     assert not validate_geo_target_ids(at_limit + ["999"]).ok
+
+
+# ---------------------------------------------------------------------------
+# campaign run dates
+# ---------------------------------------------------------------------------
+
+def test_a_schedule_with_neither_date_is_fine() -> None:
+    """update_campaign changes only what it is given, so supplying no dates is
+    ordinary rather than an error."""
+    from gads_write.safety.validators import validate_campaign_schedule
+
+    assert validate_campaign_schedule(None, None).ok
+
+
+def test_an_end_before_a_given_start_is_refused() -> None:
+    from gads_write.safety.validators import validate_campaign_schedule
+
+    assert validate_campaign_schedule("2026-01-01", "2026-12-31").ok
+    assert not validate_campaign_schedule("2026-06-01", "2026-03-01").ok
+    # Same day is a one-day campaign, not an error.
+    assert validate_campaign_schedule("2026-06-01", "2026-06-01").ok
+
+
+def test_an_end_alone_is_compared_against_the_campaigns_current_start() -> None:
+    """Setting only an end date is ordinary, and whether it works depends on a
+    value only the account holds."""
+    from gads_write.safety.validators import validate_campaign_schedule
+
+    assert validate_campaign_schedule(
+        None, "2026-12-31", current_start="2026-01-01"
+    ).ok
+    assert not validate_campaign_schedule(
+        None, "2025-12-31", current_start="2026-01-01"
+    ).ok
+
+
+def test_an_unreadable_current_start_does_not_refuse_the_callers_end_date() -> None:
+    """Not the caller's fault, and not worth blocking their change over."""
+    from gads_write.safety.validators import validate_campaign_schedule
+
+    assert validate_campaign_schedule(None, "2026-12-31", current_start="garbage").ok
+    assert validate_campaign_schedule(None, "2026-12-31", current_start="").ok
+
+
+@pytest.mark.parametrize("bad", ["2026-13-01", "2026-02-31", "01-01-2026", "soon"])
+def test_an_unusable_schedule_date_is_refused(bad: str) -> None:
+    from gads_write.safety.validators import validate_campaign_schedule
+
+    assert not validate_campaign_schedule(bad, None).ok
+    assert not validate_campaign_schedule(None, bad).ok

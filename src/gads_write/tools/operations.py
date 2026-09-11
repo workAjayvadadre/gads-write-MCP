@@ -53,6 +53,7 @@ from ..safety.validators import (
     validate_geo_target_ids,
     validate_bidding_strategy,
     validate_campaign_name,
+    validate_campaign_schedule,
     validate_customer_id,
     validate_keyword_text,
     validate_match_type,
@@ -72,6 +73,10 @@ class ReadKind(str, Enum):
     NONE = "none"
     CAMPAIGN = "campaign"
     AD_GROUP = "ad_group"
+    # Needs TWO ids, not one: an ad_group_criterion is addressed as
+    # `{ad_group_id}~{criterion_id}`. `id_argument` names the criterion and
+    # `read_current` reads the ad group id alongside it.
+    KEYWORD = "keyword"
 
 
 class Validate(Protocol):
@@ -166,6 +171,86 @@ def validate_ad_group_status_args(
     result.extend(
         validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
     )
+    return result
+
+
+def validate_keyword_status_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Validate a keyword status change. BOTH ids, and no status.
+
+    Both ids because an ad_group_criterion resource name is
+    `{ad_group_id}~{criterion_id}`: criterion ids are unique within an ad
+    group, not within an account, so one id alone identifies nothing.
+    """
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
+    )
+    result.extend(
+        validate_numeric_id(arguments.get("criterion_id", ""), field_name="criterion_id")
+    )
+    return result
+
+
+def validate_keyword_bid_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Same ids as a keyword status change; the amount is checked by policy."""
+    return validate_keyword_status_args(policy, arguments)
+
+
+def validate_ad_status_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Validate an ad status change. Both ids, and no status."""
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
+    )
+    result.extend(validate_numeric_id(arguments.get("ad_id", ""), field_name="ad_id"))
+    return result
+
+
+def validate_update_campaign_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Name and/or run dates, and at least one of them.
+
+    A mutation that changes nothing is refused rather than applied: it would
+    produce an audit line for a change nobody made, which is the same reason
+    the status tools return "nothing to do" instead of drafting a plan.
+    """
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("campaign_id", ""), field_name="campaign_id")
+    )
+
+    name = arguments.get("name")
+    start_date = arguments.get("start_date")
+    end_date = arguments.get("end_date")
+    supplied = [
+        value for value in (name, start_date, end_date)
+        if value is not None and str(value).strip() != ""
+    ]
+    if not supplied:
+        result.add(
+            "name",
+            "give at least one of name, start_date or end_date - there is "
+            "nothing to change otherwise",
+        )
+        return result
+
+    if name is not None and str(name).strip() != "":
+        result.extend(validate_campaign_name(name))
+    # Shape only. An end date supplied WITHOUT a start date can only be judged
+    # against the campaign's current start, which this cannot see - that check
+    # lives in `update_campaign_verdict`, which runs at both steps with the
+    # campaign in hand.
+    result.extend(validate_campaign_schedule(start_date, end_date))
     return result
 
 
@@ -562,6 +647,113 @@ def recheck_location_target(
     return location_target_verdict(current, payload)
 
 
+def keyword_bid_baseline_micros(current: Any) -> int:
+    """The bid a keyword actually uses today, in micros.
+
+    Deliberately `effective_cpc_bid_micros` and NOT the keyword's own
+    `cpc_bid_micros`. A keyword with no bid of its own has
+    cpc_bid_micros == 0 and bids the ad group's default instead - and
+    `evaluate_bid_change` refuses a rise from zero, because a percentage from
+    zero is undefined. Using the own-bid as the baseline would therefore
+    refuse the single most ordinary keyword bid change there is: setting one
+    for the first time.
+
+    The effective bid is the number the keyword is bidding right now, which is
+    what a percentage should be measured against and what the person sees in
+    the Google Ads UI.
+    """
+    effective = int(getattr(current, "effective_cpc_bid_micros", 0) or 0)
+    return effective or int(getattr(current, "cpc_bid_micros", 0) or 0)
+
+
+def recheck_keyword_bid(
+    policy: Policy,
+    *,
+    tier: Tier,
+    arguments: dict[str, Any],
+    current: Any,
+    payload: dict[str, Any],
+    spend_today: Decimal,
+) -> PolicyVerdict:
+    """The typo backstop, against the bid the keyword uses NOW."""
+    new_units = _units_from(arguments, "new_max_cpc")
+    if new_units is None:
+        return PolicyVerdict.deny(
+            "new_max_cpc is not a usable number, so this change cannot be "
+            "checked against the bid limits."
+        )
+    if current is None:
+        return PolicyVerdict.deny(
+            "the keyword's current bid could not be established, so a "
+            "percentage limit cannot be applied to this change."
+        )
+    if str(getattr(current, "status", "") or "").upper() == "REMOVED":
+        return PolicyVerdict.deny(
+            "this keyword is REMOVED. Removal is permanent in Google Ads, so "
+            "its bid cannot be changed."
+        )
+    return evaluate_bid_change(
+        policy,
+        tier=tier,
+        current_units=units_from_micros(keyword_bid_baseline_micros(current)),
+        new_units=new_units,
+    )
+
+
+def update_campaign_verdict(current: Any, arguments: dict[str, Any]) -> PolicyVerdict:
+    """The campaign exists, is not REMOVED, and the resulting dates cohere.
+
+    The date check is here rather than only in the argument validator because
+    it needs the campaign's CURRENT start date: setting just an end date is
+    ordinary, and whether it is valid depends on a value only the account
+    holds. Confirm re-reads, so a start date moved in the Google Ads UI
+    between drafting and confirming is caught rather than rejected opaquely by
+    Google.
+    """
+    if current is None:
+        return PolicyVerdict.deny(
+            "the campaign could not be read, so this change cannot be checked."
+        )
+    if str(getattr(current, "status", "") or "").upper() == "REMOVED":
+        return PolicyVerdict.deny(
+            "this campaign is REMOVED. Removal is permanent in Google Ads and "
+            "a removed campaign cannot be edited."
+        )
+
+    end_date = arguments.get("end_date")
+    if end_date is None or str(end_date).strip() == "":
+        return PolicyVerdict.allow()
+
+    start_date = arguments.get("start_date")
+    if start_date is not None and str(start_date).strip() != "":
+        # Both supplied: already compared by the argument validator.
+        return PolicyVerdict.allow()
+
+    result = validate_campaign_schedule(
+        None, end_date, current_start=_date_part(getattr(current, "start_date_time", ""))
+    )
+    if not result.ok:
+        return PolicyVerdict.deny(*result.as_messages())
+    return PolicyVerdict.allow()
+
+
+def recheck_update_campaign(
+    policy: Policy,
+    *,
+    tier: Tier,
+    arguments: dict[str, Any],
+    current: Any,
+    payload: dict[str, Any],
+    spend_today: Decimal,
+) -> PolicyVerdict:
+    return update_campaign_verdict(current, arguments)
+
+
+def _date_part(date_time: object) -> str:
+    """The date out of a "yyyy-MM-dd HH:mm:ss" campaign timestamp."""
+    return str(date_time or "").strip().split(" ", 1)[0]
+
+
 def validate_create_campaign_args(
     policy: Policy, arguments: dict[str, Any]
 ) -> ValidationResult:
@@ -606,6 +798,29 @@ OPERATIONS: dict[str, OperationChecks] = {
     # can approve.
     "pause_ad_group": OperationChecks(validate=validate_ad_group_status_args),
     "enable_ad_group": OperationChecks(validate=validate_ad_group_status_args),
+    # Keyword and ad status: the same shape one and two levels further down.
+    # Drafting reads for the preview; confirm has nothing relative to re-check.
+    "pause_keyword": OperationChecks(validate=validate_keyword_status_args),
+    "enable_keyword": OperationChecks(validate=validate_keyword_status_args),
+    "pause_ad": OperationChecks(validate=validate_ad_status_args),
+    "enable_ad": OperationChecks(validate=validate_ad_status_args),
+    # A bid IS relative, so this one re-reads - and reads a KEYWORD, which
+    # takes two ids rather than one.
+    "update_keyword_bid": OperationChecks(
+        validate=validate_keyword_bid_args,
+        recheck=recheck_keyword_bid,
+        reads=ReadKind.KEYWORD,
+        id_argument="criterion_id",
+    ),
+    # Re-reads because an end date supplied on its own is only meaningful
+    # against the campaign's current start date, and that can move in the
+    # Google Ads UI between drafting and confirming.
+    "update_campaign": OperationChecks(
+        validate=validate_update_campaign_args,
+        recheck=recheck_update_campaign,
+        reads=ReadKind.CAMPAIGN,
+        id_argument="campaign_id",
+    ),
     "update_campaign_budget": OperationChecks(
         validate=validate_budget_args,
         recheck=recheck_budget,
@@ -676,6 +891,15 @@ async def read_current(
         return await reader.campaign_by_id(
             customer_id=customer_id, campaign_id=entity_id
         )
+    if checks.reads is ReadKind.KEYWORD:
+        ad_group_id = str(arguments.get("ad_group_id") or "").strip()
+        if not ad_group_id:
+            return None
+        return await reader.keyword_by_id(
+            customer_id=customer_id,
+            ad_group_id=ad_group_id,
+            criterion_id=entity_id,
+        )
     return await reader.ad_group_by_id(customer_id=customer_id, ad_group_id=entity_id)
 
 
@@ -700,8 +924,16 @@ __all__ = [
     "recheck_create_ad_group",
     "validate_bid_args",
     "validate_budget_args",
+    "keyword_bid_baseline_micros",
+    "recheck_keyword_bid",
+    "recheck_update_campaign",
+    "update_campaign_verdict",
     "validate_ad_group_status_args",
+    "validate_ad_status_args",
     "validate_campaign_status_args",
+    "validate_keyword_bid_args",
+    "validate_keyword_status_args",
+    "validate_update_campaign_args",
     "validate_create_ad_group_args",
     "validate_keyword_args",
     "validate_negative_keyword_args",

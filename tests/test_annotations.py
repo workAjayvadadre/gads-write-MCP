@@ -61,7 +61,9 @@ def test_drafting_a_change_is_not_destructive() -> None:
     for name in ("pause_campaign", "update_campaign_budget", "add_keyword",
                  "create_responsive_search_ad", "update_ad_group_bid",
                  "add_negative_keyword", "enable_campaign", "create_ad_group",
-                 "add_location_target", "pause_ad_group", "enable_ad_group"):
+                 "add_location_target", "pause_ad_group", "enable_ad_group",
+                 "pause_keyword", "enable_keyword", "pause_ad", "enable_ad",
+                 "update_keyword_bid", "update_campaign"):
         ann = annotations_for(name)
         assert ann["readOnlyHint"] is False, name
         assert ann["destructiveHint"] is False, name

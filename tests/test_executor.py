@@ -28,7 +28,9 @@ import gads_write.ads.client as client_module
 from gads_write.ads.api_version import API_VERSION
 from gads_write.ads.executor import (
     AD_GROUP_STATUS_OPERATIONS,
+    AD_STATUS_OPERATIONS,
     CAMPAIGN_STATUS_OPERATIONS,
+    KEYWORD_STATUS_OPERATIONS,
     CREATE_OPERATIONS,
     KNOWN_OPERATIONS,
     UPDATE_MASK_ALLOWLIST,
@@ -572,6 +574,8 @@ def test_removal_is_not_an_available_operation() -> None:
     assert all("delete" not in name for name in KNOWN_OPERATIONS)
     assert "REMOVED" not in CAMPAIGN_STATUS_OPERATIONS.values()
     assert "REMOVED" not in AD_GROUP_STATUS_OPERATIONS.values()
+    assert "REMOVED" not in KEYWORD_STATUS_OPERATIONS.values()
+    assert "REMOVED" not in AD_STATUS_OPERATIONS.values()
 
 
 async def test_an_unknown_operation_is_refused(rec) -> None:
@@ -847,3 +851,155 @@ async def test_a_non_permission_failure_is_never_retried(rec) -> None:
         GoogleAdsExecutor._send = staticmethod(real_send)
 
     assert calls["n"] == 1, "an ambiguous failure must not be retried"
+
+
+# ---------------------------------------------------------------------------
+# keywords and ads - addressed by TWO ids
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("operation", "expected_status"), sorted(KEYWORD_STATUS_OPERATIONS.items())
+)
+async def test_each_keyword_status_operation_sets_its_own_status(
+    rec, operation, expected_status
+) -> None:
+    """An ad_group_criterion resource name is `{ad_group_id}~{criterion_id}`.
+    Criterion ids are unique within an ad group, not within an account, so a
+    criterion id alone would address the wrong keyword, silently."""
+    await _apply(operation, {"ad_group_id": "66", "criterion_id": "999"})
+    sent = _sent(rec)
+    assert sent.update.status.name == expected_status
+    assert sent.update.resource_name == (
+        f"customers/{ACCOUNT}/adGroupCriteria/66~999"
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_status"), sorted(AD_STATUS_OPERATIONS.items())
+)
+async def test_each_ad_status_operation_sets_its_own_status(
+    rec, operation, expected_status
+) -> None:
+    await _apply(operation, {"ad_group_id": "66", "ad_id": "888"})
+    sent = _sent(rec)
+    assert sent.update.status.name == expected_status
+    assert sent.update.resource_name == f"customers/{ACCOUNT}/adGroupAds/66~888"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    sorted(KEYWORD_STATUS_OPERATIONS) + sorted(AD_STATUS_OPERATIONS),
+)
+async def test_a_child_status_mask_names_only_status(rec, operation) -> None:
+    payload = (
+        {"ad_group_id": "66", "criterion_id": "999"}
+        if operation in KEYWORD_STATUS_OPERATIONS
+        else {"ad_group_id": "66", "ad_id": "888"}
+    )
+    await _apply(operation, payload)
+    paths = set(_sent(rec).update_mask.paths)
+
+    assert paths <= UPDATE_MASK_ALLOWLIST[operation]
+    assert "status" in paths
+    for forbidden in ("cpc_bid_micros", "keyword", "ad", "negative", "ad_group"):
+        assert forbidden not in paths
+
+
+async def test_a_keyword_bid_mask_names_only_the_bid(rec) -> None:
+    """Its own allowlist entry. A bid change must never legally carry
+    `status`, nor a status change a bid."""
+    await _apply(
+        "update_keyword_bid",
+        {"ad_group_id": "66", "criterion_id": "999", "cpc_bid_micros": 60_000_000},
+    )
+    sent = _sent(rec)
+    paths = set(sent.update_mask.paths)
+
+    assert paths <= UPDATE_MASK_ALLOWLIST["update_keyword_bid"]
+    assert "cpc_bid_micros" in paths
+    assert "status" not in paths
+    assert sent.update.cpc_bid_micros == 60_000_000
+    assert sent.update.resource_name == (
+        f"customers/{ACCOUNT}/adGroupCriteria/66~999"
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("pause_keyword", {"ad_group_id": "66", "criterion_id": "9' OR 1=1"}),
+        ("pause_keyword", {"ad_group_id": "", "criterion_id": "999"}),
+        ("pause_ad", {"ad_group_id": "66", "ad_id": "abc"}),
+        ("update_keyword_bid", {"ad_group_id": "66", "criterion_id": "999", "cpc_bid_micros": 0}),
+        ("update_keyword_bid", {"ad_group_id": "66", "criterion_id": "999", "cpc_bid_micros": -1}),
+    ],
+)
+async def test_malformed_keyword_and_ad_payloads_are_refused(rec, operation, payload) -> None:
+    with pytest.raises(ExecutorError):
+        await _apply(operation, payload)
+    assert "call" not in rec
+
+
+# ---------------------------------------------------------------------------
+# update_campaign - name and dates, nothing else
+# ---------------------------------------------------------------------------
+
+async def test_updating_only_the_name_masks_only_the_name(rec) -> None:
+    """The mask is derived from fields actually set, so an omitted date is
+    never named - and a mask naming an unset field BLANKS it."""
+    await _apply("update_campaign", {"campaign_id": "55", "name": "Brand - Renamed"})
+    sent = _sent(rec)
+    paths = set(sent.update_mask.paths)
+
+    assert paths == {"resource_name", "name"}
+    assert "start_date_time" not in paths
+    assert "end_date_time" not in paths
+    assert sent.update.name == "Brand - Renamed"
+
+
+async def test_updating_only_the_end_date_masks_only_that(rec) -> None:
+    await _apply(
+        "update_campaign",
+        {"campaign_id": "55", "end_date_time": "2026-12-31 23:59:59"},
+    )
+    sent = _sent(rec)
+    paths = set(sent.update_mask.paths)
+
+    assert paths == {"resource_name", "end_date_time"}
+    assert sent.update.end_date_time == "2026-12-31 23:59:59"
+
+
+async def test_update_campaign_can_never_carry_status_or_budget(rec) -> None:
+    """Status is pause_campaign's business and the budget is
+    update_campaign_budget's, each with its own preview."""
+    await _apply(
+        "update_campaign",
+        {
+            "campaign_id": "55",
+            "name": "Brand - Renamed",
+            "start_date_time": "2026-01-01 00:00:00",
+            "end_date_time": "2026-12-31 23:59:59",
+        },
+    )
+    paths = set(_sent(rec).update_mask.paths)
+    assert paths <= UPDATE_MASK_ALLOWLIST["update_campaign"]
+    assert "status" not in paths
+    assert "campaign_budget" not in paths
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Nothing to change: refused rather than sent as a no-op mutation.
+        {"campaign_id": "55"},
+        {"campaign_id": "55", "name": "   "},
+        # The format the v25 proto documents, and nothing else.
+        {"campaign_id": "55", "start_date_time": "2026-01-01"},
+        {"campaign_id": "55", "end_date_time": "2026-12-31T23:59:59"},
+        {"campaign_id": "55", "end_date_time": "31-12-2026 23:59:59"},
+    ],
+)
+async def test_malformed_update_campaign_payloads_are_refused(rec, payload) -> None:
+    with pytest.raises(ExecutorError):
+        await _apply("update_campaign", payload)
+    assert "call" not in rec

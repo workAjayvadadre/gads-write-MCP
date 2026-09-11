@@ -319,6 +319,14 @@ async def _capture_queries() -> list[str]:
         customer_id="1234567890", geo_target_ids=["2356", "1007751"]
     )
     await reader.campaign_locations(customer_id="1234567890", campaign_id="55")
+    await reader.list_keywords(customer_id="1234567890")
+    await reader.list_keywords(customer_id="1234567890", ad_group_id="66")
+    await reader.keyword_by_id(
+        customer_id="1234567890", ad_group_id="66", criterion_id="999"
+    )
+    await reader.list_ads(customer_id="1234567890")
+    await reader.list_ads(customer_id="1234567890", ad_group_id="66")
+    await reader.ad_by_id(customer_id="1234567890", ad_group_id="66", ad_id="888")
     return [query for _, query in service.queries]
 
 
@@ -376,6 +384,12 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         customer_user_access as cua_mod,
     )
     from google.ads.googleads.v25.resources.types import (
+        ad_group_ad as ad_group_ad_mod,
+    )
+    from google.ads.googleads.v25.resources.types import (
+        ad_group_criterion as ad_group_criterion_mod,
+    )
+    from google.ads.googleads.v25.resources.types import (
         campaign_criterion as campaign_criterion_mod,
     )
     from google.ads.googleads.v25.resources.types import (
@@ -394,6 +408,8 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         "metrics": metrics_mod.Metrics,
         "segments": segments_mod.Segments,
         "ad_group": ad_group_mod.AdGroup,
+        "ad_group_ad": ad_group_ad_mod.AdGroupAd,
+        "ad_group_criterion": ad_group_criterion_mod.AdGroupCriterion,
         "campaign": campaign_mod.Campaign,
         "campaign_budget": campaign_budget_mod.CampaignBudget,
         "campaign_criterion": campaign_criterion_mod.CampaignCriterion,
@@ -404,21 +420,53 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         "search_term_view": stv_mod.SearchTermView,
     }
 
+    def resolve(message: object, segment: str, reference: str) -> object:
+        """One path segment against a proto message, or fail the test.
+
+        proto-plus renames fields that collide with Python keywords by
+        appending an underscore - `ad.type` in GAQL is `ad.type_` on the
+        generated message - so both spellings are accepted. Nothing else is.
+        """
+        fields = message.meta.fields  # type: ignore[attr-defined]
+        for candidate in (segment, f"{segment}_"):
+            if candidate in fields:
+                return fields[candidate]
+        raise AssertionError(
+            f"{reference}: {segment!r} does not exist in Google Ads API "
+            f"{API_VERSION}. Either the field was renamed or API_VERSION moved."
+        )
+
     checked = 0
     for query in await _capture_queries():
         select_clause = query.split(" FROM ")[0].replace("SELECT ", "")
-        for reference in re.findall(r"[a-z_]+\.[a-z_]+", select_clause):
-            resource, field_name = reference.split(".", 1)
+        for reference in (part.strip() for part in select_clause.split(",")):
+            if not reference:
+                continue
+            resource, *path = reference.split(".")
             assert resource in known, f"{reference}: unknown resource {resource!r}"
-            fields = known[resource].meta.fields
-            assert field_name in fields, (
-                f"{reference} does not exist in Google Ads API {API_VERSION}. "
-                "Either the field was renamed or API_VERSION moved."
-            )
+            assert path, f"{reference}: no field selected"
+
+            # Walk the WHOLE path, descending into nested messages. The
+            # previous version of this test matched `resource.field` with a
+            # regex, which quietly mis-read a three-level path like
+            # `ad_group_ad.ad.responsive_search_ad.headlines` as two unrelated
+            # pairs - so the deepest and most rename-prone fields were the ones
+            # it was not checking.
+            message: object = known[resource]
+            for index, segment in enumerate(path):
+                field = resolve(message, segment, reference)
+                is_last = index == len(path) - 1
+                if not is_last:
+                    nested = getattr(field, "message", None)
+                    assert nested is not None, (
+                        f"{reference}: {segment!r} is not a message, so "
+                        f"{path[index + 1]!r} cannot be selected from it."
+                    )
+                    message = nested
             checked += 1
 
     # Guard against the loop silently checking nothing.
-    assert checked > 20, f"expected to verify many fields, only checked {checked}"
+    assert checked > 40, f"expected to verify many fields, only checked {checked}"
 
 
 # ---------------------------------------------------------------------------
@@ -775,3 +823,174 @@ async def test_an_excluded_location_is_reported_as_excluded() -> None:
     )
     assert rows[0].negative is True
     assert rows[0].geo_target_id == "2356"
+
+
+# ---------------------------------------------------------------------------
+# keywords and ads
+# ---------------------------------------------------------------------------
+
+async def test_listing_keywords_excludes_negatives() -> None:
+    """A negative keyword is also an ad_group_criterion of type KEYWORD.
+
+    Listing the two together for somebody about to pause one would be
+    dangerous: pausing a NEGATIVE keyword stops it excluding traffic, which
+    INCREASES spend - the opposite of what "pause" suggests.
+    """
+    service = FakeService(rows=[])
+    await StubReader(service).list_keywords(customer_id="1234567890")
+    _, query = service.queries[0]
+
+    assert "ad_group_criterion.type = 'KEYWORD'" in query
+    assert "ad_group_criterion.negative = FALSE" in query
+    assert "ad_group_criterion.status != 'REMOVED'" in query
+
+
+async def test_a_keyword_lookup_filters_on_BOTH_ids() -> None:
+    """Criterion ids are unique within an ad group, not within an account, so
+    one id alone would be a silent way to address the wrong keyword."""
+    service = FakeService(rows=[])
+    await StubReader(service).keyword_by_id(
+        customer_id="1234567890", ad_group_id="66", criterion_id="999"
+    )
+    _, query = service.queries[0]
+
+    assert "ad_group.id = 66" in query
+    assert "ad_group_criterion.criterion_id = 999" in query
+    # And no status filter: a REMOVED keyword must come back so a write tool
+    # can refuse it with a message that says why.
+    assert "REMOVED" not in query
+
+
+async def test_an_ad_lookup_filters_on_both_ids() -> None:
+    service = FakeService(rows=[])
+    await StubReader(service).ad_by_id(
+        customer_id="1234567890", ad_group_id="66", ad_id="888"
+    )
+    _, query = service.queries[0]
+    assert "ad_group.id = 66" in query
+    assert "ad_group_ad.ad.id = 888" in query
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("list_keywords", {"ad_group_id": "66' OR '1'='1"}),
+        ("keyword_by_id", {"ad_group_id": "66", "criterion_id": "9' OR '1'='1"}),
+        ("keyword_by_id", {"ad_group_id": "6' OR '1'='1", "criterion_id": "999"}),
+        ("ad_by_id", {"ad_group_id": "66", "ad_id": "8' OR '1'='1"}),
+        ("list_ads", {"ad_group_id": "66; DROP"}),
+    ],
+)
+async def test_hostile_ids_never_reach_a_keyword_or_ad_query(method, kwargs) -> None:
+    service = FakeService(rows=[])
+    reader = StubReader(service)
+    with pytest.raises(AdsReadError):
+        await getattr(reader, method)(customer_id="1234567890", **kwargs)
+    assert service.queries == []
+
+
+def _keyword_row(criterion_id=999, text="ivf treatment", match="EXACT",
+                 own_bid=0, effective=50_000_000, status="ENABLED"):
+    return SimpleNamespace(
+        ad_group_criterion=SimpleNamespace(
+            criterion_id=criterion_id,
+            keyword=SimpleNamespace(text=text, match_type=SimpleNamespace(name=match)),
+            status=SimpleNamespace(name=status),
+            cpc_bid_micros=own_bid,
+            effective_cpc_bid_micros=effective,
+        ),
+        ad_group=SimpleNamespace(
+            id=66, name="Core Terms", status=SimpleNamespace(name="ENABLED")
+        ),
+        campaign=SimpleNamespace(
+            id=55, name="Brand - Exact", status=SimpleNamespace(name="ENABLED"),
+            bidding_strategy_type=SimpleNamespace(name="MANUAL_CPC"),
+        ),
+    )
+
+
+async def test_a_keyword_row_keeps_its_own_bid_and_its_effective_bid_apart() -> None:
+    """They differ whenever the keyword has no bid and inherits the ad group
+    default - which is the case the percentage backstop has to measure
+    against, or setting a first keyword bid would read as a rise from zero."""
+    service = FakeService(rows=[_keyword_row(own_bid=0, effective=50_000_000)])
+    rows = await StubReader(service).list_keywords(customer_id="1234567890")
+
+    assert rows[0].cpc_bid_micros == 0
+    assert rows[0].effective_cpc_bid_micros == 50_000_000
+
+
+@pytest.mark.parametrize(
+    ("match", "expected"),
+    [("EXACT", "[ivf]"), ("PHRASE", '"ivf"'), ("BROAD", "ivf")],
+)
+async def test_a_keyword_displays_in_the_ui_match_type_form(match, expected) -> None:
+    """The form people read every day. Never accepted as INPUT - that is what
+    validate_keyword_text refuses, so the brackets cannot become part of the
+    keyword itself."""
+    service = FakeService(rows=[_keyword_row(text="ivf", match=match)])
+    rows = await StubReader(service).list_keywords(customer_id="1234567890")
+    assert rows[0].display_text == expected
+
+
+def _ad_row(ad_id=888, headlines=("Fertility Care", "IVF Experts"),
+            status="ENABLED", approval="APPROVED"):
+    return SimpleNamespace(
+        ad_group_ad=SimpleNamespace(
+            ad=SimpleNamespace(
+                id=ad_id,
+                type_=SimpleNamespace(name="RESPONSIVE_SEARCH_AD"),
+                final_urls=["https://indiraivf.com/x"],
+                responsive_search_ad=SimpleNamespace(
+                    headlines=[SimpleNamespace(text=h) for h in headlines],
+                    descriptions=[SimpleNamespace(text="Speak to a specialist.")],
+                ),
+            ),
+            status=SimpleNamespace(name=status),
+            policy_summary=SimpleNamespace(
+                approval_status=SimpleNamespace(name=approval),
+                review_status=SimpleNamespace(name="REVIEWED"),
+            ),
+        ),
+        ad_group=SimpleNamespace(
+            id=66, name="Core Terms", status=SimpleNamespace(name="ENABLED")
+        ),
+        campaign=SimpleNamespace(
+            id=55, name="Brand - Exact", status=SimpleNamespace(name="ENABLED")
+        ),
+    )
+
+
+async def test_an_ad_is_identified_by_its_first_headline() -> None:
+    """An ad has no name, so the first headline is the only human handle there
+    is. Without it a preview reads "ad 888 -> PAUSED", which nobody can
+    approve."""
+    service = FakeService(rows=[_ad_row()])
+    rows = await StubReader(service).list_ads(customer_id="1234567890")
+
+    assert rows[0].display_text == "Fertility Care"
+    assert rows[0].headlines == ("Fertility Care", "IVF Experts")
+    assert rows[0].approval_status == "APPROVED"
+
+
+async def test_an_ad_with_no_headlines_still_has_a_handle() -> None:
+    """Not every ad type is an RSA, and a preview must never be left with
+    nothing but an id."""
+    service = FakeService(rows=[_ad_row(headlines=())])
+    rows = await StubReader(service).list_ads(customer_id="1234567890")
+    assert rows[0].display_text == "https://indiraivf.com/x"
+
+
+async def test_campaign_dates_are_read_from_the_date_time_fields() -> None:
+    """v25 has NO campaign.start_date / campaign.end_date. The fields are
+    start_date_time / end_date_time, strings in the customer's timezone."""
+    service = FakeService(rows=[])
+    await StubReader(service).campaign_by_id(
+        customer_id="1234567890", campaign_id="55"
+    )
+    _, query = service.queries[0]
+
+    assert "campaign.start_date_time" in query
+    assert "campaign.end_date_time" in query
+    assert "campaign.start_date," not in query
+    assert "campaign.end_date," not in query

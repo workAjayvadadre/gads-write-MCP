@@ -172,6 +172,17 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="list_ad_groups", required_tier=Tier.READONLY, writes=False)
     )
 
+    # The other half of discovery. list_ad_groups gets you an ad_group_id, but
+    # pausing a keyword or an ad needs the id of the keyword or the ad, and
+    # nothing else here returned one - which left hand-writing GAQL as the
+    # only route to a value the write tools require.
+    register(
+        ToolSpec(name="list_keywords", required_tier=Tier.READONLY, writes=False)
+    )
+    register(
+        ToolSpec(name="list_ads", required_tier=Tier.READONLY, writes=False)
+    )
+
     # Disambiguation, not discovery. "Delhi" is a city, a state AND a union
     # territory in Google's geo data, so a name is a question rather than an
     # answer; this is what turns it into a set of ids a person can choose
@@ -326,6 +337,27 @@ def _register_builtin_tools() -> None:
             operation="add_location_target",
         )
     )
+    # Keyword and ad status, and a keyword's own bid. All operator: a Standard
+    # user pauses keywords and ads and edits bids in the Google Ads UI all day,
+    # and none of these can do anything a campaign budget does not already cap.
+    for _name in (
+        "pause_keyword",
+        "enable_keyword",
+        "pause_ad",
+        "enable_ad",
+        "update_keyword_bid",
+        # Name and run dates only. It cannot touch status, budget or bidding -
+        # those have their own tools with their own previews.
+        "update_campaign",
+    ):
+        register(
+            ToolSpec(
+                name=_name,
+                required_tier=Tier.OPERATOR,
+                writes=True,
+                operation=_name,
+            )
+        )
 
     # `operation=None` on purpose: confirm_and_apply is not itself a
     # mutation kind, so it must not be matched against

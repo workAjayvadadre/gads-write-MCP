@@ -27,7 +27,15 @@ by reading the generated protos, not the documentation:
   customer              id, descriptive_name, currency_code, time_zone,
                         manager, test_account, status
   campaign              id, name, status, advertising_channel_type,
-                        geo_target_type_setting.positive_geo_target_type
+                        geo_target_type_setting.positive_geo_target_type,
+                        start_date_time, end_date_time - NOT start_date /
+                        end_date, which DO NOT EXIST in v25. Both are strings
+                        in the customer's timezone, "yyyy-MM-dd HH:mm:ss".
+  ad_group_criterion    criterion_id, keyword.text, keyword.match_type,
+                        status, cpc_bid_micros, effective_cpc_bid_micros
+  ad_group_ad           ad.id, ad.type, status, ad.final_urls,
+                        ad.responsive_search_ad.headlines / .descriptions,
+                        policy_summary.approval_status / .review_status
   campaign_budget       amount_micros
   campaign_criterion    criterion_id, location.geo_target_constant,
                         negative, status, display_name
@@ -244,6 +252,13 @@ class CampaignSummary:
     # criterion - which is why adding a location does not restrict a campaign
     # on its own. Empty when Google did not report it.
     positive_geo_target_type: str = ""
+    # When the campaign runs. NOTE THE FIELD NAMES: Google Ads API v25 has no
+    # `campaign.start_date` or `campaign.end_date`. They are
+    # `start_date_time` and `end_date_time`, strings in the CUSTOMER'S timezone
+    # in "yyyy-MM-dd HH:mm:ss" form, verified in the v25 Campaign proto. An
+    # empty end_date_time means the campaign runs indefinitely.
+    start_date_time: str = ""
+    end_date_time: str = ""
 
 
 @dataclass(frozen=True)
@@ -264,6 +279,93 @@ class AdGroupSummary:
     # to say so - otherwise it reports success on a change with no visible
     # effect, and the person is left wondering what went wrong.
     campaign_status: str = ""
+
+
+@dataclass(frozen=True)
+class KeywordSummary:
+    """One positive keyword in an ad group.
+
+    Addressed by TWO ids. An `ad_group_criterion` resource name is
+    `customers/X/adGroupCriteria/{ad_group_id}~{criterion_id}` - verified via
+    AdGroupCriterionServiceClient.ad_group_criterion_path - so a criterion_id
+    on its own does not identify a keyword, and any tool taking one has to
+    take the ad group id with it.
+    """
+
+    criterion_id: str
+    ad_group_id: str
+    ad_group_name: str
+    campaign_id: str
+    campaign_name: str
+    text: str
+    match_type: str
+    status: str
+    # The keyword's OWN max CPC. Zero when it has none and the ad group's
+    # default applies instead.
+    cpc_bid_micros: int
+    # What Google actually bids: the keyword's own bid if it has one, else the
+    # ad group default. Read-only, and the number a person recognises.
+    effective_cpc_bid_micros: int = 0
+    ad_group_status: str = ""
+    campaign_status: str = ""
+    bidding_strategy_type: str = ""
+
+    @property
+    def display_text(self) -> str:
+        """The keyword as the Google Ads UI writes it.
+
+        The API keeps text and match type apart; the UI renders exact as
+        [shoes] and phrase as "shoes". Previews use this form because it is
+        the one people read every day - but it is never accepted as INPUT,
+        which validate_keyword_text refuses precisely to stop the brackets
+        becoming part of the keyword.
+        """
+        if self.match_type == "EXACT":
+            return f"[{self.text}]"
+        if self.match_type == "PHRASE":
+            return f'"{self.text}"'
+        return self.text
+
+
+@dataclass(frozen=True)
+class AdSummary:
+    """One ad in an ad group.
+
+    Addressed by two ids for the same reason as a keyword: an `ad_group_ad`
+    resource name is `customers/X/adGroupAds/{ad_group_id}~{ad_id}`.
+    """
+
+    ad_id: str
+    ad_group_id: str
+    ad_group_name: str
+    campaign_id: str
+    campaign_name: str
+    status: str
+    ad_type: str
+    headlines: tuple[str, ...] = ()
+    descriptions: tuple[str, ...] = ()
+    final_urls: tuple[str, ...] = ()
+    # Whether Google has approved this ad to serve. An ad can be ENABLED and
+    # still show nothing if it was disapproved, so a preview that reported
+    # only `status` would be telling half the story.
+    approval_status: str = ""
+    review_status: str = ""
+    ad_group_status: str = ""
+    campaign_status: str = ""
+
+    @property
+    def display_text(self) -> str:
+        """Something a person can recognise the ad by.
+
+        An ad has no name - `ad.name` exists but is unused for search ads - so
+        the first headline is the only human handle there is. Without it a
+        preview says "ad 712334455 -> PAUSED", which nobody can approve.
+        """
+        if self.headlines:
+            return self.headlines[0]
+        if self.final_urls:
+            return self.final_urls[0]
+        return f"ad {self.ad_id}"
 
 
 @dataclass(frozen=True)
@@ -433,6 +535,35 @@ class AdsReader(Protocol):
         self, *, customer_id: str, ad_group_id: str
     ) -> AdGroupSummary | None:
         """One ad group's current state, or None if it does not exist."""
+        ...
+
+    async def list_keywords(
+        self, *, customer_id: str, ad_group_id: str | None = None
+    ) -> tuple[KeywordSummary, ...]:
+        """Positive keywords, optionally within one ad group.
+
+        Negative keywords are excluded: they are a different thing with
+        different tools, and mixing them into a list somebody is about to
+        pause from would be actively dangerous.
+        """
+        ...
+
+    async def keyword_by_id(
+        self, *, customer_id: str, ad_group_id: str, criterion_id: str
+    ) -> KeywordSummary | None:
+        """One keyword's current state, or None if it does not exist."""
+        ...
+
+    async def list_ads(
+        self, *, customer_id: str, ad_group_id: str | None = None
+    ) -> tuple[AdSummary, ...]:
+        """Ads, optionally within one ad group."""
+        ...
+
+    async def ad_by_id(
+        self, *, customer_id: str, ad_group_id: str, ad_id: str
+    ) -> AdSummary | None:
+        """One ad's current state, or None if it does not exist."""
         ...
 
     async def find_geo_targets(
@@ -811,6 +942,102 @@ class GoogleAdsReader(AdsReader):
 
         return _ad_group_summary(rows[0])
 
+    async def list_keywords(
+        self, *, customer_id: str, ad_group_id: str | None = None
+    ) -> tuple[KeywordSummary, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        where = [
+            # Positive keywords only. A negative keyword is also an
+            # ad_group_criterion of type KEYWORD, and listing the two together
+            # for somebody about to pause one would be dangerous: pausing a
+            # NEGATIVE keyword stops it excluding traffic, which INCREASES
+            # spend - the opposite of what "pause" suggests.
+            "ad_group_criterion.type = 'KEYWORD'",
+            "ad_group_criterion.negative = FALSE",
+            "ad_group_criterion.status != 'REMOVED'",
+            "ad_group.status != 'REMOVED'",
+            "campaign.status != 'REMOVED'",
+        ]
+        if ad_group_id is not None:
+            where.append(
+                f"ad_group.id = {_literal(ad_group_id, field='ad_group_id')}"
+            )
+
+        query = (
+            f"SELECT {KEYWORD_FIELDS} "
+            "FROM ad_group_criterion "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY campaign.name, ad_group.name, ad_group_criterion.keyword.text "
+            f"LIMIT {MAX_ROWS}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return tuple(_keyword_summary(row) for row in rows)
+
+    async def keyword_by_id(
+        self, *, customer_id: str, ad_group_id: str, criterion_id: str
+    ) -> KeywordSummary | None:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe_ad_group = _literal(ad_group_id, field="ad_group_id")
+        safe_criterion = _literal(criterion_id, field="criterion_id")
+
+        # BOTH ids, because neither identifies a keyword alone: criterion ids
+        # are unique within an ad group, not within an account. Filtering on
+        # only one would be a silent way to address the wrong keyword.
+        #
+        # No status filter: a REMOVED keyword has to come back so a write tool
+        # can refuse it with a message that says why.
+        query = (
+            f"SELECT {KEYWORD_FIELDS} "
+            "FROM ad_group_criterion "
+            f"WHERE ad_group.id = {safe_ad_group} "
+            f"AND ad_group_criterion.criterion_id = {safe_criterion} "
+            "AND ad_group_criterion.type = 'KEYWORD' "
+            "LIMIT 1"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return _keyword_summary(rows[0]) if rows else None
+
+    async def list_ads(
+        self, *, customer_id: str, ad_group_id: str | None = None
+    ) -> tuple[AdSummary, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        where = [
+            "ad_group_ad.status != 'REMOVED'",
+            "ad_group.status != 'REMOVED'",
+            "campaign.status != 'REMOVED'",
+        ]
+        if ad_group_id is not None:
+            where.append(
+                f"ad_group.id = {_literal(ad_group_id, field='ad_group_id')}"
+            )
+
+        query = (
+            f"SELECT {AD_FIELDS} "
+            "FROM ad_group_ad "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY campaign.name, ad_group.name "
+            f"LIMIT {MAX_ROWS}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return tuple(_ad_summary(row) for row in rows)
+
+    async def ad_by_id(
+        self, *, customer_id: str, ad_group_id: str, ad_id: str
+    ) -> AdSummary | None:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe_ad_group = _literal(ad_group_id, field="ad_group_id")
+        safe_ad = _literal(ad_id, field="ad_id")
+
+        query = (
+            f"SELECT {AD_FIELDS} "
+            "FROM ad_group_ad "
+            f"WHERE ad_group.id = {safe_ad_group} "
+            f"AND ad_group_ad.ad.id = {safe_ad} "
+            "LIMIT 1"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=query)
+        return _ad_summary(rows[0]) if rows else None
+
     async def find_geo_targets(
         self,
         *,
@@ -965,6 +1192,7 @@ CAMPAIGN_FIELDS = (
     "campaign.id, campaign.name, campaign.status, "
     "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
     "campaign.geo_target_type_setting.positive_geo_target_type, "
+    "campaign.start_date_time, campaign.end_date_time, "
     "campaign_budget.resource_name, campaign_budget.id, "
     "campaign_budget.amount_micros, campaign_budget.reference_count"
 )
@@ -977,6 +1205,29 @@ AD_GROUP_FIELDS = (
     "ad_group.id, ad_group.name, ad_group.status, ad_group.cpc_bid_micros, "
     "campaign.id, campaign.name, campaign.status, "
     "campaign.bidding_strategy_type"
+)
+
+# The keyword fields every keyword read selects, and the ad fields every ad
+# read selects. Same reason as CAMPAIGN_FIELDS and AD_GROUP_FIELDS.
+KEYWORD_FIELDS = (
+    "ad_group_criterion.criterion_id, ad_group_criterion.keyword.text, "
+    "ad_group_criterion.keyword.match_type, ad_group_criterion.status, "
+    "ad_group_criterion.cpc_bid_micros, "
+    "ad_group_criterion.effective_cpc_bid_micros, "
+    "ad_group.id, ad_group.name, ad_group.status, "
+    "campaign.id, campaign.name, campaign.status, "
+    "campaign.bidding_strategy_type"
+)
+
+AD_FIELDS = (
+    "ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, "
+    "ad_group_ad.ad.final_urls, "
+    "ad_group_ad.ad.responsive_search_ad.headlines, "
+    "ad_group_ad.ad.responsive_search_ad.descriptions, "
+    "ad_group_ad.policy_summary.approval_status, "
+    "ad_group_ad.policy_summary.review_status, "
+    "ad_group.id, ad_group.name, ad_group.status, "
+    "campaign.id, campaign.name, campaign.status"
 )
 
 # The geo target fields every geo query selects. One constant so the
@@ -1006,6 +1257,8 @@ def _campaign_summary(row: Any) -> CampaignSummary:
         positive_geo_target_type=_enum_name(
             row.campaign.geo_target_type_setting.positive_geo_target_type
         ),
+        start_date_time=row.campaign.start_date_time or "",
+        end_date_time=row.campaign.end_date_time or "",
     )
 
 
@@ -1020,6 +1273,53 @@ def _ad_group_summary(row: Any) -> AdGroupSummary:
         campaign_name=row.campaign.name or "",
         cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
         bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+        campaign_status=_enum_name(row.campaign.status),
+    )
+
+
+def _keyword_summary(row: Any) -> KeywordSummary:
+    """Map one keyword row. Shared by `keyword_by_id` and `list_keywords`."""
+    criterion = row.ad_group_criterion
+    return KeywordSummary(
+        criterion_id=str(criterion.criterion_id or ""),
+        ad_group_id=str(row.ad_group.id),
+        ad_group_name=row.ad_group.name or "",
+        campaign_id=str(row.campaign.id),
+        campaign_name=row.campaign.name or "",
+        text=criterion.keyword.text or "",
+        match_type=_enum_name(criterion.keyword.match_type),
+        status=_enum_name(criterion.status),
+        cpc_bid_micros=int(criterion.cpc_bid_micros or 0),
+        effective_cpc_bid_micros=int(criterion.effective_cpc_bid_micros or 0),
+        ad_group_status=_enum_name(row.ad_group.status),
+        campaign_status=_enum_name(row.campaign.status),
+        bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+    )
+
+
+def _ad_text(assets: Any) -> tuple[str, ...]:
+    """Text out of a repeated AdTextAsset. Empty when the ad is not an RSA."""
+    return tuple((getattr(asset, "text", "") or "") for asset in (assets or ()))
+
+
+def _ad_summary(row: Any) -> AdSummary:
+    """Map one ad row. Shared by `ad_by_id` and `list_ads`."""
+    ad_group_ad = row.ad_group_ad
+    rsa = ad_group_ad.ad.responsive_search_ad
+    return AdSummary(
+        ad_id=str(ad_group_ad.ad.id or ""),
+        ad_group_id=str(row.ad_group.id),
+        ad_group_name=row.ad_group.name or "",
+        campaign_id=str(row.campaign.id),
+        campaign_name=row.campaign.name or "",
+        status=_enum_name(ad_group_ad.status),
+        ad_type=_enum_name(ad_group_ad.ad.type_),
+        headlines=_ad_text(getattr(rsa, "headlines", ())),
+        descriptions=_ad_text(getattr(rsa, "descriptions", ())),
+        final_urls=tuple(ad_group_ad.ad.final_urls or ()),
+        approval_status=_enum_name(ad_group_ad.policy_summary.approval_status),
+        review_status=_enum_name(ad_group_ad.policy_summary.review_status),
+        ad_group_status=_enum_name(row.ad_group.status),
         campaign_status=_enum_name(row.campaign.status),
     )
 

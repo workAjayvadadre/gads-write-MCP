@@ -59,13 +59,17 @@ from .operations import (
     OPERATIONS,
     ad_group_campaign_verdict,
     budget_spend_delta,
+    keyword_bid_baseline_micros,
     location_target_verdict,
     recheck_bid,
     recheck_budget,
     recheck_create_ad_group,
+    recheck_keyword_bid,
     recheck_location_target,
+    recheck_update_campaign,
     shared_budget_verdict,
     units_from_micros,
+    update_campaign_verdict,
     validate_campaign_status_args,
 )
 
@@ -87,6 +91,10 @@ TOOL_TARGET_STATUS: dict[str, str] = {
     "enable_campaign": "ENABLED",
     "pause_ad_group": "PAUSED",
     "enable_ad_group": "ENABLED",
+    "pause_keyword": "PAUSED",
+    "enable_keyword": "ENABLED",
+    "pause_ad": "PAUSED",
+    "enable_ad": "ENABLED",
 }
 
 
@@ -305,6 +313,135 @@ def register_write_tools(
             },
         )
 
+    async def _draft_child_status_change(
+        tool: str,
+        *,
+        customer_id: str,
+        ad_group_id: str,
+        entity_id: str,
+        id_argument: str,
+    ) -> dict:
+        """Status change on a keyword or an ad - anything below an ad group.
+
+        Both are addressed by TWO ids (`{ad_group_id}~{entity_id}`), both read
+        for the preview and not for the gate, and both refuse a REMOVED entity
+        and a no-op. One function rather than two because, unlike the campaign
+        and ad-group previews, these genuinely differ only in the words -
+        `_child_preview` handles that with the lines the caller supplies.
+        """
+        target_status = TOOL_TARGET_STATUS[tool]
+        customer_id = str(customer_id).strip()
+        ad_group_id = str(ad_group_id).strip()
+        entity_id = str(entity_id).strip()
+        arguments = {
+            "customer_id": customer_id,
+            "ad_group_id": ad_group_id,
+            id_argument: entity_id,
+        }
+
+        caller = caller_provider()
+        decision = await guard.check(
+            tool=tool,
+            caller=caller,
+            customer_id=customer_id,
+            arguments=arguments,
+            validate=lambda policy: OPERATIONS[tool].validate(policy, arguments),
+        )
+        if not decision.allowed:
+            raise ToolError(f"{decision.reason_text}. Nothing was changed.")
+
+        policy: Policy = decision.policy or policy_store.current()
+        is_keyword = id_argument == "criterion_id"
+
+        # Deliberately Any: a keyword and an ad are different row types that
+        # satisfy the same small protocol here - display_text, status,
+        # ad_group_name, campaign_name. Naming the union would mean every
+        # attribute access below needed narrowing for no safety gained.
+        entity: Any
+        try:
+            if is_keyword:
+                entity = await reader.keyword_by_id(
+                    customer_id=customer_id,
+                    ad_group_id=ad_group_id,
+                    criterion_id=entity_id,
+                )
+            else:
+                entity = await reader.ad_by_id(
+                    customer_id=customer_id,
+                    ad_group_id=ad_group_id,
+                    ad_id=entity_id,
+                )
+        except AdsReadError as exc:
+            raise ToolError(
+                f"could not read {'keyword' if is_keyword else 'ad'} {entity_id} "
+                f"in ad group {ad_group_id}: {exc}. Nothing was changed."
+            ) from exc
+
+        noun = "keyword" if is_keyword else "ad"
+        if entity is None:
+            raise ToolError(
+                f"No {noun} {entity_id} in ad group {ad_group_id} of account "
+                f"{customer_id}. Check the id with "
+                f"{'list_keywords' if is_keyword else 'list_ads'}. Nothing was "
+                "changed."
+            )
+
+        if entity.status == "REMOVED":
+            raise ToolError(
+                f"{noun.capitalize()} {entity.display_text!r} ({entity_id}) is "
+                "REMOVED. Removal is permanent in Google Ads and cannot be "
+                "undone by this server. Nothing was changed."
+            )
+
+        if entity.status == target_status:
+            return {
+                "ok": True,
+                "no_change_needed": True,
+                id_argument: entity_id,
+                "ad_group_id": entity.ad_group_id,
+                "name": entity.display_text,
+                "status": entity.status,
+                "message": (
+                    f"{noun.capitalize()} {entity.display_text!r} is already "
+                    f"{target_status}. Nothing to do."
+                ),
+            }
+
+        preview = _child_preview(
+            customer_id=customer_id,
+            noun=noun,
+            entity=entity,
+            target_status=target_status,
+        )
+
+        return _park(
+            caller=caller,
+            tool=tool,
+            customer_id=customer_id,
+            arguments=arguments,
+            preview=preview,
+            policy=policy,
+            # No spend delta. Neither moves a daily budget; the campaign's
+            # budget still caps everything below it.
+            spend_delta_units=None,
+            metadata={
+                "current_status": entity.status,
+                "target_status": target_status,
+                "name": entity.display_text,
+                "ad_group_name": entity.ad_group_name,
+                "campaign_name": entity.campaign_name,
+                "operation": tool,
+                "payload": {"ad_group_id": ad_group_id, id_argument: entity_id},
+            },
+            extra={
+                id_argument: entity_id,
+                "ad_group_id": entity.ad_group_id,
+                "name": entity.display_text,
+                "current_status": entity.status,
+                "target_status": target_status,
+            },
+        )
+
     # ------------------------------------------------------------------
     # shared gate helpers for tools that need current state
     # ------------------------------------------------------------------
@@ -419,6 +556,33 @@ def register_write_tools(
                 "Nothing was changed."
             )
         return ad_group
+
+    async def _keyword_or_fail(
+        customer_id: str, ad_group_id: str, criterion_id: str
+    ) -> Any:
+        try:
+            keyword = await reader.keyword_by_id(
+                customer_id=customer_id,
+                ad_group_id=ad_group_id,
+                criterion_id=criterion_id,
+            )
+        except AdsReadError as exc:
+            raise ToolError(
+                f"could not read keyword {criterion_id} in ad group "
+                f"{ad_group_id}: {exc}. Nothing was changed."
+            ) from exc
+        if keyword is None:
+            raise ToolError(
+                f"No keyword {criterion_id} in ad group {ad_group_id} of account "
+                f"{customer_id}. Check the ids with list_keywords - both are "
+                "needed. Nothing was changed."
+            )
+        if keyword.status == "REMOVED":
+            raise ToolError(
+                f"Keyword {keyword.display_text!r} is REMOVED. Removal is "
+                "permanent in Google Ads. Nothing was changed."
+            )
+        return keyword
 
     def _park(
         *,
@@ -1433,6 +1597,296 @@ def register_write_tools(
             "enable_ad_group", customer_id, ad_group_id
         )
 
+    @mcp.tool(annotations=annotations_for("pause_keyword"))
+    async def pause_keyword(
+        customer_id: str, ad_group_id: str, criterion_id: str
+    ) -> dict:
+        """Draft a change that pauses one keyword. Does NOT pause it.
+
+        Needs BOTH ids: a criterion id is unique within an ad group, not
+        within an account. Get them together from list_keywords.
+
+        Only positive keywords are reachable here. A negative keyword is a
+        different thing and pausing one would INCREASE spend by letting the
+        traffic it excludes back in.
+
+        Returns a preview and a plan_id; reversible with enable_keyword.
+        """
+        return await _draft_child_status_change(
+            "pause_keyword",
+            customer_id=customer_id,
+            ad_group_id=ad_group_id,
+            entity_id=criterion_id,
+            id_argument="criterion_id",
+        )
+
+    @mcp.tool(annotations=annotations_for("enable_keyword"))
+    async def enable_keyword(
+        customer_id: str, ad_group_id: str, criterion_id: str
+    ) -> dict:
+        """Draft a change that enables one keyword. Does NOT enable it.
+
+        Lets the keyword start matching searches again, spending the
+        CAMPAIGN's budget. If its ad group or campaign is paused the preview
+        says so, because nothing serves until those are enabled too.
+        """
+        return await _draft_child_status_change(
+            "enable_keyword",
+            customer_id=customer_id,
+            ad_group_id=ad_group_id,
+            entity_id=criterion_id,
+            id_argument="criterion_id",
+        )
+
+    @mcp.tool(annotations=annotations_for("pause_ad"))
+    async def pause_ad(customer_id: str, ad_group_id: str, ad_id: str) -> dict:
+        """Draft a change that pauses one ad. Does NOT pause it.
+
+        Needs both ids; get them together from list_ads. Pausing the only
+        enabled ad in an ad group stops that ad group serving entirely, and
+        the preview says so when that is the case.
+        """
+        return await _draft_child_status_change(
+            "pause_ad",
+            customer_id=customer_id,
+            ad_group_id=ad_group_id,
+            entity_id=ad_id,
+            id_argument="ad_id",
+        )
+
+    @mcp.tool(annotations=annotations_for("enable_ad"))
+    async def enable_ad(customer_id: str, ad_group_id: str, ad_id: str) -> dict:
+        """Draft a change that enables one ad. Does NOT enable it.
+
+        Note that an ad Google has DISAPPROVED will not serve however this is
+        set; the preview reports its approval status alongside its own.
+        """
+        return await _draft_child_status_change(
+            "enable_ad",
+            customer_id=customer_id,
+            ad_group_id=ad_group_id,
+            entity_id=ad_id,
+            id_argument="ad_id",
+        )
+
+    # ------------------------------------------------------------------
+    # keyword bids
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("update_keyword_bid"))
+    async def update_keyword_bid(
+        customer_id: str, ad_group_id: str, criterion_id: str, new_max_cpc: float
+    ) -> dict:
+        """Draft a change to one keyword's own max CPC. Does NOT change it.
+
+        `new_max_cpc` is in whole currency units, never micros. A keyword with
+        no bid of its own uses its ad group's default; setting one here
+        overrides that for this keyword only.
+
+        The percentage backstop is measured against what the keyword bids
+        TODAY - its own bid if it has one, otherwise the ad group default -
+        so setting a first keyword-level bid is ordinary rather than a rise
+        from zero.
+        """
+        customer_id = str(customer_id).strip()
+        ad_group_id = str(ad_group_id).strip()
+        criterion_id = str(criterion_id).strip()
+        arguments = {
+            "customer_id": customer_id,
+            "ad_group_id": ad_group_id,
+            "criterion_id": criterion_id,
+            "new_max_cpc": str(new_max_cpc),
+        }
+
+        caller, _ = await _authorise("update_keyword_bid", customer_id, arguments)
+        keyword = await _keyword_or_fail(customer_id, ad_group_id, criterion_id)
+
+        try:
+            new_units = coerce_units(new_max_cpc, field="new_max_cpc")
+        except MoneyError as exc:
+            raise ToolError(f"{exc}. Nothing was changed.") from exc
+
+        decision = await _decide(
+            "update_keyword_bid",
+            customer_id,
+            arguments,
+            validate=_validator("update_keyword_bid", arguments),
+            evaluate=_evaluator(recheck_keyword_bid, arguments, current=keyword),
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        baseline = keyword_bid_baseline_micros(keyword)
+        own_bid = (
+            format_micros(keyword.cpc_bid_micros, code)
+            if keyword.cpc_bid_micros
+            else f"none - uses the ad group default of {format_micros(baseline, code)}"
+        )
+        preview = "\n".join(
+            [
+                f"Account {customer_id}",
+                f"Keyword {keyword.display_text!r} (criterion {keyword.criterion_id})",
+                f"  ad group : {keyword.ad_group_name!r} (id {keyword.ad_group_id})",
+                f"  campaign : {keyword.campaign_name!r}",
+                f"  own bid  : {own_bid}",
+                f"  max CPC  : {format_micros(baseline, code)}"
+                f" -> {format_units(new_units, code)}",
+                "  This changes what you pay per click for THIS keyword, not the",
+                "  daily budget. The campaign budget still caps total spend.",
+            ]
+        )
+
+        return _park(
+            caller=caller,
+            tool="update_keyword_bid",
+            customer_id=customer_id,
+            arguments=arguments,
+            preview=preview,
+            policy=policy,
+            # A bid is a price per click, not a daily amount, so there is no
+            # honest figure to charge against the running budget total.
+            spend_delta_units=None,
+            metadata={
+                "current_cpc_bid_micros": keyword.cpc_bid_micros,
+                "effective_cpc_bid_micros": keyword.effective_cpc_bid_micros,
+                "keyword": keyword.display_text,
+                "operation": "update_keyword_bid",
+                "payload": {
+                    "ad_group_id": ad_group_id,
+                    "criterion_id": criterion_id,
+                    "cpc_bid_micros": int(to_micros(new_units)),
+                },
+            },
+            extra={
+                "criterion_id": keyword.criterion_id,
+                "ad_group_id": keyword.ad_group_id,
+                "keyword": keyword.display_text,
+                "current_max_cpc": format_micros(baseline, code),
+                "new_max_cpc": format_units(new_units, code),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # update_campaign
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("update_campaign"))
+    async def update_campaign(
+        customer_id: str,
+        campaign_id: str,
+        name: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        """Draft a change to a campaign's name or run dates. Does NOT apply it.
+
+        Give at least one of `name`, `start_date` or `end_date`; whatever you
+        omit is left exactly as it is. Dates are YYYY-MM-DD and are
+        interpreted in the ACCOUNT's own timezone, which is where Google keeps
+        them.
+
+        This tool changes nothing else. Status is pause_campaign and
+        enable_campaign, the budget is update_campaign_budget, and locations
+        are add_location_target - each with its own preview.
+
+        It cannot REMOVE an end date, only move one. Clearing a field means
+        naming it in an update mask while leaving it unset, which is the exact
+        mechanism this server forbids because it is how a status change
+        silently erases a campaign name. Clear an end date in the Google Ads UI.
+        """
+        customer_id = str(customer_id).strip()
+        campaign_id = str(campaign_id).strip()
+        name = None if name is None else str(name).strip()
+        start_date = None if start_date is None else str(start_date).strip()
+        end_date = None if end_date is None else str(end_date).strip()
+        arguments = {
+            "customer_id": customer_id,
+            "campaign_id": campaign_id,
+            "name": name,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+
+        caller, _ = await _authorise("update_campaign", customer_id, arguments)
+        campaign = await _campaign_or_fail(customer_id, campaign_id)
+
+        verdict = update_campaign_verdict(campaign, arguments)
+        if not verdict.allowed:
+            raise ToolError(
+                f"Campaign {campaign.name!r} (id {campaign.campaign_id}): "
+                f"{' '.join(verdict.reasons)} Nothing was changed."
+            )
+
+        # Timestamps are composed HERE, once, from the format the v25 Campaign
+        # proto documents: "yyyy-MM-dd HH:mm:ss" in the account's timezone,
+        # 00:00:00 to begin a day and 23:59:59 to end one.
+        payload: dict[str, Any] = {"campaign_id": campaign_id}
+        if name:
+            payload["name"] = name
+        if start_date:
+            payload["start_date_time"] = f"{start_date} 00:00:00"
+        if end_date:
+            payload["end_date_time"] = f"{end_date} 23:59:59"
+
+        decision = await _decide(
+            "update_campaign",
+            customer_id,
+            arguments,
+            validate=_validator("update_campaign", arguments),
+            evaluate=_evaluator(
+                recheck_update_campaign, arguments, current=campaign, payload=payload
+            ),
+        )
+        policy = decision.policy or policy_store.current()
+
+        lines = [
+            f"Account {customer_id}",
+            f"Campaign {campaign.name!r} (id {campaign.campaign_id})",
+        ]
+        if name:
+            lines.append(f"  name       : {campaign.name!r} -> {name!r}")
+        if start_date:
+            lines.append(
+                f"  start date : {_date_or_unset(campaign.start_date_time)}"
+                f" -> {start_date}"
+            )
+        if end_date:
+            lines.append(
+                f"  end date   : {_date_or_unset(campaign.end_date_time)}"
+                f" -> {end_date}"
+            )
+        lines.append(
+            f"  Dates are in the account's own timezone ({policy.timezone})."
+        )
+        lines.append(
+            "  Status, budget, bidding and locations are NOT changed by this."
+        )
+
+        return _park(
+            caller=caller,
+            tool="update_campaign",
+            customer_id=customer_id,
+            arguments=arguments,
+            preview="\n".join(lines),
+            policy=policy,
+            # No spend delta. A name moves no money, and a date change alters
+            # when a budget is spent rather than how much per day.
+            spend_delta_units=None,
+            metadata={
+                "campaign_name": campaign.name,
+                "current_start_date_time": campaign.start_date_time,
+                "current_end_date_time": campaign.end_date_time,
+                "operation": "update_campaign",
+                "payload": payload,
+            },
+            extra={
+                "campaign_id": campaign.campaign_id,
+                "new_name": name,
+                "new_start_date": start_date,
+                "new_end_date": end_date,
+            },
+        )
+
 
 def _preview(
     *,
@@ -1456,6 +1910,70 @@ def _preview(
         )
     else:
         lines.append("  This is reversible with enable_campaign.")
+    return "\n".join(lines)
+
+
+def _date_or_unset(date_time: object) -> str:
+    """The date out of a campaign timestamp, or a word saying there is none.
+
+    Campaign dates are "yyyy-MM-dd HH:mm:ss" in the account's timezone. An
+    empty end_date_time means the campaign runs indefinitely, and a preview
+    reading "end date:  -> 2026-12-31" would leave the reader guessing.
+    """
+    text = str(date_time or "").strip()
+    return text.split(" ", 1)[0] if text else "none (runs indefinitely)"
+
+
+def _child_preview(
+    *, customer_id: str, noun: str, entity: Any, target_status: str
+) -> str:
+    """The text a human approves for a keyword or ad status change.
+
+    Names the thing, its ad group and its campaign, because an id and an arrow
+    is not approvable - and reports the status of everything ABOVE it, because
+    an enabled keyword under a paused ad group still does not serve. Enabling
+    something and seeing nothing happen sends people looking for a fault that
+    is not there.
+    """
+    ad_group_status = getattr(entity, "ad_group_status", "") or "unknown"
+    campaign_status = getattr(entity, "campaign_status", "") or "unknown"
+    lines = [
+        f"Account {customer_id}",
+        f"{noun.capitalize()} {entity.display_text!r}",
+        f"  ad group : {entity.ad_group_name!r} ({ad_group_status})",
+        f"  campaign : {entity.campaign_name!r} ({campaign_status})",
+    ]
+    if noun == "keyword":
+        lines.append(f"  match    : {entity.match_type}")
+    else:
+        approval = getattr(entity, "approval_status", "") or "unknown"
+        lines.append(f"  approval : {approval}")
+    lines.append(f"  status   : {entity.status} -> {target_status}")
+
+    if target_status == "ENABLED":
+        blockers = [
+            label
+            for label, value in (("ad group", ad_group_status), ("campaign", campaign_status))
+            if value not in ("ENABLED", "unknown")
+        ]
+        if blockers:
+            lines.append(
+                f"  NOTE: the {' and '.join(blockers)} above it "
+                f"{'are' if len(blockers) > 1 else 'is'} not enabled, so this"
+            )
+            lines.append(f"        {noun} still will not serve.")
+        elif noun == "ad" and getattr(entity, "approval_status", "") == "DISAPPROVED":
+            lines.append(
+                "  NOTE: Google has DISAPPROVED this ad, so it will not serve"
+            )
+            lines.append("        however this is set. Fix the policy issue first.")
+        else:
+            lines.append(
+                f"  NOTE: this lets the {noun} spend the CAMPAIGN's daily budget "
+                "again."
+            )
+    else:
+        lines.append(f"  Reversible with enable_{noun}.")
     return "\n".join(lines)
 
 

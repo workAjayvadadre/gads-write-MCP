@@ -310,6 +310,136 @@ def register_read_tools(
         }
 
     # ------------------------------------------------------------------
+    # list_keywords / list_ads
+    # ------------------------------------------------------------------
+    # Both exist because pause_keyword, enable_keyword, pause_ad, enable_ad and
+    # update_keyword_bid all need an id that nothing else here returned. The
+    # alternative was hand-writing GAQL to find a value the write tools
+    # require, which is not a workflow anybody should be asked to use.
+
+    @mcp.tool(annotations=annotations_for("list_keywords"))
+    async def list_keywords(
+        customer_id: str, ad_group_id: str | None = None
+    ) -> dict:
+        """Positive keywords in an account, optionally within one ad group.
+
+        Use this to find a criterion_id - the id pause_keyword,
+        enable_keyword and update_keyword_bid all need, alongside the
+        ad_group_id. Both are required together because a criterion id is
+        unique within an ad group, not within an account.
+
+        NEGATIVE keywords are deliberately not listed. They are a different
+        thing: pausing a negative keyword stops it excluding traffic, which
+        INCREASES spend.
+        """
+        def validate(_: Policy) -> ValidationResult:
+            result = _customer_only(customer_id)
+            if ad_group_id is not None:
+                result.extend(
+                    validate_numeric_id(ad_group_id, field_name="ad_group_id")
+                )
+            return result
+
+        decision = await _gate(
+            tool="list_keywords",
+            customer_id=str(customer_id).strip(),
+            arguments={"customer_id": customer_id, "ad_group_id": ad_group_id},
+            validate=validate,
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        rows = await reader.list_keywords(
+            customer_id=str(customer_id).strip(),
+            ad_group_id=None if ad_group_id is None else str(ad_group_id).strip(),
+        )
+        return {
+            "ok": True,
+            "customer_id": str(customer_id).strip(),
+            "keyword_count": len(rows),
+            "keywords": [
+                {
+                    # Both ids, together, because neither addresses a keyword
+                    # on its own.
+                    "criterion_id": row.criterion_id,
+                    "ad_group_id": row.ad_group_id,
+                    "keyword": row.display_text,
+                    "text": row.text,
+                    "match_type": row.match_type,
+                    "status": row.status,
+                    "ad_group_name": row.ad_group_name,
+                    "campaign_name": row.campaign_name,
+                    # Its own bid, and what it actually bids. They differ
+                    # whenever the keyword has no bid and inherits the ad
+                    # group's default.
+                    "max_cpc": (
+                        _money(row.cpc_bid_micros, code)
+                        if row.cpc_bid_micros
+                        else None
+                    ),
+                    "max_cpc_micros": row.cpc_bid_micros,
+                    "effective_max_cpc": _money(row.effective_cpc_bid_micros, code),
+                    "effective_max_cpc_micros": row.effective_cpc_bid_micros,
+                }
+                for row in rows
+            ],
+        }
+
+    @mcp.tool(annotations=annotations_for("list_ads"))
+    async def list_ads(customer_id: str, ad_group_id: str | None = None) -> dict:
+        """Ads in an account, optionally within one ad group.
+
+        Use this to find an ad_id, which pause_ad and enable_ad need alongside
+        the ad_group_id.
+
+        `approval_status` is worth reading: an ad can be ENABLED and still show
+        nothing because Google disapproved it, so status alone does not tell
+        you whether an ad is running.
+        """
+        def validate(_: Policy) -> ValidationResult:
+            result = _customer_only(customer_id)
+            if ad_group_id is not None:
+                result.extend(
+                    validate_numeric_id(ad_group_id, field_name="ad_group_id")
+                )
+            return result
+
+        await _gate(
+            tool="list_ads",
+            customer_id=str(customer_id).strip(),
+            arguments={"customer_id": customer_id, "ad_group_id": ad_group_id},
+            validate=validate,
+        )
+
+        rows = await reader.list_ads(
+            customer_id=str(customer_id).strip(),
+            ad_group_id=None if ad_group_id is None else str(ad_group_id).strip(),
+        )
+        return {
+            "ok": True,
+            "customer_id": str(customer_id).strip(),
+            "ad_count": len(rows),
+            "ads": [
+                {
+                    "ad_id": row.ad_id,
+                    "ad_group_id": row.ad_group_id,
+                    "ad_group_name": row.ad_group_name,
+                    "campaign_name": row.campaign_name,
+                    "status": row.status,
+                    "ad_type": row.ad_type,
+                    # An ad has no name, so the headlines are the only human
+                    # handle there is.
+                    "headlines": list(row.headlines),
+                    "descriptions": list(row.descriptions),
+                    "final_urls": list(row.final_urls),
+                    "approval_status": row.approval_status,
+                    "review_status": row.review_status,
+                }
+                for row in rows
+            ],
+        }
+
+    # ------------------------------------------------------------------
     # find_locations
     # ------------------------------------------------------------------
 

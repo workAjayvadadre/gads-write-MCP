@@ -35,7 +35,11 @@ If you need a config value, a decision, or a file from the existing server,
 | 5 | Budget, bids, negatives, keywords, RSA | **code done, 366 tests; NOT yet run against a live account** |
 | 6 | Rollout: runbook, health endpoint, self-managing audit log, human approval | **code done; not yet exercised against a live client** |
 | 6.5 | Zero-config: accounts/currency/timezone from Google, relative spend rules, `policy.yaml` deleted | **code done** |
-| 6.6 | Parity with the Google Ads UI: absolute caps and the daily ceiling removed, broad match downgraded to a warning, `roles.yaml` reduced to break-glass | **code done, 410 tests** |
+| 6.6 | Parity with the Google Ads UI: absolute caps and the daily ceiling removed, broad match downgraded to a warning, `roles.yaml` reduced to break-glass | **code done** |
+| 7 | `create_ad_group` - closes the gap between `create_campaign` and `add_keyword` | **code done; NOT yet run against a live account** |
+| 8 | Location targeting: `find_locations`, `add_location_target` | **code done; NOT yet run live** |
+| 9 | `pause_ad_group` / `enable_ad_group` | **code done; NOT yet run live** |
+| 10 | `list_keywords` / `list_ads`, then `pause_keyword` / `enable_keyword`, `pause_ad` / `enable_ad`, `update_keyword_bid`, `update_campaign` | **code done, 786 tests; NOT yet run live** |
 
 Pinned to `google-ads` 31.4.x / Google Ads API **v25**. The version lives in
 `ads/api_version.py` and nowhere else.
@@ -386,6 +390,78 @@ and shifted every window by a day for part of each Asia/Kolkata day. An
 explicit `start_date`/`end_date` pair is the caller's own and needs no
 timezone, so it is still validated at the gate.
 
+**`campaign.start_date` and `campaign.end_date` DO NOT EXIST in v25.** The
+fields are `start_date_time` and `end_date_time`: strings in the CUSTOMER'S
+timezone in `"yyyy-MM-dd HH:mm:ss"` form, per the v25 Campaign proto, which
+also specifies the time components - `00:00:00` to begin a day, `23:59:59` to
+end one. `update_campaign` takes plain ISO dates from the caller and composes
+the timestamp in exactly one place, `ads/executor.py:_update_campaign`. Writing
+the field names that obviously ought to exist would have produced code that
+type-checks, reads correctly and is rejected by Google on the first live call.
+
+**No tool can CLEAR a field, and `update_campaign` cannot remove an end date.**
+Clearing means naming a field in an update mask while leaving it unset, which
+is precisely the mechanism `_seal_mask` exists to make impossible - it is how a
+status change silently erases a campaign name. So "run indefinitely" is not
+expressible here; an empty string is treated as "not supplied". Clear an end
+date in the Google Ads UI.
+
+**A keyword's bid is measured against its EFFECTIVE bid, not its own.** A
+keyword with no bid of its own has `cpc_bid_micros == 0` and bids the ad
+group's default instead, and `evaluate_bid_change` refuses a rise from zero
+because a percentage from zero is undefined. Using the own-bid as the baseline
+would therefore have refused the single most ordinary keyword bid change there
+is: setting one for the first time. `keyword_bid_baseline_micros` uses
+`effective_cpc_bid_micros`, which is the number the keyword bids right now and
+the one the Google Ads UI shows.
+
+**Everything below an ad group is addressed by TWO ids.** An
+`ad_group_criterion` resource name is `{ad_group_id}~{criterion_id}` and an
+`ad_group_ad` is `{ad_group_id}~{ad_id}`; those child ids are unique within an
+ad group, not within an account. A tool taking one alone would be a silent way
+to change the wrong thing, so every keyword and ad tool takes both, and
+`list_keywords` / `list_ads` return them together. `ReadKind.KEYWORD` exists
+for the same reason - `read_current` needs two arguments, not one.
+
+**Location criteria are created ENABLED**, the one place
+`new_entities_start_paused` deliberately does not apply. A PAUSED location
+criterion restricts nothing, so creating one would leave a campaign serving
+worldwide under a preview that said it was restricted to India.
+
+**`add_location_target` forces `positive_geo_target_type` to PRESENCE.**
+Google's default, `PRESENCE_OR_INTEREST`, does not restrict a campaign to its
+targeted locations - it broadens it to anyone in the world showing interest in
+them. A tool called `add_location_target` that left that alone would produce a
+preview reading "targeting India" for a campaign still serving abroad. PRESENCE
+can only ever NARROW who sees an ad, so it cannot increase spend, and it is one
+click to reverse. The cost, recorded as a decision: a campaign somebody
+deliberately set to presence-or-interest is flipped back, visibly on the
+preview with its previous value, each time a location is added. If that ever
+needs an escape hatch the fix is a parameter on the tool.
+
+**`add_location_target` is the one operation carrying creates AND an update**,
+so it sits in `UPDATE_MASK_ALLOWLIST` rather than `CREATE_OPERATIONS`. Its mask
+is safe because `protobuf_helpers.field_mask` returns the LEAF path
+`geo_target_type_setting.positive_geo_target_type` - verified, not assumed. A
+mask naming the containing `geo_target_type_setting` would also name
+`negative_geo_target_type`, which it never sets, and would blank it.
+
+**`geo_target_constant.name LIKE` filterability is the one unverified API
+fact.** The Google Ads v25 field page is JavaScript-rendered and unfetchable;
+the claim comes from the Search Ads 360 Reporting API mirror of the same field
+metadata. It is confined to `find_locations`, a READ: the write path filters
+only on `geo_target_constant.resource_name`, which Google's own documentation
+demonstrates. If the mirror is wrong, one read tool fails loudly and nothing
+else is affected. **Settle it on the first live call.**
+
+**A status is never a tool parameter, anywhere.** `CampaignStatus`,
+`AdGroupStatus`, `AdGroupCriterionStatus` and `AdGroupAdStatus` all have a
+REMOVED member, removal is terminal, and this server has no remove tool by
+design. A status arriving as input is one typo away from being one. It is
+hardcoded in two places per tool - `TOOL_TARGET_STATUS` in `tools/writes.py`
+and a `*_STATUS_OPERATIONS` map in `ads/executor.py` - and tests assert the
+published MCP schemas carry no `status` property at all.
+
 ## Open risks
 
 **Can a non-admin read their own access role? CONFIRMED YES by the account
@@ -460,7 +536,7 @@ so this should be invisible; if it is not, the TTL is the knob.
 ## Commands
 
 ```bash
-.venv/Scripts/python -m pytest          # 410 tests, no network, no credentials
+.venv/Scripts/python -m pytest          # 786 tests, no network, no credentials
 curl -s localhost:8081/healthz          # 200 ok / 503 degraded, no auth needed
 .venv/Scripts/python -m gads_write.server
 pm2 restart gads-write-mcp              # prod; picks up .env (roles.yaml hot-reloads)
