@@ -27,6 +27,7 @@ from google.oauth2.credentials import Credentials
 import gads_write.ads.client as client_module
 from gads_write.ads.api_version import API_VERSION
 from gads_write.ads.executor import (
+    AD_GROUP_STATUS_OPERATIONS,
     CAMPAIGN_STATUS_OPERATIONS,
     CREATE_OPERATIONS,
     KNOWN_OPERATIONS,
@@ -470,6 +471,8 @@ async def test_an_rsa_without_urls_is_refused(rec) -> None:
     ("operation", "payload"),
     [
         ("pause_campaign", {"campaign_id": "55"}),
+        ("pause_ad_group", {"ad_group_id": "66"}),
+        ("enable_ad_group", {"ad_group_id": "66"}),
         ("update_campaign_budget", {"budget_resource_name": BUDGET_RESOURCE, "amount_micros": 20_000_000}),
         ("update_ad_group_bid", {"ad_group_id": "66", "cpc_bid_micros": 1_000_000}),
         ("add_campaign_negative_keyword", {"campaign_id": "55", "keyword_text": "x", "match_type": "BROAD"}),
@@ -516,6 +519,50 @@ async def test_each_status_operation_sets_its_own_status(rec, operation, expecte
     assert _sent(rec).update.status.name == expected_status
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected_status"), sorted(AD_GROUP_STATUS_OPERATIONS.items())
+)
+async def test_each_ad_group_status_operation_sets_its_own_status(
+    rec, operation, expected_status
+) -> None:
+    """The status comes from the OPERATION, never from the payload. That is
+    what makes a REMOVED ad group unreachable from here."""
+    await _apply(operation, {"ad_group_id": "66"})
+    sent = _sent(rec)
+    assert sent.update.status.name == expected_status
+    assert sent.update.resource_name == f"customers/{ACCOUNT}/adGroups/66"
+
+
+@pytest.mark.parametrize("operation", sorted(AD_GROUP_STATUS_OPERATIONS))
+async def test_an_ad_group_status_mask_names_only_status(rec, operation) -> None:
+    """Its OWN allowlist entry, not a widening of update_ad_group_bid's. All
+    three mutate an AdGroup, and one shared entry would let a bid change
+    legally carry `status`."""
+    await _apply(operation, {"ad_group_id": "66"})
+    paths = set(_sent(rec).update_mask.paths)
+
+    assert paths <= UPDATE_MASK_ALLOWLIST[operation]
+    assert "status" in paths
+    for forbidden in ("name", "cpc_bid_micros", "campaign", "type_"):
+        assert forbidden not in paths
+
+
+async def test_a_status_payload_cannot_steer_an_ad_group_status_change(rec) -> None:
+    """A `status` in the payload is ignored outright - the operation decides.
+
+    This is the property that makes "no delete tool" structural rather than a
+    convention: there is no input that reaches AdGroupStatus.REMOVED.
+    """
+    await _apply("pause_ad_group", {"ad_group_id": "66", "status": "REMOVED"})
+    assert _sent(rec).update.status.name == "PAUSED"
+
+
+async def test_a_non_numeric_ad_group_id_is_refused(rec) -> None:
+    with pytest.raises(ExecutorError):
+        await _apply("pause_ad_group", {"ad_group_id": "66 OR 1=1"})
+    assert "call" not in rec
+
+
 # ---------------------------------------------------------------------------
 # failing loudly
 # ---------------------------------------------------------------------------
@@ -524,6 +571,7 @@ def test_removal_is_not_an_available_operation() -> None:
     assert all("remove" not in name for name in KNOWN_OPERATIONS)
     assert all("delete" not in name for name in KNOWN_OPERATIONS)
     assert "REMOVED" not in CAMPAIGN_STATUS_OPERATIONS.values()
+    assert "REMOVED" not in AD_GROUP_STATUS_OPERATIONS.values()
 
 
 async def test_an_unknown_operation_is_refused(rec) -> None:

@@ -152,6 +152,23 @@ def validate_campaign_status_args(
     return result
 
 
+def validate_ad_group_status_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Validate the arguments of an ad group status change.
+
+    There is no status to validate, and that is the point: the status is
+    hardcoded per tool in tools/writes.py and per operation in
+    ads/executor.py, so it never arrives as input and can never be REMOVED.
+    """
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("ad_group_id", ""), field_name="ad_group_id")
+    )
+    return result
+
+
 def validate_budget_args(policy: Policy, arguments: dict[str, Any]) -> ValidationResult:
     result = ValidationResult()
     result.extend(validate_customer_id(arguments.get("customer_id", "")))
@@ -582,6 +599,13 @@ def validate_create_campaign_args(
 OPERATIONS: dict[str, OperationChecks] = {
     "pause_campaign": OperationChecks(validate=validate_campaign_status_args),
     "enable_campaign": OperationChecks(validate=validate_campaign_status_args),
+    # No recheck and no read at CONFIRM time. A status change has no relative
+    # rule to re-evaluate - there is no percentage and no amount - so what it
+    # skips is the second gate pass, not the read. Drafting still reads the ad
+    # group, because "ad group 449283710 -> PAUSED" is not something a person
+    # can approve.
+    "pause_ad_group": OperationChecks(validate=validate_ad_group_status_args),
+    "enable_ad_group": OperationChecks(validate=validate_ad_group_status_args),
     "update_campaign_budget": OperationChecks(
         validate=validate_budget_args,
         recheck=recheck_budget,
@@ -676,6 +700,7 @@ __all__ = [
     "recheck_create_ad_group",
     "validate_bid_args",
     "validate_budget_args",
+    "validate_ad_group_status_args",
     "validate_campaign_status_args",
     "validate_create_ad_group_args",
     "validate_keyword_args",

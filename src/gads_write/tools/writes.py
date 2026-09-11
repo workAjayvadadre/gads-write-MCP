@@ -74,10 +74,19 @@ from .registry import annotations_for
 logger = logging.getLogger(__name__)
 
 # tool name -> the status it will set. Mirrors
-# ads/executor.py:CAMPAIGN_STATUS_OPERATIONS, which is the enforcing copy.
+# ads/executor.py:CAMPAIGN_STATUS_OPERATIONS and AD_GROUP_STATUS_OPERATIONS,
+# which are the enforcing copies.
+#
+# The reason this is a TABLE rather than a parameter, stated once for all four
+# tools: CampaignStatus and AdGroupStatus both have a REMOVED member, removal
+# is terminal in Google Ads, and this server has no remove tool by design. A
+# status that arrives as input is one typo away from being one. Here it cannot
+# arrive as input at all.
 TOOL_TARGET_STATUS: dict[str, str] = {
     "pause_campaign": "PAUSED",
     "enable_campaign": "ENABLED",
+    "pause_ad_group": "PAUSED",
+    "enable_ad_group": "ENABLED",
 }
 
 
@@ -200,6 +209,101 @@ def register_write_tools(
             target_status=target_status,
         )
         return summary
+
+    async def _draft_ad_group_status_change(
+        tool: str, customer_id: str, ad_group_id: str
+    ) -> dict:
+        """The ad group twin of `_draft_status_change`.
+
+        Deliberately a parallel function rather than a generalisation of it.
+        The two share a shape but not a preview: a campaign preview shows a
+        daily budget, an ad group preview shows its campaign's status and its
+        max CPC. Folding them together would mean a table of formatting
+        strategies, which is more indirection than two short functions.
+
+        One gate pass, like the campaign pair. A status change has no relative
+        rule to evaluate, so there is no second pass - but it still READS,
+        because "ad group 449283710 -> PAUSED" is not something a human can
+        approve.
+        """
+        target_status = TOOL_TARGET_STATUS[tool]
+        customer_id = str(customer_id).strip()
+        ad_group_id = str(ad_group_id).strip()
+        arguments = {"customer_id": customer_id, "ad_group_id": ad_group_id}
+
+        caller = caller_provider()
+        decision = await guard.check(
+            tool=tool,
+            caller=caller,
+            customer_id=customer_id,
+            arguments=arguments,
+            validate=lambda policy: OPERATIONS[tool].validate(policy, arguments),
+        )
+        if not decision.allowed:
+            raise ToolError(f"{decision.reason_text}. Nothing was changed.")
+
+        ad_group = await _ad_group_or_fail(customer_id, ad_group_id)
+
+        if ad_group.status == "REMOVED":
+            raise ToolError(
+                f"Ad group {ad_group.name!r} ({ad_group_id}) is REMOVED. Removal "
+                "is permanent in Google Ads and cannot be undone by this "
+                "server. Nothing was changed."
+            )
+
+        if ad_group.status == target_status:
+            # Not an error, and deliberately not a plan - the pause_campaign
+            # rule. A confirmed, audited change that changed nothing makes the
+            # audit log harder to read.
+            return {
+                "ok": True,
+                "no_change_needed": True,
+                "ad_group_id": ad_group.ad_group_id,
+                "ad_group_name": ad_group.name,
+                "campaign_name": ad_group.campaign_name,
+                "status": ad_group.status,
+                "message": (
+                    f"Ad group {ad_group.name!r} is already {target_status}. "
+                    "Nothing to do."
+                ),
+            }
+
+        policy: Policy = decision.policy or policy_store.current()
+        preview = _ad_group_preview(
+            customer_id=customer_id,
+            ad_group=ad_group,
+            target_status=target_status,
+            currency_code=policy.currency_code,
+        )
+
+        return _park(
+            caller=caller,
+            tool=tool,
+            customer_id=customer_id,
+            arguments=arguments,
+            preview=preview,
+            policy=policy,
+            # No spend delta. Pausing and enabling an ad group move no daily
+            # budget - the campaign's budget is unchanged either way - so
+            # there is no honest number to charge against the running total
+            # the budget previews report.
+            spend_delta_units=None,
+            metadata={
+                "current_status": ad_group.status,
+                "target_status": target_status,
+                "ad_group_name": ad_group.name,
+                "campaign_name": ad_group.campaign_name,
+                "operation": tool,
+                "payload": {"ad_group_id": ad_group_id},
+            },
+            extra={
+                "ad_group_id": ad_group.ad_group_id,
+                "ad_group_name": ad_group.name,
+                "campaign_name": ad_group.campaign_name,
+                "current_status": ad_group.status,
+                "target_status": target_status,
+            },
+        )
 
     # ------------------------------------------------------------------
     # shared gate helpers for tools that need current state
@@ -1298,6 +1402,37 @@ def register_write_tools(
         """
         return await _draft_status_change("enable_campaign", customer_id, campaign_id)
 
+    @mcp.tool(annotations=annotations_for("pause_ad_group"))
+    async def pause_ad_group(customer_id: str, ad_group_id: str) -> dict:
+        """Draft a change that pauses one ad group. Does NOT pause it.
+
+        Pausing an ad group stops all of its keywords and ads serving in one
+        step, without touching any of them individually. Reversible with
+        enable_ad_group.
+
+        Returns a preview and a plan_id; nothing changes until
+        confirm_and_apply. Use list_ad_groups to find an ad_group_id.
+        """
+        return await _draft_ad_group_status_change(
+            "pause_ad_group", customer_id, ad_group_id
+        )
+
+    @mcp.tool(annotations=annotations_for("enable_ad_group"))
+    async def enable_ad_group(customer_id: str, ad_group_id: str) -> dict:
+        """Draft a change that enables one ad group. Does NOT enable it.
+
+        Lets the ad group's keywords and ads serve again, spending the
+        CAMPAIGN's budget - this does not create a budget of its own. If the
+        campaign is paused the preview says so, because an enabled ad group in
+        a paused campaign still does not serve.
+
+        Returns a preview and a plan_id; nothing changes until
+        confirm_and_apply.
+        """
+        return await _draft_ad_group_status_change(
+            "enable_ad_group", customer_id, ad_group_id
+        )
+
 
 def _preview(
     *,
@@ -1321,6 +1456,51 @@ def _preview(
         )
     else:
         lines.append("  This is reversible with enable_campaign.")
+    return "\n".join(lines)
+
+
+def _ad_group_preview(
+    *,
+    customer_id: str,
+    ad_group: Any,
+    target_status: str,
+    currency_code: str,
+) -> str:
+    """The text a human approves for an ad group status change.
+
+    Names the ad group, its campaign and its bid, because an id and an arrow
+    is not something anybody can sensibly approve.
+
+    The campaign's own status is on here for a specific reason: an ENABLED ad
+    group inside a PAUSED campaign does not serve. Without that line the tool
+    would report success on a change with no visible effect, and the person
+    would be left looking for the fault somewhere else.
+    """
+    campaign_status = getattr(ad_group, "campaign_status", "") or "unknown"
+    lines = [
+        f"Account {customer_id}",
+        f"Ad group {ad_group.name!r} (id {ad_group.ad_group_id})",
+        f"  campaign : {ad_group.campaign_name!r} ({campaign_status})",
+        f"  max CPC  : {format_micros(ad_group.cpc_bid_micros, currency_code)}",
+        f"  status   : {ad_group.status} -> {target_status}",
+    ]
+    if target_status == "ENABLED":
+        if campaign_status == "ENABLED":
+            lines.append(
+                "  NOTE: this lets its keywords and ads spend the CAMPAIGN's "
+                "daily budget again."
+            )
+        else:
+            lines.append(
+                f"  NOTE: campaign {ad_group.campaign_name!r} is {campaign_status}, "
+                "so this ad group"
+            )
+            lines.append(
+                "        still will not serve until that campaign is enabled too."
+            )
+    else:
+        lines.append("  This stops every keyword and ad in it serving.")
+        lines.append("  Reversible with enable_ad_group.")
     return "\n".join(lines)
 
 

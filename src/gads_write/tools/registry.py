@@ -214,6 +214,29 @@ def _register_builtin_tools() -> None:
             operation="enable_campaign",
         )
     )
+    # Ad group status. Operator, and NOT split by direction the way the
+    # campaign pair nearly was: pausing an ad group stops its keywords
+    # serving, enabling resumes them, and both are things a Standard user does
+    # in the Google Ads UI constantly. An enable here is bounded by the
+    # campaign's own budget and status, which is more than enable_campaign can
+    # say for itself.
+    register(
+        ToolSpec(
+            name="pause_ad_group",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="pause_ad_group",
+        )
+    )
+    register(
+        ToolSpec(
+            name="enable_ad_group",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="enable_ad_group",
+        )
+    )
+
     # --- Phase 5 writes ----------------------------------------------------
     # operator: budgets and negative keywords. Negatives only ever reduce
     # spend, and budgets are bounded by the policy limits plus the per-user

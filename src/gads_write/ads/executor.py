@@ -91,6 +91,18 @@ CAMPAIGN_STATUS_OPERATIONS: dict[str, str] = {
     "enable_campaign": "ENABLED",
 }
 
+# operation name -> the AdGroupStatus enum member it sets.
+#
+# REMOVED is deliberately absent and must stay absent, for the same reason it
+# is absent above. A status is never taken as a parameter anywhere in this
+# server: AdGroupStatus has a REMOVED member, and a status parameter is one
+# typo away from a delete tool. Hardcoding it per operation makes that
+# impossible rather than merely unlikely.
+AD_GROUP_STATUS_OPERATIONS: dict[str, str] = {
+    "pause_ad_group": "PAUSED",
+    "enable_ad_group": "ENABLED",
+}
+
 # Per-operation update-mask allowlists.
 #
 # An update mask says which fields to overwrite, and a mask naming a field
@@ -108,6 +120,12 @@ UPDATE_MASK_ALLOWLIST: dict[str, frozenset[str]] = {
     "enable_campaign": frozenset({"resource_name", "status"}),
     "update_campaign_budget": frozenset({"resource_name", "amount_micros"}),
     "update_ad_group_bid": frozenset({"resource_name", "cpc_bid_micros"}),
+    # Their OWN entries, not a widening of update_ad_group_bid's. All three
+    # mutate an AdGroup, and a single shared entry would let a bid change
+    # legally carry `status` - which is exactly the cross-contamination these
+    # per-operation lists exist to catch.
+    "pause_ad_group": frozenset({"resource_name", "status"}),
+    "enable_ad_group": frozenset({"resource_name", "status"}),
     # The one operation that carries BOTH creates and an update. The location
     # criteria are creates and need no mask; the campaign-level presence
     # setting is an update and does, so the operation is listed here rather
@@ -265,6 +283,8 @@ class GoogleAdsExecutor(Executor):
         handler = {
             "pause_campaign": self._set_campaign_status,
             "enable_campaign": self._set_campaign_status,
+            "pause_ad_group": self._set_ad_group_status,
+            "enable_ad_group": self._set_ad_group_status,
             "create_campaign": self._create_campaign,
             "create_ad_group": self._create_ad_group,
             "add_location_target": self._add_location_target,
@@ -376,6 +396,30 @@ class GoogleAdsExecutor(Executor):
         response = self._send(
             service.mutate_campaigns, request, operations=[operation]
         )
+        return self._finish(response, request, {"new_status": status_name})
+
+    def _set_ad_group_status(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Pause or enable one ad group.
+
+        The status comes from AD_GROUP_STATUS_OPERATIONS keyed on the
+        operation, never from the payload. That is the whole reason the two
+        tools are separate operations rather than one taking a status.
+        """
+        status_name = AD_GROUP_STATUS_OPERATIONS[request.operation]
+        ad_group_id = _digits(request.payload, "ad_group_id")
+
+        service = client.get_service("AdGroupService")
+        operation = client.get_type("AdGroupOperation")
+        ad_group = operation.update
+        ad_group.resource_name = service.ad_group_path(
+            request.customer_id, ad_group_id
+        )
+        ad_group.status = client.enums.AdGroupStatusEnum[status_name]
+        self._seal_mask(request.operation, operation, ad_group, client)
+
+        response = self._send(service.mutate_ad_groups, request, operations=[operation])
         return self._finish(response, request, {"new_status": status_name})
 
     def _update_campaign_budget(

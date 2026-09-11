@@ -259,6 +259,11 @@ class AdGroupSummary:
     # automated bidding strategy and no manual bid applies.
     cpc_bid_micros: int
     bidding_strategy_type: str = ""
+    # The CAMPAIGN's status, not this ad group's. An ENABLED ad group inside a
+    # PAUSED campaign still does not serve, so enable_ad_group has to be able
+    # to say so - otherwise it reports success on a change with no visible
+    # effect, and the person is left wondering what went wrong.
+    campaign_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -758,27 +763,14 @@ class GoogleAdsReader(AdsReader):
             where.append(f"campaign.id = {safe_campaign}")
 
         query = (
-            "SELECT ad_group.id, ad_group.name, ad_group.status, "
-            "ad_group.cpc_bid_micros, "
-            "campaign.id, campaign.name, campaign.bidding_strategy_type "
+            f"SELECT {AD_GROUP_FIELDS} "
             "FROM ad_group "
             "WHERE " + " AND ".join(where) + " "
             "ORDER BY campaign.name, ad_group.name "
             f"LIMIT {MAX_ROWS}"
         )
         rows = await self._search_rows(customer_id=customer_id, query=query)
-        return tuple(
-            AdGroupSummary(
-                ad_group_id=str(row.ad_group.id),
-                name=row.ad_group.name or "",
-                status=_enum_name(row.ad_group.status),
-                campaign_id=str(row.campaign.id),
-                campaign_name=row.campaign.name or "",
-                cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
-                bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
-            )
-            for row in rows
-        )
+        return tuple(_ad_group_summary(row) for row in rows)
 
     async def campaign_by_id(
         self, *, customer_id: str, campaign_id: str
@@ -804,10 +796,11 @@ class GoogleAdsReader(AdsReader):
         customer_id = _literal(customer_id, field="customer_id")
         safe_ad_group = _literal(ad_group_id, field="ad_group_id")
 
+        # No status filter, deliberately. A REMOVED ad group has to come back
+        # so a write tool can refuse it with a message that says why, rather
+        # than reporting "no such ad group".
         query = (
-            "SELECT ad_group.id, ad_group.name, ad_group.status, "
-            "ad_group.cpc_bid_micros, "
-            "campaign.id, campaign.name, campaign.bidding_strategy_type "
+            f"SELECT {AD_GROUP_FIELDS} "
             "FROM ad_group "
             f"WHERE ad_group.id = {safe_ad_group} "
             "LIMIT 1"
@@ -816,16 +809,7 @@ class GoogleAdsReader(AdsReader):
         if not rows:
             return None
 
-        row = rows[0]
-        return AdGroupSummary(
-            ad_group_id=str(row.ad_group.id),
-            name=row.ad_group.name or "",
-            status=_enum_name(row.ad_group.status),
-            campaign_id=str(row.campaign.id),
-            campaign_name=row.campaign.name or "",
-            cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
-            bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
-        )
+        return _ad_group_summary(rows[0])
 
     async def find_geo_targets(
         self,
@@ -985,6 +969,16 @@ CAMPAIGN_FIELDS = (
     "campaign_budget.amount_micros, campaign_budget.reference_count"
 )
 
+# The ad group fields every ad group read selects. Same reason as
+# CAMPAIGN_FIELDS: a field added for the single-ad-group lookup cannot then go
+# missing from the listing, which would surface as an AttributeError on a row
+# rather than a clear error.
+AD_GROUP_FIELDS = (
+    "ad_group.id, ad_group.name, ad_group.status, ad_group.cpc_bid_micros, "
+    "campaign.id, campaign.name, campaign.status, "
+    "campaign.bidding_strategy_type"
+)
+
 # The geo target fields every geo query selects. One constant so the
 # by-name search and the by-id lookup cannot disagree about a field, which
 # would surface as an AttributeError on a row rather than a clear error.
@@ -1012,6 +1006,21 @@ def _campaign_summary(row: Any) -> CampaignSummary:
         positive_geo_target_type=_enum_name(
             row.campaign.geo_target_type_setting.positive_geo_target_type
         ),
+    )
+
+
+def _ad_group_summary(row: Any) -> AdGroupSummary:
+    """Map one ad group row. Shared by `ad_group_by_id` and `list_ad_groups`
+    so the two can never disagree about a field."""
+    return AdGroupSummary(
+        ad_group_id=str(row.ad_group.id),
+        name=row.ad_group.name or "",
+        status=_enum_name(row.ad_group.status),
+        campaign_id=str(row.campaign.id),
+        campaign_name=row.campaign.name or "",
+        cpc_bid_micros=int(row.ad_group.cpc_bid_micros or 0),
+        bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+        campaign_status=_enum_name(row.campaign.status),
     )
 
 
