@@ -269,6 +269,18 @@ def _register_builtin_tools() -> None:
             operation="create_responsive_search_ad",
         )
     )
+    # Operator, like everything else that writes. An ad group is the container
+    # add_keyword and create_responsive_search_ad target, and a Standard user
+    # creates them in the Google Ads UI every day. It arrives PAUSED with no
+    # keywords and no ads, so it cannot spend until someone fills it.
+    register(
+        ToolSpec(
+            name="create_ad_group",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="create_ad_group",
+        )
+    )
 
     # `operation=None` on purpose: confirm_and_apply is not itself a
     # mutation kind, so it must not be matched against

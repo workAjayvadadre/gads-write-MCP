@@ -662,3 +662,40 @@ def validate_bidding_strategy(strategy: object) -> ValidationResult:
             "Google spend the budget on clicks.",
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# creating an ad group
+# ---------------------------------------------------------------------------
+
+# Google's System Limits page gives 256 characters for an ad group name,
+# paired with the error code `AdGroupError.INVALID_ADGROUP_NAME`. 255 is used
+# here so the two name limits in this file agree: being one character
+# stricter than Google can only ever refuse a name Google would have taken,
+# never accept one it would reject.
+MAX_AD_GROUP_NAME = 255
+
+
+def validate_ad_group_name(name: object) -> ValidationResult:
+    """Same shape as validate_campaign_name, for the same reasons.
+
+    Not shared with it deliberately: the two limits come from different rows
+    of Google's System Limits page and different error codes, so folding them
+    into one function would make a future divergence invisible.
+    """
+    result = ValidationResult()
+    text = str(name or "").strip()
+    if not text:
+        result.add("name", "an ad group needs a name")
+        return result
+    if len(text) > MAX_AD_GROUP_NAME:
+        result.add(
+            "name",
+            f"an ad group name may be at most {MAX_AD_GROUP_NAME} characters, "
+            f"got {len(text)}",
+        )
+    # Control characters would be accepted by Google and then render as
+    # nothing in the UI, producing an ad group nobody can find by name.
+    if any(unicodedata.category(ch).startswith("C") for ch in text):
+        result.add("name", "an ad group name may not contain control characters")
+    return result

@@ -119,8 +119,17 @@ CREATE_OPERATIONS: frozenset[str] = frozenset(
         "add_keyword",
         "create_responsive_search_ad",
         "create_campaign",
+        "create_ad_group",
     }
 )
+
+# The one ad group type this server creates. `AdGroup.type_` is IMMUTABLE in
+# the Google Ads API - verified in the v25 proto - and there is no tool here
+# to remove an ad group, so a wrong type could never be corrected through this
+# server. SEARCH_STANDARD is the only type that belongs in the Search
+# campaigns create_campaign makes, and the only one add_keyword and
+# create_responsive_search_ad can populate.
+AD_GROUP_TYPE = "SEARCH_STANDARD"
 
 # Bidding strategies this server will create a campaign with. Two, not the
 # seventeen the API offers: Manual CPC needs no extra value and Maximize
@@ -225,6 +234,7 @@ class GoogleAdsExecutor(Executor):
             "pause_campaign": self._set_campaign_status,
             "enable_campaign": self._set_campaign_status,
             "create_campaign": self._create_campaign,
+            "create_ad_group": self._create_ad_group,
             "update_campaign_budget": self._update_campaign_budget,
             "update_ad_group_bid": self._update_ad_group_bid,
             "add_campaign_negative_keyword": self._add_campaign_negative_keyword,
@@ -578,6 +588,49 @@ class GoogleAdsExecutor(Executor):
                 "name": name,
                 "status": "PAUSED",
                 "bidding_strategy": strategy,
+            },
+        )
+
+    def _create_ad_group(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Create one ad group in an existing campaign.
+
+        `cpc_bid_micros` is set only when the payload carries it, and is then
+        omitted from the message entirely rather than sent as zero. On a create
+        there is no update mask, so an absent field is simply not written -
+        whereas an explicit zero is a real value Google would store, and a zero
+        default bid under Manual CPC is an ad group that cannot win an auction.
+        """
+        campaign_id = _digits(request.payload, "campaign_id")
+        name = str(request.payload.get("name") or "").strip()
+        status = _status(request.payload)
+        if not name:
+            raise ExecutorError("an ad group needs a name")
+
+        service = client.get_service("AdGroupService")
+        operation = client.get_type("AdGroupOperation")
+        ad_group = operation.create
+        ad_group.campaign = service.campaign_path(request.customer_id, campaign_id)
+        ad_group.name = name
+        ad_group.status = client.enums.AdGroupStatusEnum[status]
+        # Immutable once created. See AD_GROUP_TYPE.
+        ad_group.type_ = client.enums.AdGroupTypeEnum[AD_GROUP_TYPE]
+
+        cpc_bid_micros = request.payload.get("cpc_bid_micros")
+        if cpc_bid_micros is not None:
+            cpc_bid_micros = _micros(request.payload, "cpc_bid_micros")
+            ad_group.cpc_bid_micros = cpc_bid_micros
+
+        response = self._send(service.mutate_ad_groups, request, operations=[operation])
+        return self._finish(
+            response,
+            request,
+            {
+                "name": name,
+                "status": status,
+                "ad_group_type": AD_GROUP_TYPE,
+                "cpc_bid_micros": cpc_bid_micros,
             },
         )
 

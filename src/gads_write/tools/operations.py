@@ -49,6 +49,7 @@ from ..safety.policy import (
 from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
     ValidationResult,
+    validate_ad_group_name,
     validate_bidding_strategy,
     validate_campaign_name,
     validate_customer_id,
@@ -346,6 +347,128 @@ def recheck_bid(
     )
 
 
+def validate_create_ad_group_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    """Shape of the arguments for a new ad group.
+
+    `max_cpc` is checked for being a usable, positive amount ONLY. Whether it
+    is required at all, or must be absent, depends on the campaign's bidding
+    strategy, which this cannot see - that lives in
+    `ad_group_campaign_verdict` below, which runs at both steps.
+    """
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("campaign_id", ""), field_name="campaign_id")
+    )
+    result.extend(validate_ad_group_name(arguments.get("name")))
+
+    max_cpc = arguments.get("max_cpc")
+    if max_cpc is None or str(max_cpc).strip() == "":
+        return result
+    try:
+        bid_units = coerce_units(max_cpc, field="max_cpc")
+    except MoneyError as exc:
+        result.add("max_cpc", str(exc))
+        return result
+    if bid_units <= 0:
+        result.add("max_cpc", f"a max CPC must be above zero, got {bid_units}")
+    return result
+
+
+# Campaign bidding strategies under which an ad group's OWN cpc_bid_micros is
+# the bid Google uses. Verified against the v25 AdGroup proto, which says of
+# cpc_bid_micros: "This field is used when the ad group's effective bidding
+# strategy is Manual CPC." ENHANCED_CPC is the legacy manual strategy with a
+# Google adjustment applied on top, so the ad group bid is still the base.
+MANUAL_BIDDING_STRATEGIES = frozenset({"MANUAL_CPC", "ENHANCED_CPC"})
+
+
+def ad_group_campaign_verdict(current: Any, payload: dict[str, Any]) -> PolicyVerdict:
+    """Whether this ad group can legitimately go in THIS campaign, as it is now.
+
+    Three things have to hold, and none of them can be judged from the
+    arguments alone:
+
+      the campaign exists and is not REMOVED - removal is terminal in Google
+      Ads, so an ad group added to a removed campaign could never serve;
+
+      the campaign is a SEARCH campaign - `type_` on an ad group is IMMUTABLE
+      in the API, and this server only ever sets SEARCH_STANDARD. There are no
+      delete tools, so a SEARCH_STANDARD ad group created in a Display campaign
+      could never be corrected here;
+
+      the bid matches the bidding strategy - required under Manual CPC, where
+      the Google Ads UI also demands it, and absent under an automated
+      strategy, where Google ignores the field entirely. Accepting a number
+      Google ignores would put a figure on the preview that does nothing, and
+      a preview that lies is what breaks the approval model.
+
+    Checked at BOTH steps, which is the point of it living here. A campaign
+    moved from Manual CPC to Maximize Clicks between drafting and confirming
+    is exactly what a draft-time-only check misses.
+    """
+    if current is None:
+        return PolicyVerdict.deny(
+            "the campaign this ad group would go in could not be read, so we "
+            "cannot tell whether it needs a default bid or whether an ad group "
+            "belongs in it at all."
+        )
+
+    if str(getattr(current, "status", "") or "").upper() == "REMOVED":
+        return PolicyVerdict.deny(
+            "this campaign is REMOVED. Removal is permanent in Google Ads, so "
+            "an ad group added to it could never serve."
+        )
+
+    channel = str(getattr(current, "channel_type", "") or "").strip().upper()
+    if channel != "SEARCH":
+        return PolicyVerdict.deny(
+            f"this is a {channel or 'unreadable'} campaign, and this server only "
+            "creates SEARCH_STANDARD ad groups. An ad group's type is immutable "
+            "in Google Ads and there is no tool here to remove one, so the wrong "
+            "type could never be corrected. Create it in the Google Ads UI."
+        )
+
+    strategy = str(getattr(current, "bidding_strategy_type", "") or "").strip().upper()
+    if not strategy:
+        return PolicyVerdict.deny(
+            "the campaign's bidding strategy could not be established, so we "
+            "cannot tell whether this ad group needs a default max CPC. "
+            "Refusing rather than guessing."
+        )
+
+    has_bid = payload.get("cpc_bid_micros") is not None
+    if strategy in MANUAL_BIDDING_STRATEGIES and not has_bid:
+        return PolicyVerdict.deny(
+            f"this campaign bids by {strategy}, so the ad group needs its own "
+            "default max CPC - the Google Ads UI requires one on this screen "
+            "too. Pass max_cpc in whole currency units."
+        )
+    if strategy not in MANUAL_BIDDING_STRATEGIES and has_bid:
+        return PolicyVerdict.deny(
+            f"this campaign bids by {strategy}, which sets bids for you, so "
+            "Google ignores an ad group's max CPC entirely. Drop max_cpc rather "
+            "than putting a number on the preview that does nothing."
+        )
+
+    return PolicyVerdict.allow()
+
+
+def recheck_create_ad_group(
+    policy: Policy,
+    *,
+    tier: Tier,
+    arguments: dict[str, Any],
+    current: Any,
+    payload: dict[str, Any],
+    spend_today: Decimal,
+) -> PolicyVerdict:
+    """The same verdict the draft ran, against the campaign as it is NOW."""
+    return ad_group_campaign_verdict(current, payload)
+
+
 def validate_create_campaign_args(
     policy: Policy, arguments: dict[str, Any]
 ) -> ValidationResult:
@@ -394,6 +517,16 @@ OPERATIONS: dict[str, OperationChecks] = {
     # No recheck and no read: a new campaign is measured against nothing that
     # already exists, so there is no current state to re-establish at confirm.
     "create_campaign": OperationChecks(validate=validate_create_campaign_args),
+    # An ad group DOES have current state to be measured against: the campaign
+    # it goes in decides whether it needs a default bid, and whether a
+    # SEARCH_STANDARD ad group belongs there at all. So unlike create_campaign
+    # it pays for the second gate pass and the re-read.
+    "create_ad_group": OperationChecks(
+        validate=validate_create_ad_group_args,
+        recheck=recheck_create_ad_group,
+        reads=ReadKind.CAMPAIGN,
+        id_argument="campaign_id",
+    ),
     "add_keyword": OperationChecks(
         validate=validate_keyword_args,
     ),
@@ -429,8 +562,10 @@ async def read_current(
 
 
 __all__ = [
+    "MANUAL_BIDDING_STRATEGIES",
     "OPERATIONS",
     "SpendDelta",
+    "ad_group_campaign_verdict",
     "budget_spend_delta",
     "shared_budget_verdict",
     "units_from_micros",
@@ -441,9 +576,11 @@ __all__ = [
     "read_current",
     "recheck_bid",
     "recheck_budget",
+    "recheck_create_ad_group",
     "validate_bid_args",
     "validate_budget_args",
     "validate_campaign_status_args",
+    "validate_create_ad_group_args",
     "validate_keyword_args",
     "validate_negative_keyword_args",
     "validate_rsa_args",

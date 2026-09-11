@@ -56,9 +56,11 @@ from ..safety.units import MoneyError, coerce_units, format_micros, format_units
 from ..safety.validators import ValidationResult
 from .operations import (
     OPERATIONS,
+    ad_group_campaign_verdict,
     budget_spend_delta,
     recheck_bid,
     recheck_budget,
+    recheck_create_ad_group,
     shared_budget_verdict,
     units_from_micros,
     validate_campaign_status_args,
@@ -740,6 +742,151 @@ def register_write_tools(
                 },
             },
             extra={"created_status": "PAUSED"},
+        )
+
+    # ------------------------------------------------------------------
+    # create_ad_group
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("create_ad_group"))
+    async def create_ad_group(
+        customer_id: str,
+        campaign_id: str,
+        name: str,
+        max_cpc: float | None = None,
+    ) -> dict:
+        """Draft a new ad group in an existing Search campaign. Does NOT create it.
+
+        The ad group `add_keyword` and `create_responsive_search_ad` will
+        target. `create_campaign` makes a campaign with none, so this is the
+        step between the two.
+
+        `max_cpc` is the ad group's default max CPC bid, in whole currency
+        units, never micros. Whether to pass it is decided by the CAMPAIGN,
+        not by you:
+
+          Manual CPC campaign     max_cpc is REQUIRED. Without a default bid
+                                  the ad group has nothing to bid with, and
+                                  the Google Ads UI demands one here too.
+          automated bidding       max_cpc must be OMITTED. Google sets the
+                                  bids and ignores this field entirely.
+
+        The ad group is created PAUSED and of type SEARCH_STANDARD. That type
+        is immutable in Google Ads and cannot be changed afterwards, which is
+        why this refuses any campaign that is not a Search campaign.
+
+        Returns a preview and a plan_id; nothing is created until
+        confirm_and_apply.
+        """
+        customer_id = str(customer_id).strip()
+        campaign_id = str(campaign_id).strip()
+        name = str(name).strip()
+        arguments = {
+            "customer_id": customer_id,
+            "campaign_id": campaign_id,
+            "name": name,
+            # Plans are stored as JSON, so the amount travels as a string the
+            # same way every other money argument here does.
+            "max_cpc": None if max_cpc is None else str(max_cpc),
+        }
+
+        caller, _ = await _authorise("create_ad_group", customer_id, arguments)
+        campaign = await _campaign_or_fail(customer_id, campaign_id)
+
+        bid_units: Decimal | None = None
+        if max_cpc is not None:
+            try:
+                bid_units = coerce_units(max_cpc, field="max_cpc")
+            except MoneyError as exc:
+                raise ToolError(f"{exc}. Nothing was created.") from exc
+
+        # Read from the policy snapshot rather than the gate's decision
+        # because the payload has to exist BEFORE the gate runs - the bid
+        # check compares the payload against the campaign. `for_account` only
+        # rebinds currency and timezone, so `rules` is the same either way.
+        status = (
+            "PAUSED"
+            if policy_store.current().rules.new_entities_start_paused
+            else "ENABLED"
+        )
+        # One payload object, built once, judged by the gate and then stored
+        # on the plan. Two derivations from the same variables can drift.
+        payload: dict[str, Any] = {
+            "campaign_id": campaign_id,
+            "name": name,
+            "status": status,
+        }
+        if bid_units is not None:
+            payload["cpc_bid_micros"] = int(to_micros(bid_units))
+
+        # Refused here as well as inside the recheck, so whoever is drafting
+        # gets the explanation before a plan_id exists rather than a bare
+        # policy denial. Same function confirm re-runs, so the two cannot
+        # drift.
+        suitable = ad_group_campaign_verdict(campaign, payload)
+        if not suitable.allowed:
+            raise ToolError(
+                f"Campaign {campaign.name!r} (id {campaign.campaign_id}): "
+                f"{' '.join(suitable.reasons)} Nothing was created."
+            )
+
+        decision = await _decide(
+            "create_ad_group",
+            customer_id,
+            arguments,
+            validate=_validator("create_ad_group", arguments),
+            evaluate=_evaluator(
+                recheck_create_ad_group, arguments, current=campaign, payload=payload
+            ),
+        )
+        policy = decision.policy or policy_store.current()
+        code = policy.currency_code
+
+        bid_text = (
+            format_units(bid_units, code)
+            if bid_units is not None
+            else f"none - {campaign.bidding_strategy_type} sets the bids for you"
+        )
+        preview = "\n".join(
+            [
+                f"Account {customer_id}",
+                f"CREATE an ad group {name!r}",
+                f"  campaign        : {campaign.name!r} (id {campaign.campaign_id})",
+                f"  bidding         : {campaign.bidding_strategy_type}",
+                f"  default max CPC : {bid_text}",
+                f"  type            : SEARCH_STANDARD",
+                f"  status          : {status}",
+                "",
+                "  An ad group's type is IMMUTABLE in Google Ads and there is no",
+                "  tool here to remove one, so SEARCH_STANDARD is permanent.",
+                "  It will have no keywords and no ads, so it cannot spend until",
+                "  someone adds them.",
+            ]
+        )
+
+        return _park(
+            caller=caller,
+            tool="create_ad_group",
+            customer_id=customer_id,
+            arguments=arguments,
+            preview=preview,
+            policy=policy,
+            # No spend delta. A paused ad group with no keywords and no ads
+            # spends nothing, and a max CPC is a price per click rather than a
+            # daily amount - there is no honest number to charge against a
+            # ceiling derived from daily budget increases.
+            spend_delta_units=None,
+            metadata={
+                "campaign_name": campaign.name,
+                "status": status,
+                "operation": "create_ad_group",
+                "payload": payload,
+            },
+            extra={
+                "campaign_id": campaign.campaign_id,
+                "ad_group_name": name,
+                "created_status": status,
+            },
         )
 
     # ------------------------------------------------------------------

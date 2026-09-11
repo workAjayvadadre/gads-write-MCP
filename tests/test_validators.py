@@ -198,3 +198,33 @@ def test_budget_range_boundary(amount: str, ok: bool) -> None:
         amount, min_units=Decimal(50), max_units=Decimal(5000), currency_code="INR"
     )
     assert result.ok is ok
+
+
+# ---------------------------------------------------------------------------
+# ad group names
+# ---------------------------------------------------------------------------
+
+def test_an_ad_group_needs_a_name() -> None:
+    from gads_write.safety.validators import validate_ad_group_name
+
+    assert not validate_ad_group_name("").ok
+    assert not validate_ad_group_name("   ").ok
+    assert validate_ad_group_name("Core Terms").ok
+
+
+def test_ad_group_name_length_boundary() -> None:
+    """255 is one under the 256 Google's System Limits page gives, so this can
+    only ever refuse a name Google would have taken."""
+    from gads_write.safety.validators import MAX_AD_GROUP_NAME, validate_ad_group_name
+
+    assert MAX_AD_GROUP_NAME == 255
+    assert validate_ad_group_name("a" * 255).ok
+    assert not validate_ad_group_name("a" * 256).ok
+
+
+def test_an_ad_group_name_may_not_contain_control_characters() -> None:
+    """Google accepts them and then renders them as nothing, producing an ad
+    group nobody can find by name."""
+    from gads_write.safety.validators import validate_ad_group_name
+
+    assert not validate_ad_group_name("Core" + chr(0) + "Terms").ok

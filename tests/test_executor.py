@@ -241,6 +241,59 @@ async def test_a_positive_keyword_is_explicitly_not_negative(rec) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ad groups
+# ---------------------------------------------------------------------------
+
+async def test_an_ad_group_is_created_as_search_standard(rec) -> None:
+    """`type_` is IMMUTABLE in the Google Ads API and there is no remove tool
+    here, so this is the one chance to get it right."""
+    await _apply(
+        "create_ad_group",
+        {
+            "campaign_id": "55",
+            "name": "Core Terms",
+            "status": "PAUSED",
+            "cpc_bid_micros": 25_000_000,
+        },
+    )
+    created = _sent(rec).create
+    assert created.type_.name == "SEARCH_STANDARD"
+    assert created.status.name == "PAUSED"
+    assert created.name == "Core Terms"
+    assert created.campaign == f"customers/{ACCOUNT}/campaigns/55"
+    assert created.cpc_bid_micros == 25_000_000
+
+
+async def test_an_ad_group_without_a_bid_omits_the_field_entirely(rec) -> None:
+    """Omitted, not zero. A create carries no update mask, so an absent field
+    is simply not written - whereas an explicit zero is a real value Google
+    would store, and a zero default bid is an ad group that cannot win."""
+    await _apply(
+        "create_ad_group",
+        {"campaign_id": "55", "name": "Core Terms", "status": "PAUSED"},
+    )
+    created = _sent(rec).create
+    assert "cpc_bid_micros" not in created
+
+
+async def test_an_ad_group_with_no_name_is_refused(rec) -> None:
+    with pytest.raises(ExecutorError, match="name"):
+        await _apply("create_ad_group", {"campaign_id": "55", "name": "  "})
+    assert "call" not in rec
+
+
+async def test_an_ad_group_can_never_be_created_removed(rec) -> None:
+    """REMOVED is a real AdGroupStatus, and it is terminal. The status helper
+    refuses it here as well as in policy."""
+    with pytest.raises(ExecutorError, match="REMOVED"):
+        await _apply(
+            "create_ad_group",
+            {"campaign_id": "55", "name": "Core Terms", "status": "REMOVED"},
+        )
+    assert "call" not in rec
+
+
+# ---------------------------------------------------------------------------
 # responsive search ads
 # ---------------------------------------------------------------------------
 
@@ -292,6 +345,7 @@ async def test_an_rsa_without_urls_is_refused(rec) -> None:
         ("add_campaign_negative_keyword", {"campaign_id": "55", "keyword_text": "x", "match_type": "BROAD"}),
         ("add_ad_group_negative_keyword", {"ad_group_id": "66", "keyword_text": "x", "match_type": "BROAD"}),
         ("add_keyword", {"ad_group_id": "66", "keyword_text": "x", "match_type": "EXACT"}),
+        ("create_ad_group", {"campaign_id": "55", "name": "Core Terms"}),
         (
             "create_responsive_search_ad",
             {
