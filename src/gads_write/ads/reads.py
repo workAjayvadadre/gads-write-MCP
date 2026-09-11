@@ -51,13 +51,14 @@ Python notes for a TypeScript reader:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from ..settings import Settings
-from .client import build_client
+from .client import NO_MANAGER, build_client
 
 logger = logging.getLogger(__name__)
 
@@ -356,36 +357,79 @@ class GoogleAdsReader(AdsReader):
     ) -> None:
         self._settings = settings
         self._token_provider = token_provider
+        # (caller, customer_id) -> True when the caller reaches this account
+        # DIRECTLY and the manager header must be omitted. Populated by the
+        # first successful read; see _search_rows.
+        self._direct_access: dict[tuple[str, str], bool] = {}
 
     # -- plumbing ---------------------------------------------------------
 
-    def _service(self, name: str) -> Any:
+    def _service(self, name: str, *, manager: Any = None) -> Any:
         client = build_client(
-            settings=self._settings, access_token=self._token_provider()
+            settings=self._settings,
+            access_token=self._token_provider(),
+            login_customer_id=manager,
         )
         return client.get_service(name)
 
+    def _caller_key(self) -> str:
+        """A stable, non-reversible handle for the current caller.
+
+        The direct-access cache is per person: whether a manager header works
+        depends on whose token is asking. Hashed so no credential is used as a
+        dictionary key or reachable from a memory dump of the cache.
+        """
+        return hashlib.sha256(self._token_provider().encode()).hexdigest()[:16]
+
     async def _search_rows(self, *, customer_id: str, query: str) -> list[Any]:
         """Run one GAQL query and return its rows.
+
+        Tries THROUGH THE MANAGER first, and falls back to no manager at all
+        if Google refuses on permissions.
+
+        Most people here hold a single access row on the manager and none on
+        the accounts beneath it, so the manager framing is right for them and
+        is tried first. But somebody granted access directly to one
+        sub-account has no standing on the manager, and naming it makes Google
+        refuse a request for an account they legitimately hold - which locked
+        exactly such a user out of their own account. Google only requires the
+        header when reaching a client customer THROUGH a manager.
+
+        Which framing worked is remembered per caller and account, so the
+        second request costs one round trip rather than two.
 
         The blocking gRPC call is pushed to a worker thread. Errors are
         re-raised as AdsReadError with the Google failure text preserved -
         never downgraded to an empty result.
         """
+        cache_key = (self._caller_key(), customer_id)
+        direct = self._direct_access.get(cache_key)
 
-        def run() -> list[Any]:
-            service = self._service("GoogleAdsService")
+        def run(manager: Any) -> list[Any]:
+            service = self._service("GoogleAdsService", manager=manager)
             pager = service.search(customer_id=customer_id, query=query)
             return list(pager)
 
-        try:
-            return await asyncio.to_thread(run)
-        except AdsReadError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - re-raised, never swallowed
-            raise AdsReadError(
-                f"Google Ads read failed for customer {customer_id}: {exc}"
-            ) from exc
+        attempts: list[Any] = (
+            [NO_MANAGER] if direct else [None, NO_MANAGER]
+        )
+        last: Exception | None = None
+
+        for index, manager in enumerate(attempts):
+            try:
+                rows = await asyncio.to_thread(run, manager)
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                last = exc
+                is_last = index == len(attempts) - 1
+                if is_last or not _is_permission_error(exc):
+                    break
+                continue
+            self._direct_access[cache_key] = manager is NO_MANAGER
+            return rows
+
+        raise AdsReadError(
+            f"Google Ads read failed for customer {customer_id}: {last}"
+        ) from last
 
     # -- interface --------------------------------------------------------
 
@@ -708,6 +752,18 @@ def _campaign_summary(row: Any) -> CampaignSummary:
         budget_reference_count=int(row.campaign_budget.reference_count or 0),
         bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
     )
+
+
+def _is_permission_error(exc: Exception) -> bool:
+    """Whether Google refused this for permissions rather than anything else.
+
+    Matched on the text because the exception type varies across the gRPC and
+    google-ads layers, and only the refusal reason decides whether retrying
+    without the manager header is worth a round trip. Any other failure -
+    a bad query, an outage - is surfaced immediately rather than retried.
+    """
+    text = str(exc).upper()
+    return "PERMISSION_DENIED" in text or "USER_PERMISSION_DENIED" in text
 
 
 def _enum_name(value: object) -> str:

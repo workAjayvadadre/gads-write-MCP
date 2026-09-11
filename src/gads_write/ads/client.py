@@ -40,19 +40,38 @@ from ..settings import Settings
 from .api_version import API_VERSION
 
 
+class _NoManager:
+    """Sentinel for "send no login-customer-id at all".
+
+    A plain `None` cannot express this: `None` already means "use the default
+    manager", and that is the right default for almost every caller.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return "NO_MANAGER"
+
+
+NO_MANAGER = _NoManager()
+
+
 def build_client(
     *,
     settings: Settings,
     access_token: str,
-    login_customer_id: str | None = None,
+    login_customer_id: str | _NoManager | None = None,
 ) -> GoogleAdsClient:
     """Construct a Google Ads client for one request, as one user.
 
     `login_customer_id` is the manager account the request is made "through",
     the API equivalent of picking an account from the switcher in the Google
-    Ads UI. It defaults to the configured MCC. Google resolves the caller's
-    effective role against this account, which is why it is not optional in
-    practice.
+    Ads UI. It defaults to the configured MCC, because most people here hold
+    one access row on the manager and none on the accounts beneath it.
+
+    Pass `NO_MANAGER` to send no manager at all. That is for the caller who
+    holds a DIRECT grant on the account: Google only requires the header when
+    reaching a client customer THROUGH a manager, and naming a manager the
+    caller has no standing on is refused outright - which is what locked a
+    sub-account-only user out of their own account.
     """
     if not access_token:
         # Defensive: an empty token would produce an opaque UNAUTHENTICATED
@@ -67,7 +86,11 @@ def build_client(
     return GoogleAdsClient(
         credentials=credentials,
         developer_token=settings.developer_token,
-        login_customer_id=login_customer_id or settings.login_customer_id,
+        login_customer_id=(
+            None
+            if login_customer_id is NO_MANAGER
+            else (login_customer_id or settings.login_customer_id)
+        ),
         # Pinning the version on the client makes it stick for every service
         # and type lookup made through it: the library starts each one with
         # `version = self.version if self.version else version`, so an

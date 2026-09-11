@@ -243,3 +243,72 @@ async def test_the_set_is_shared_across_callers_rather_than_per_user() -> None:
     reader.set_error(AdsReadError("this caller cannot read the MCC"))
 
     assert await store.get(CHILD_A) is not None
+
+
+# ---------------------------------------------------------------------------
+# surviving a caller who cannot read the manager account
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_keeps_the_last_known_set() -> None:
+    """The bug this fixes, seen in production.
+
+    The set is derived by querying the MCC, which needs access to the MCC. A
+    user holding only a direct grant on a sub-account has none, so when their
+    request is the one whose turn it is to refresh an expired cache, the
+    lookup fails - and failing closed threw away an answer we already had,
+    locking them out of an account they legitimately hold access to.
+
+    Serving the stale set grants nobody anything. It says only which accounts
+    exist under the manager; the per-user decision is still the tier check,
+    run on every call with the caller's own credential.
+    """
+    reader = FakeReader([_summary(CHILD_A)])
+    clock = {"now": 1000.0}
+    store = ManagedAccountStore(
+        reader=reader, login_customer_id=MCC, ttl_seconds=60,
+        clock=lambda: clock["now"],
+    )
+
+    assert await store.get(CHILD_A) is not None      # establishes the set
+
+    clock["now"] += 61                                # cache expires
+    reader.set_error(AdsReadError("USER_PERMISSION_DENIED"))
+
+    assert await store.get(CHILD_A) is not None, (
+        "a caller who cannot read the MCC must still see the accounts a "
+        "previous successful lookup established"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_with_no_previous_set_still_raises() -> None:
+    """Falling back is only possible when there is something to fall back to.
+    A cold start that cannot reach the MCC is still `we do not know`, never an
+    empty set that would read as a correct refusal."""
+    store = _store(FakeReader(error=AdsReadError("USER_PERMISSION_DENIED")))
+    with pytest.raises(AccountLookupError):
+        await store.get(CHILD_A)
+
+
+@pytest.mark.asyncio
+async def test_a_later_success_replaces_the_stale_set() -> None:
+    """Stale is a fallback, not a resting state - the next caller who CAN read
+    the manager refreshes it for everyone."""
+    reader = FakeReader([_summary(CHILD_A)])
+    clock = {"now": 1000.0}
+    store = ManagedAccountStore(
+        reader=reader, login_customer_id=MCC, ttl_seconds=60,
+        clock=lambda: clock["now"],
+    )
+    await store.get(CHILD_A)
+
+    clock["now"] += 61
+    reader.set_error(AdsReadError("USER_PERMISSION_DENIED"))
+    assert await store.get(CHILD_B) is None          # serving the stale set
+
+    clock["now"] += 61
+    reader.set_error(None)
+    reader.set_accounts([_summary(CHILD_A), _summary(CHILD_B)])
+    assert await store.get(CHILD_B) is not None      # refreshed

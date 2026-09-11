@@ -141,6 +141,17 @@ CAMPAIGN_BIDDING_STRATEGIES: frozenset[str] = frozenset(
 KNOWN_OPERATIONS: frozenset[str] = frozenset(UPDATE_MASK_ALLOWLIST) | CREATE_OPERATIONS
 
 
+def _is_permission_error(exc: Exception) -> bool:
+    """Whether Google refused this on authorisation rather than anything else.
+
+    Matched on the text because the exception type varies across the gRPC and
+    google-ads layers. Only an authorisation refusal is safe to retry: it
+    happens before any operation runs, so nothing was applied.
+    """
+    text = str(exc).upper()
+    return "PERMISSION_DENIED" in text or "USER_PERMISSION_DENIED" in text
+
+
 class ExecutorError(RuntimeError):
     """A mutation failed. Never swallowed, never downgraded to success."""
 
@@ -174,11 +185,42 @@ class GoogleAdsExecutor(Executor):
     # ------------------------------------------------------------------
 
     def _dispatch(self, request: MutationRequest) -> MutationResult:
-        from .client import build_client
+        """Run the mutation, THROUGH THE MANAGER first, then directly.
 
-        client = build_client(
-            settings=self._settings, access_token=self._token_provider()
-        )
+        Same reasoning as ads/reads.py: most people here hold one access row
+        on the manager and none on the accounts beneath it, but somebody
+        granted access directly to a single sub-account has no standing on the
+        manager, and naming it makes Google refuse a change to an account they
+        legitimately hold.
+
+        Retrying a MUTATION needs the stronger argument that a read did not.
+        It is safe here because the retry fires on a permission refusal only:
+        Google rejected the request on authorisation, before any operation ran,
+        so nothing was applied and there is nothing to double. `partial_failure`
+        is false on every mutate, so a refusal is all-or-nothing by
+        construction. Any other failure - including an ambiguous one - is
+        surfaced immediately and never retried, because "we do not know whether
+        it landed" must stay a reason to stop.
+        """
+        from .client import NO_MANAGER, build_client
+
+        last: Exception | None = None
+        for index, manager in enumerate((None, NO_MANAGER)):
+            client = build_client(
+                settings=self._settings,
+                access_token=self._token_provider(),
+                login_customer_id=manager,
+            )
+            try:
+                return self._run(request, client)
+            except ExecutorError as exc:
+                last = exc
+                if index == 1 or not _is_permission_error(exc):
+                    raise
+        # Unreachable: the loop either returns or re-raises on its last pass.
+        raise AssertionError("mutation dispatch fell through")  # pragma: no cover
+
+    def _run(self, request: MutationRequest, client: Any) -> MutationResult:
         handler = {
             "pause_campaign": self._set_campaign_status,
             "enable_campaign": self._set_campaign_status,

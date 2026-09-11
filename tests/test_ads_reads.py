@@ -34,6 +34,9 @@ class FakeService:
         self.resource_names = resource_names or []
         self.queries: list[tuple[str, str]] = []
         self.explode: Exception | None = None
+        # login_customer_id passed for each call: None = through the manager,
+        # NO_MANAGER = direct.
+        self.managers: list = []
 
     def search(self, *, customer_id: str, query: str):
         self.queries.append((customer_id, query))
@@ -61,8 +64,13 @@ class StubReader(GoogleAdsReader):
             developer_token="devtoken", login_customer_id="9999999999"
         )
         self._token_provider = lambda: "ya29.fake"
+        # Same state the real __init__ builds. _search_rows remembers per
+        # caller and account whether the manager header must be omitted.
+        self._direct_access: dict[tuple[str, str], bool] = {}
 
-    def _service(self, name: str):  # noqa: D102
+    def _service(self, name: str, *, manager=None):  # noqa: D102
+        # Record which framing was used so a test can assert on the fallback.
+        self._fake.managers.append(manager)
         return self._fake
 
 
@@ -472,3 +480,96 @@ async def test_a_failed_manager_listing_raises_rather_than_returning_nothing() -
 
     with pytest.raises(AdsReadError):
         await reader.managed_accounts(manager_customer_id="9999999999")
+
+
+# ---------------------------------------------------------------------------
+# reaching an account the caller holds DIRECTLY
+# ---------------------------------------------------------------------------
+
+
+class PermissionDeniedOnce(FakeService):
+    """Refuses the manager framing, accepts the direct one.
+
+    Stands in for the real case: somebody granted access to one sub-account
+    and nothing on the manager.
+    """
+
+    def search(self, *, customer_id: str, query: str):
+        from gads_write.ads.client import NO_MANAGER
+
+        if self.managers and self.managers[-1] is not NO_MANAGER:
+            raise RuntimeError(
+                "PERMISSION_DENIED: User doesn't have permission to access "
+                "customer. Note: If you're accessing a client customer, the "
+                "manager's customer id must be set in the 'login-customer-id' "
+                "header."
+            )
+        return super().search(customer_id=customer_id, query=query)
+
+
+async def test_the_manager_framing_is_tried_first() -> None:
+    """Most people here hold one access row on the manager and none on the
+    accounts beneath it, so that framing is right for them and must not cost
+    an extra round trip."""
+    service = FakeService(rows=[])
+    reader = StubReader(service)
+
+    await reader.account_summary("1234567890")
+
+    assert service.managers == [None], "should succeed through the manager"
+
+
+async def test_a_direct_grant_falls_back_to_no_manager() -> None:
+    """The bug this fixes. A user with a direct grant on one sub-account has
+    no standing on the manager, so naming it makes Google refuse a request for
+    an account they legitimately hold."""
+    from gads_write.ads.client import NO_MANAGER
+
+    service = PermissionDeniedOnce(rows=[])
+    reader = StubReader(service)
+
+    await reader.account_summary("1234567890")
+
+    assert service.managers[0] is None          # tried the manager
+    assert service.managers[-1] is NO_MANAGER   # then direct
+
+
+async def test_the_working_framing_is_remembered() -> None:
+    """Otherwise every call for such a user costs two round trips, and
+    visible_tier loops over every managed account."""
+    from gads_write.ads.client import NO_MANAGER
+
+    service = PermissionDeniedOnce(rows=[])
+    reader = StubReader(service)
+
+    await reader.account_summary("1234567890")
+    service.managers.clear()
+    await reader.account_summary("1234567890")
+
+    assert service.managers == [NO_MANAGER], "second call should go direct"
+
+
+async def test_a_non_permission_failure_is_not_retried() -> None:
+    """A bad query or an outage is surfaced immediately. Retrying it without
+    the manager header would double the cost of every genuine failure and
+    change nothing."""
+    service = FakeService(rows=[])
+    service.explode = RuntimeError("INVALID_ARGUMENT: bad query")
+    reader = StubReader(service)
+
+    with pytest.raises(AdsReadError, match="INVALID_ARGUMENT"):
+        await reader.account_summary("1234567890")
+
+    assert len(service.managers) == 1, "should not retry a non-permission error"
+
+
+async def test_a_permission_failure_on_both_framings_still_raises() -> None:
+    """No access either way is a real refusal, not something to paper over."""
+    service = FakeService(rows=[])
+    service.explode = RuntimeError("PERMISSION_DENIED")
+    reader = StubReader(service)
+
+    with pytest.raises(AdsReadError, match="PERMISSION_DENIED"):
+        await reader.account_summary("1234567890")
+
+    assert len(service.managers) == 2, "tried both framings before giving up"

@@ -33,6 +33,15 @@ Conflating those would turn a Google outage into a silent, total refusal
 that is indistinguishable from a correct one in the audit log. Same
 reasoning as `TierLookupError` in auth/tiers.py; see that module.
 
+One deliberate exception to failing closed: a refresh that fails when a set
+is already known serves the STALE set rather than raising. Deriving the set
+queries the manager, so a caller holding only a direct grant on a sub-account
+cannot do it - and if their request happened to be the one refreshing an
+expired cache, failing closed locked them out of an account they legitimately
+hold. The stale set grants nobody anything, because tier is still resolved
+per user per call on their own credential. The expiry is not extended, so the
+next caller who CAN read the manager refreshes it for everyone.
+
 Python notes for a TypeScript reader:
   - `time.monotonic()` only moves forward and ignores system clock changes,
     which is what you want for a TTL. `datetime.now()` is not.
@@ -145,9 +154,35 @@ class ManagedAccountStore:
                     manager_customer_id=self._manager_id
                 )
             except AdsReadError as exc:
-                # Deliberately NOT cached, and deliberately not an empty set.
-                # An outage must not become sticky, and it must not read as a
-                # correct refusal.
+                # Deriving the set means querying the MANAGER, which needs
+                # access to the manager. A person holding only a direct grant
+                # on a sub-account has none - so when their request is the one
+                # whose turn it is to refresh an expired cache, this fails.
+                #
+                # Failing closed here threw away an answer we already had and
+                # locked them out of an account they legitimately hold access
+                # to. That happened in production.
+                #
+                # Serving the last known set instead grants nobody anything:
+                # it says only which accounts exist under the manager, and the
+                # per-user decision is still the tier check, run on every call
+                # with the caller's own credential. Same reasoning as RoleStore
+                # keeping the last good roles.yaml rather than relaxing to
+                # defaults.
+                if self._accounts is not None:
+                    logger.warning(
+                        "managed-account refresh failed, serving the last "
+                        "known set of %d account(s): %s",
+                        len(self._accounts),
+                        exc,
+                    )
+                    # Do NOT extend the expiry. The next caller tries again, so
+                    # a caller who CAN read the manager refreshes it for
+                    # everyone rather than the stale set becoming permanent.
+                    return self._accounts
+
+                # Nothing to fall back to. Still "we do not know", never an
+                # empty set that would read as a correct refusal.
                 raise AccountLookupError(
                     f"could not list the accounts under manager account "
                     f"{self._manager_id}: {exc}"

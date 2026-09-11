@@ -551,3 +551,59 @@ async def test_a_campaign_with_no_budget_is_refused(rec) -> None:
             {"name": "ZZ Test", "budget_micros": 0,
              "bidding_strategy": "MANUAL_CPC"},
         )
+
+
+# ---------------------------------------------------------------------------
+# reaching an account the caller holds DIRECTLY
+# ---------------------------------------------------------------------------
+
+
+async def test_a_permission_refusal_is_retried_without_the_manager(rec) -> None:
+    """Somebody granted access to one sub-account and nothing on the manager
+    has no standing on it, so naming the manager makes Google refuse a change
+    to an account they legitimately hold.
+
+    Safe to retry because the refusal is an AUTHORISATION one: Google rejected
+    the request before any operation ran, and partial_failure is false, so
+    nothing was applied and there is nothing to double.
+    """
+    calls = {"n": 0}
+    real_send = GoogleAdsExecutor._send
+
+    def failing_first(call, request, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ExecutorError("PERMISSION_DENIED: User doesn't have permission")
+        return real_send(call, request, **kwargs)
+
+    GoogleAdsExecutor._send = staticmethod(failing_first)
+    try:
+        result = await _apply(
+            "pause_campaign", {"campaign_id": "55", "status": "PAUSED"}
+        )
+    finally:
+        GoogleAdsExecutor._send = staticmethod(real_send)
+
+    assert result.success
+    assert calls["n"] == 2, "should have retried once, without the manager"
+
+
+async def test_a_non_permission_failure_is_never_retried(rec) -> None:
+    """The rule that makes retrying a mutation defensible at all. Anything
+    that is not an authorisation refusal might have landed, and "we do not
+    know whether it landed" must stay a reason to stop, not to try again."""
+    calls = {"n": 0}
+    real_send = GoogleAdsExecutor._send
+
+    def always_failing(call, request, **kwargs):
+        calls["n"] += 1
+        raise ExecutorError("INTERNAL: connection reset")
+
+    GoogleAdsExecutor._send = staticmethod(always_failing)
+    try:
+        with pytest.raises(ExecutorError, match="connection reset"):
+            await _apply("pause_campaign", {"campaign_id": "55", "status": "PAUSED"})
+    finally:
+        GoogleAdsExecutor._send = staticmethod(real_send)
+
+    assert calls["n"] == 1, "an ambiguous failure must not be retried"
