@@ -172,6 +172,16 @@ def _register_builtin_tools() -> None:
         ToolSpec(name="list_ad_groups", required_tier=Tier.READONLY, writes=False)
     )
 
+    # Disambiguation, not discovery. "Delhi" is a city, a state AND a union
+    # territory in Google's geo data, so a name is a question rather than an
+    # answer; this is what turns it into a set of ids a person can choose
+    # between. readonly, like every other read: it reveals nothing about the
+    # account, but it still goes through the gate so the managed-account check
+    # holds and the call is audited.
+    register(
+        ToolSpec(name="find_locations", required_tier=Tier.READONLY, writes=False)
+    )
+
     # The general escape hatch. Everything the purpose-built reads cannot
     # answer - ads, assets, conversions, geo, change history - without a new
     # tool per question. Still `readonly`, still through the full gate, and
@@ -279,6 +289,18 @@ def _register_builtin_tools() -> None:
             required_tier=Tier.OPERATOR,
             writes=True,
             operation="create_ad_group",
+        )
+    )
+    # Operator. Setting where a campaign may serve is ordinary Standard-user
+    # work in the Google Ads UI. It is also the change most likely to REDUCE
+    # spend rather than raise it: a Search campaign with no location criteria
+    # serves everywhere, so the first one added is a restriction.
+    register(
+        ToolSpec(
+            name="add_location_target",
+            required_tier=Tier.OPERATOR,
+            writes=True,
+            operation="add_location_target",
         )
     )
 

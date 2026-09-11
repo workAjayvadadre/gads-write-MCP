@@ -50,6 +50,7 @@ from ..safety.units import MICROS_PER_UNIT, MoneyError, coerce_units
 from ..safety.validators import (
     ValidationResult,
     validate_ad_group_name,
+    validate_geo_target_ids,
     validate_bidding_strategy,
     validate_campaign_name,
     validate_customer_id,
@@ -469,6 +470,81 @@ def recheck_create_ad_group(
     return ad_group_campaign_verdict(current, payload)
 
 
+def validate_location_target_args(
+    policy: Policy, arguments: dict[str, Any]
+) -> ValidationResult:
+    result = ValidationResult()
+    result.extend(validate_customer_id(arguments.get("customer_id", "")))
+    result.extend(
+        validate_numeric_id(arguments.get("campaign_id", ""), field_name="campaign_id")
+    )
+    result.extend(validate_geo_target_ids(arguments.get("location_ids")))
+    return result
+
+
+def location_target_verdict(current: Any, payload: dict[str, Any]) -> PolicyVerdict:
+    """Whether this location change still means what its preview said.
+
+    Two things, and both are about the preview rather than about spending:
+
+      the campaign exists and is not REMOVED - removal is terminal in Google
+      Ads, so a location added to a removed campaign could never serve;
+
+      the campaign's presence setting has not moved since drafting. This is
+      the one that matters. `positive_geo_target_type` is CAMPAIGN-level, not
+      a criterion, and Google's default (PRESENCE_OR_INTEREST) serves ads to
+      anyone in the world showing interest in a targeted place. So a campaign
+      that was already PRESENCE when this was drafted needs no change and the
+      preview says "unchanged" - but if somebody switched it back to
+      presence-or-interest in the Google Ads UI in the meantime, applying the
+      plan would add the locations and leave interest targeting ON, under a
+      preview that promised otherwise. Refuse and make them draft again.
+
+    Checked at BOTH steps, which is why it lives here rather than in the tool.
+    """
+    if current is None:
+        return PolicyVerdict.deny(
+            "the campaign these locations would be added to could not be read, "
+            "so we cannot tell what this change would actually do."
+        )
+
+    if str(getattr(current, "status", "") or "").upper() == "REMOVED":
+        return PolicyVerdict.deny(
+            "this campaign is REMOVED. Removal is permanent in Google Ads, so "
+            "locations added to it could never serve."
+        )
+
+    if not payload.get("geo_target_constant_ids"):
+        return PolicyVerdict.deny(
+            "this change names no locations, so there is nothing to apply."
+        )
+
+    expected = str(payload.get("expected_positive_geo_target_type") or "")
+    actual = str(getattr(current, "positive_geo_target_type", "") or "")
+    if expected and actual and expected != actual:
+        return PolicyVerdict.deny(
+            "this campaign's location setting has changed since this was "
+            f"drafted: the preview was built when it was {expected}, and it is "
+            f"now {actual}. Applying the plan would not do what the preview "
+            "said. Draft it again."
+        )
+
+    return PolicyVerdict.allow()
+
+
+def recheck_location_target(
+    policy: Policy,
+    *,
+    tier: Tier,
+    arguments: dict[str, Any],
+    current: Any,
+    payload: dict[str, Any],
+    spend_today: Decimal,
+) -> PolicyVerdict:
+    """The same verdict the draft ran, against the campaign as it is NOW."""
+    return location_target_verdict(current, payload)
+
+
 def validate_create_campaign_args(
     policy: Policy, arguments: dict[str, Any]
 ) -> ValidationResult:
@@ -527,6 +603,24 @@ OPERATIONS: dict[str, OperationChecks] = {
         reads=ReadKind.CAMPAIGN,
         id_argument="campaign_id",
     ),
+    # Reads the campaign for the same reason: this change writes a
+    # CAMPAIGN-level field (the presence setting) as well as the criteria, so
+    # confirm has to re-establish that the field still holds the value the
+    # preview was built from.
+    #
+    # A known gap, recorded rather than papered over: the campaign's EXISTING
+    # location criteria are re-read at draft time but not at confirm. If
+    # somebody adds the same location in the Google Ads UI in between, the
+    # mutate is refused by Google as a duplicate, the plan is burnt and the
+    # error is surfaced verbatim. That is a loud, all-or-nothing failure with
+    # nothing half-applied, which is the failure mode this server is built
+    # around - so it is accepted rather than paid for with a third ReadKind.
+    "add_location_target": OperationChecks(
+        validate=validate_location_target_args,
+        recheck=recheck_location_target,
+        reads=ReadKind.CAMPAIGN,
+        id_argument="campaign_id",
+    ),
     "add_keyword": OperationChecks(
         validate=validate_keyword_args,
     ),
@@ -566,6 +660,9 @@ __all__ = [
     "OPERATIONS",
     "SpendDelta",
     "ad_group_campaign_verdict",
+    "location_target_verdict",
+    "recheck_location_target",
+    "validate_location_target_args",
     "budget_spend_delta",
     "shared_budget_verdict",
     "units_from_micros",

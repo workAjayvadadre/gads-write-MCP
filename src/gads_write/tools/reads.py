@@ -38,7 +38,7 @@ from typing import Any
 
 from fastmcp.exceptions import ToolError
 
-from ..ads.reads import AdsReader, AdsReadError
+from ..ads.reads import MAX_LOCATION_MATCHES, AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..auth.tiers import Tier
 from ..safety.accounts import AccountLookupError, ManagedAccountStore
@@ -51,6 +51,7 @@ from ..safety.validators import (
     ValidationResult,
     gaql_resource,
     validate_gaql_query,
+    validate_location_query,
     with_row_limit,
     validate_customer_id,
     validate_date_range,
@@ -307,6 +308,94 @@ def register_read_tools(
                 for row in rows
             ],
         }
+
+    # ------------------------------------------------------------------
+    # find_locations
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("find_locations"))
+    async def find_locations(
+        customer_id: str, query: str, country_code: str | None = None
+    ) -> dict:
+        """Find the places Google will let a campaign target, by name.
+
+        Use this before add_location_target, which takes ids rather than
+        names. It takes ids because a name is usually a QUESTION: "Delhi"
+        matches a city, a state and a union territory in Google's data, as
+        three different targets with three different ids. This tool shows all
+        of them so a person can say which one they meant.
+
+        `country_code` is an ISO-3166-1 alpha-2 code such as IN, and narrows
+        the search. Every result carries a canonical name
+        ("New Delhi,Delhi,India") and a target type ("City"), which are what
+        tell near-identical names apart.
+        """
+        customer_id = str(customer_id).strip()
+        code = None if country_code is None else str(country_code).strip().upper()
+
+        def validate(_: Policy) -> ValidationResult:
+            result = _customer_only(customer_id)
+            result.extend(validate_location_query(query))
+            if code is not None and not (len(code) == 2 and code.isalpha()):
+                result.add(
+                    "country_code",
+                    f"{country_code!r} is not a two-letter ISO country code, "
+                    "e.g. IN",
+                )
+            return result
+
+        await _gate(
+            tool="find_locations",
+            customer_id=customer_id,
+            arguments={
+                "customer_id": customer_id,
+                "query": query,
+                "country_code": code,
+            },
+            validate=validate,
+        )
+
+        try:
+            rows = await reader.find_geo_targets(
+                customer_id=customer_id,
+                query=str(query).strip(),
+                country_code=code,
+            )
+        except AdsReadError as exc:
+            raise ToolError(str(exc)) from exc
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "query": str(query).strip(),
+            "country_code": code,
+            "match_count": len(rows),
+            "locations": [
+                {
+                    "location_id": row.geo_target_id,
+                    "name": row.name,
+                    # The disambiguating field. Named in full on every
+                    # add_location_target preview.
+                    "canonical_name": row.canonical_name,
+                    "target_type": row.target_type,
+                    "country_code": row.country_code,
+                }
+                for row in rows
+            ],
+        }
+        if len(rows) >= MAX_LOCATION_MATCHES:
+            # No silent caps, the same rule list_accounts follows.
+            result["note"] = (
+                f"This tool returns at most {MAX_LOCATION_MATCHES} matches and "
+                "that many came back, so there may be more. Narrow the search "
+                "with country_code or a longer name."
+            )
+        if not rows:
+            result["note"] = (
+                "No enabled place matched that name. Try a shorter or more "
+                "official spelling - Google stores English names, so "
+                "'Bengaluru' and 'Bangalore' are not interchangeable."
+            )
+        return result
 
     # ------------------------------------------------------------------
     # run_gaql_query

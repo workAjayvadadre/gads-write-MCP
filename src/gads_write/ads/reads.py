@@ -26,8 +26,14 @@ by reading the generated protos, not the documentation:
   customer_user_access  user_id, email_address, access_role
   customer              id, descriptive_name, currency_code, time_zone,
                         manager, test_account, status
-  campaign              id, name, status, advertising_channel_type
+  campaign              id, name, status, advertising_channel_type,
+                        geo_target_type_setting.positive_geo_target_type
   campaign_budget       amount_micros
+  campaign_criterion    criterion_id, location.geo_target_constant,
+                        negative, status, display_name
+  geo_target_constant   id, resource_name, name, canonical_name,
+                        country_code, target_type (a STRING, not an enum),
+                        status
   search_term_view      search_term, status, ad_group
   metrics               impressions (int64), clicks (int64),
                         cost_micros (int64), conversions (double)
@@ -96,6 +102,55 @@ def _literal(value: object, *, field: str) -> str:
             f"refusing to build a query: {field}={text!r} contains characters "
             "that are not permitted in a GAQL literal"
         )
+    return text
+
+
+# Free text that reaches a GAQL LIKE clause. Deliberately far narrower than
+# _SAFE_LITERAL: no quote characters (which could close the string literal),
+# no backslash, and none of the four characters GAQL treats as LIKE wildcards
+# (`%`, `_`, `[`, `]` - the grammar escapes those by bracketing them, which is
+# a scheme we have not verified and are not going to implement blind). What is
+# left cannot change the shape of a query or the meaning of the pattern.
+#
+# The cost is that a name containing an apostrophe - "Cote d'Ivoire" - cannot
+# be searched for here. Geo target constant names are English by definition
+# (the v25 proto says "Geo target constant English name"), so this is a narrow
+# loss, and refusing beats inventing an escaping scheme for a grammar whose
+# escape rules are not documented.
+# The safety property is the character SET, not where in the string a
+# character sits. Only the FIRST character is pinned to alphanumeric, so a
+# name cannot start with punctuation; "Washington, D.C." ends in a period and
+# is a real place.
+_SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .,&-]*$")
+
+
+def _text_literal(value: object, *, field: str) -> str:
+    """Assert a free-text value is safe inside a quoted GAQL literal.
+
+    Same two-layer arrangement as `_literal`: tools validate first and return
+    a message a human can act on, this is the backstop against a validation
+    step somebody forgets to call.
+    """
+    text = str(value).strip()
+    if not _SAFE_TEXT.fullmatch(text):
+        raise AdsReadError(
+            f"refusing to build a query: {field}={text!r} contains characters "
+            "that are not permitted in a GAQL text literal. Use letters, "
+            "digits, spaces, and . , & -"
+        )
+    return text
+
+
+def _digit_literal(value: object, *, field: str) -> str:
+    """Digits only. Stricter than `_literal`, which also permits letters.
+
+    Used for ids that are composed into a resource name, where a letter would
+    produce a resource name that is merely wrong rather than dangerous - but
+    "merely wrong" is not a category this module trades in.
+    """
+    text = str(value).strip()
+    if not text.isdigit():
+        raise AdsReadError(f"{field} must be numeric, got {text!r}")
     return text
 
 
@@ -183,6 +238,12 @@ class CampaignSummary:
     budget_reference_count: int = 0
     # Needed for rules.block_broad_match_with_manual_cpc.
     bidding_strategy_type: str = ""
+    # Whether the campaign serves to people IN its targeted locations
+    # (PRESENCE) or also to people merely INTERESTED in them
+    # (PRESENCE_OR_INTEREST, Google's default). Campaign-level, not a
+    # criterion - which is why adding a location does not restrict a campaign
+    # on its own. Empty when Google did not report it.
+    positive_geo_target_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -198,6 +259,54 @@ class AdGroupSummary:
     # automated bidding strategy and no manual bid applies.
     cpc_bid_micros: int
     bidding_strategy_type: str = ""
+
+
+@dataclass(frozen=True)
+class GeoTargetRow:
+    """One geo target constant - a place Google will let you target.
+
+    `canonical_name` is the field that earns this row its existence. "Delhi"
+    in Google's data is a city, a state AND a union territory, as three
+    separate targets with three different ids; only
+    "New Delhi,Delhi,India" against "Delhi,India" tells them apart. Anything
+    that resolved a bare name to one of them silently would be picking, on
+    someone's behalf, which part of a country their money is spent in.
+    """
+
+    geo_target_id: str
+    resource_name: str
+    name: str
+    canonical_name: str
+    country_code: str
+    # A plain string in the API, not an enum - "City", "Region", "Country",
+    # "Postal Code" and so on. Verified in the v25 proto.
+    target_type: str
+    status: str
+
+    def describe(self) -> str:
+        """The one line a human needs to tell two 'Delhi's apart."""
+        label = self.canonical_name or self.name
+        return f"{label} ({self.target_type})" if self.target_type else label
+
+
+@dataclass(frozen=True)
+class CampaignLocationRow:
+    """One location criterion already on a campaign.
+
+    Read before adding any, for two reasons. A mutate is all-or-nothing here,
+    so one duplicate would fail the whole batch; and a preview that offers to
+    add a location the campaign already targets is a preview that lies.
+    """
+
+    criterion_id: str
+    # Resource name, e.g. "geoTargetConstants/2356".
+    geo_target_constant: str
+    geo_target_id: str
+    # True means the location is EXCLUDED, not targeted. See the v25 proto:
+    # "Whether to target (false) or exclude (true) the criterion."
+    negative: bool
+    status: str
+    display_name: str
 
 
 @dataclass(frozen=True)
@@ -321,6 +430,40 @@ class AdsReader(Protocol):
         """One ad group's current state, or None if it does not exist."""
         ...
 
+    async def find_geo_targets(
+        self,
+        *,
+        customer_id: str,
+        query: str,
+        country_code: str | None = None,
+        limit: int = 50,
+    ) -> tuple[GeoTargetRow, ...]:
+        """Places whose English name contains `query`.
+
+        The disambiguation step. Returns every match rather than a best one,
+        because "Delhi" legitimately matches several different places and this
+        server does not choose between them on anyone's behalf.
+        """
+        ...
+
+    async def geo_targets_by_id(
+        self, *, customer_id: str, geo_target_ids: list[str]
+    ) -> tuple[GeoTargetRow, ...]:
+        """The named geo targets, for a preview that says where money goes.
+
+        Filtered on `geo_target_constant.resource_name`, which is the one
+        filter on this resource Google's own documentation demonstrates.
+        A missing id simply does not come back; the caller compares what it
+        asked for against what it got.
+        """
+        ...
+
+    async def campaign_locations(
+        self, *, customer_id: str, campaign_id: str
+    ) -> tuple[CampaignLocationRow, ...]:
+        """Location criteria already on a campaign, targeted or excluded."""
+        ...
+
     async def search_terms(
         self,
         *,
@@ -337,6 +480,11 @@ class AdsReader(Protocol):
 # ---------------------------------------------------------------------------
 
 MAX_ROWS = 1000
+
+# How many places a name search will return. Enough that a real search is not
+# truncated, few enough that a list of them is still something a person reads
+# rather than skims.
+MAX_LOCATION_MATCHES = 50
 
 
 class GoogleAdsReader(AdsReader):
@@ -679,6 +827,105 @@ class GoogleAdsReader(AdsReader):
             bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
         )
 
+    async def find_geo_targets(
+        self,
+        *,
+        customer_id: str,
+        query: str,
+        country_code: str | None = None,
+        limit: int = MAX_LOCATION_MATCHES,
+    ) -> tuple[GeoTargetRow, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        text = _text_literal(query, field="query")
+        row_limit = _int_literal(
+            limit, field="limit", minimum=1, maximum=MAX_LOCATION_MATCHES
+        )
+
+        # REMOVAL_PLANNED targets still resolve but Google is retiring them,
+        # so offering one would be handing somebody a target that stops
+        # working. ENABLED is the only status worth suggesting.
+        where = [
+            f"geo_target_constant.name LIKE '%{text}%'",
+            "geo_target_constant.status = 'ENABLED'",
+        ]
+        if country_code is not None:
+            where.append(
+                "geo_target_constant.country_code = "
+                f"'{_literal(country_code, field='country_code')}'"
+            )
+
+        # No ORDER BY. Sorting happens in Python, which needs no assumption
+        # about which fields of this resource are sortable.
+        gaql = (
+            f"SELECT {GEO_TARGET_FIELDS} "
+            "FROM geo_target_constant "
+            "WHERE " + " AND ".join(where) + " "
+            f"LIMIT {row_limit}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=gaql)
+        return tuple(sorted(
+            (_geo_target_row(row) for row in rows),
+            key=lambda row: (row.country_code, row.canonical_name),
+        ))
+
+    async def geo_targets_by_id(
+        self, *, customer_id: str, geo_target_ids: list[str]
+    ) -> tuple[GeoTargetRow, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe = [
+            _digit_literal(value, field="geo_target_constant_id")
+            for value in geo_target_ids
+        ]
+        if not safe:
+            return ()
+
+        # Composed from digit-only ids, so the resource names cannot carry
+        # anything that would escape the literal. Resource-name filtering is
+        # the one filter on this resource Google's own documentation shows.
+        names = ", ".join(f"'geoTargetConstants/{value}'" for value in safe)
+        gaql = (
+            f"SELECT {GEO_TARGET_FIELDS} "
+            "FROM geo_target_constant "
+            f"WHERE geo_target_constant.resource_name IN ({names}) "
+            f"LIMIT {len(safe)}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=gaql)
+        return tuple(_geo_target_row(row) for row in rows)
+
+    async def campaign_locations(
+        self, *, customer_id: str, campaign_id: str
+    ) -> tuple[CampaignLocationRow, ...]:
+        customer_id = _literal(customer_id, field="customer_id")
+        safe_campaign = _literal(campaign_id, field="campaign_id")
+
+        gaql = (
+            "SELECT campaign_criterion.criterion_id, "
+            "campaign_criterion.location.geo_target_constant, "
+            "campaign_criterion.negative, campaign_criterion.status, "
+            "campaign_criterion.display_name "
+            "FROM campaign_criterion "
+            f"WHERE campaign.id = {safe_campaign} "
+            "AND campaign_criterion.type = 'LOCATION' "
+            "AND campaign_criterion.status != 'REMOVED' "
+            f"LIMIT {MAX_ROWS}"
+        )
+        rows = await self._search_rows(customer_id=customer_id, query=gaql)
+        return tuple(
+            CampaignLocationRow(
+                criterion_id=str(row.campaign_criterion.criterion_id or ""),
+                geo_target_constant=(
+                    row.campaign_criterion.location.geo_target_constant or ""
+                ),
+                geo_target_id=_geo_target_id(
+                    row.campaign_criterion.location.geo_target_constant or ""
+                ),
+                negative=bool(row.campaign_criterion.negative),
+                status=_enum_name(row.campaign_criterion.status),
+                display_name=row.campaign_criterion.display_name or "",
+            )
+            for row in rows
+        )
+
     async def search_terms(
         self,
         *,
@@ -733,8 +980,19 @@ class GoogleAdsReader(AdsReader):
 CAMPAIGN_FIELDS = (
     "campaign.id, campaign.name, campaign.status, "
     "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
+    "campaign.geo_target_type_setting.positive_geo_target_type, "
     "campaign_budget.resource_name, campaign_budget.id, "
     "campaign_budget.amount_micros, campaign_budget.reference_count"
+)
+
+# The geo target fields every geo query selects. One constant so the
+# by-name search and the by-id lookup cannot disagree about a field, which
+# would surface as an AttributeError on a row rather than a clear error.
+GEO_TARGET_FIELDS = (
+    "geo_target_constant.id, geo_target_constant.resource_name, "
+    "geo_target_constant.name, geo_target_constant.canonical_name, "
+    "geo_target_constant.country_code, geo_target_constant.target_type, "
+    "geo_target_constant.status"
 )
 
 
@@ -751,7 +1009,34 @@ def _campaign_summary(row: Any) -> CampaignSummary:
         budget_id=str(row.campaign_budget.id or ""),
         budget_reference_count=int(row.campaign_budget.reference_count or 0),
         bidding_strategy_type=_enum_name(row.campaign.bidding_strategy_type),
+        positive_geo_target_type=_enum_name(
+            row.campaign.geo_target_type_setting.positive_geo_target_type
+        ),
     )
+
+
+def _geo_target_row(row: Any) -> GeoTargetRow:
+    """Map one geo target constant row. Shared by both geo queries."""
+    constant = row.geo_target_constant
+    return GeoTargetRow(
+        geo_target_id=str(constant.id or ""),
+        resource_name=constant.resource_name or "",
+        name=constant.name or "",
+        canonical_name=constant.canonical_name or "",
+        country_code=constant.country_code or "",
+        target_type=constant.target_type or "",
+        status=_enum_name(constant.status),
+    )
+
+
+def _geo_target_id(resource_name: str) -> str:
+    """The numeric id out of "geoTargetConstants/2356".
+
+    Format verified twice: the v25 GeoTargetConstant proto documents it, and
+    GeoTargetConstantServiceClient.geo_target_constant_path builds it.
+    """
+    tail = str(resource_name or "").rsplit("/", 1)[-1]
+    return tail if tail.isdigit() else ""
 
 
 def _is_permission_error(exc: Exception) -> bool:

@@ -228,3 +228,66 @@ def test_an_ad_group_name_may_not_contain_control_characters() -> None:
     from gads_write.safety.validators import validate_ad_group_name
 
     assert not validate_ad_group_name("Core" + chr(0) + "Terms").ok
+
+
+# ---------------------------------------------------------------------------
+# location targeting
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "ordinary", ["Delhi", "New Delhi", "St. Louis", "Washington, D.C.", "Sault Ste-Marie"]
+)
+def test_ordinary_place_names_are_searchable(ordinary: str) -> None:
+    from gads_write.safety.validators import validate_location_query
+
+    assert validate_location_query(ordinary).ok
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "Delhi' OR '1'='1",
+        'Delhi"',
+        "Delhi\\",
+        # LIKE wildcards. They cannot change the query's shape, but they
+        # silently change what the pattern MEANS.
+        "Del%hi",
+        "Del_hi",
+        "Del[hi",
+        "Del]hi",
+        ".Delhi",     # punctuation may not lead
+        "",
+        "D",          # too short to be a useful search
+        "a" * 81,
+    ],
+)
+def test_an_unsearchable_place_name_is_refused(hostile: str) -> None:
+    from gads_write.safety.validators import validate_location_query
+
+    assert not validate_location_query(hostile).ok
+
+
+def test_geo_target_ids_must_be_numeric_and_unique() -> None:
+    """Ids rather than names, because "Delhi" is a question - it matches a
+    city, a state and a union territory."""
+    from gads_write.safety.validators import validate_geo_target_ids
+
+    assert validate_geo_target_ids(["2356", "1007751"]).ok
+    assert not validate_geo_target_ids([]).ok
+    assert not validate_geo_target_ids(["Delhi"]).ok
+    assert not validate_geo_target_ids(["2356", "2356"]).ok
+    assert not validate_geo_target_ids("2356").ok      # a string, not a list
+
+
+def test_too_many_locations_for_one_preview_are_refused() -> None:
+    """Not an API limit - a limit on what a human can actually approve. The
+    preview names every location, and a preview nobody reads is not an
+    approval."""
+    from gads_write.safety.validators import (
+        MAX_LOCATIONS_PER_CHANGE,
+        validate_geo_target_ids,
+    )
+
+    at_limit = [str(n) for n in range(MAX_LOCATIONS_PER_CHANGE)]
+    assert validate_geo_target_ids(at_limit).ok
+    assert not validate_geo_target_ids(at_limit + ["999"]).ok

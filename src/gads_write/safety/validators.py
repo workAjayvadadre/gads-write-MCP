@@ -676,6 +676,103 @@ def validate_bidding_strategy(strategy: object) -> ValidationResult:
 MAX_AD_GROUP_NAME = 255
 
 
+# ---------------------------------------------------------------------------
+# location targeting
+# ---------------------------------------------------------------------------
+
+MIN_LOCATION_QUERY = 2
+MAX_LOCATION_QUERY = 80
+
+# How many locations one change may carry. Not an API limit - the API takes
+# far more - but a limit on what a human can actually approve. The preview
+# names every location, and a preview nobody reads is not an approval.
+MAX_LOCATIONS_PER_CHANGE = 20
+
+# Mirrors _SAFE_TEXT in ads/reads.py, which asserts the same thing again.
+# Only the first character is pinned to alphanumeric: the safety property is
+# the character set, and "Washington, D.C." ends in a period.
+_LOCATION_QUERY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .,&-]*$")
+
+
+def validate_location_query(text: object) -> ValidationResult:
+    """A place name to search for, safe to put inside a GAQL LIKE pattern.
+
+    Deliberately a narrow allowlist rather than an escaping scheme. GAQL
+    string literals are quoted, and the grammar escapes the LIKE wildcards
+    (`%`, `_`, `[`, `]`) by bracketing them - rules we have not verified and
+    are not going to implement blind. So the characters that would matter are
+    simply not allowed through.
+
+    The cost is a name containing an apostrophe. Geo target constant names
+    are English by definition (the v25 proto says "Geo target constant English
+    name"), so this loses "Cote d'Ivoire" and very little else. Asserted again
+    by `_text_literal` in ads/reads.py.
+    """
+    result = ValidationResult()
+    value = str(text or "").strip()
+    if not value:
+        result.add("query", "a place name is required")
+        return result
+    if len(value) < MIN_LOCATION_QUERY:
+        result.add(
+            "query",
+            f"{value!r} is too short to search on; use at least "
+            f"{MIN_LOCATION_QUERY} characters",
+        )
+        return result
+    if len(value) > MAX_LOCATION_QUERY:
+        result.add(
+            "query",
+            f"a place name may be at most {MAX_LOCATION_QUERY} characters, "
+            f"got {len(value)}",
+        )
+        return result
+    if not _LOCATION_QUERY.fullmatch(value):
+        result.add(
+            "query",
+            f"{value!r} contains characters this search cannot pass to Google "
+            "safely. Use letters, digits, spaces, and . , & - only.",
+        )
+    return result
+
+
+def validate_geo_target_ids(ids: object) -> ValidationResult:
+    """A non-empty, deduplicated list of numeric geo target constant ids.
+
+    Ids rather than names, on purpose. "Delhi" is a city, a state and a union
+    territory in Google's data, so a name is not an answer - it is a question.
+    `find_locations` turns the question into a set of ids and shows a person
+    which is which; this refuses anything less definite.
+    """
+    result = ValidationResult()
+    if not isinstance(ids, (list, tuple)):
+        result.add("location_ids", f"expected a list, got {type(ids).__name__}")
+        return result
+    values = [str(value).strip() for value in ids]
+    if not values:
+        result.add("location_ids", "at least one location id is required")
+        return result
+    if len(values) > MAX_LOCATIONS_PER_CHANGE:
+        result.add(
+            "location_ids",
+            f"at most {MAX_LOCATIONS_PER_CHANGE} locations per change, got "
+            f"{len(values)}. The preview has to name every one of them, and a "
+            "preview nobody reads is not an approval.",
+        )
+        return result
+    for index, value in enumerate(values):
+        if not value.isdigit():
+            result.add(
+                f"location_ids[{index}]",
+                f"{value!r} is not a numeric geo target constant id. Use "
+                "find_locations to look one up.",
+            )
+    duplicates = _duplicates(values)
+    if duplicates:
+        result.add("location_ids", f"duplicated: {sorted(duplicates)}")
+    return result
+
+
 def validate_ad_group_name(name: object) -> ValidationResult:
     """Same shape as validate_campaign_name, for the same reasons.
 

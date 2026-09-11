@@ -108,6 +108,20 @@ UPDATE_MASK_ALLOWLIST: dict[str, frozenset[str]] = {
     "enable_campaign": frozenset({"resource_name", "status"}),
     "update_campaign_budget": frozenset({"resource_name", "amount_micros"}),
     "update_ad_group_bid": frozenset({"resource_name", "cpc_bid_micros"}),
+    # The one operation that carries BOTH creates and an update. The location
+    # criteria are creates and need no mask; the campaign-level presence
+    # setting is an update and does, so the operation is listed here rather
+    # than in CREATE_OPERATIONS.
+    #
+    # The mask path is the LEAF, not the containing message - verified against
+    # protobuf_helpers on v25, which returns
+    # `geo_target_type_setting.positive_geo_target_type`. That distinction is
+    # the whole safety of this entry: a mask naming the containing
+    # `geo_target_type_setting` would also name `negative_geo_target_type`,
+    # which this never sets, and a mask naming an unset field BLANKS it.
+    "add_location_target": frozenset(
+        {"resource_name", "geo_target_type_setting.positive_geo_target_type"}
+    ),
 }
 
 # Creates carry no update mask - there is no existing row to partially
@@ -130,6 +144,24 @@ CREATE_OPERATIONS: frozenset[str] = frozenset(
 # campaigns create_campaign makes, and the only one add_keyword and
 # create_responsive_search_ad can populate.
 AD_GROUP_TYPE = "SEARCH_STANDARD"
+
+# The one positive geo target type this server writes, and the only value
+# `add_location_target` will put on a campaign.
+#
+# Google's default is PRESENCE_OR_INTEREST, which does not restrict a campaign
+# to its targeted locations - it broadens it to anyone in the world showing
+# interest in them. A tool called add_location_target that left that alone
+# would produce a preview saying "targeting India" for a campaign still
+# serving abroad, and a preview that lies is the thing this server refuses on
+# principle. PRESENCE can only ever NARROW who sees an ad, so it cannot
+# increase spend, and it is one click to reverse in the Google Ads UI.
+#
+# The cost, stated so it is a decision rather than an oversight: a campaign
+# somebody deliberately set to presence-or-interest is flipped back each time
+# a location is added. It is on the preview with its previous value every
+# time, so nobody gets it unseen. If that ever needs an escape hatch, the fix
+# is a parameter on the tool, not a change here.
+POSITIVE_GEO_TARGET_TYPE = "PRESENCE"
 
 # Bidding strategies this server will create a campaign with. Two, not the
 # seventeen the API offers: Manual CPC needs no extra value and Maximize
@@ -235,6 +267,7 @@ class GoogleAdsExecutor(Executor):
             "enable_campaign": self._set_campaign_status,
             "create_campaign": self._create_campaign,
             "create_ad_group": self._create_ad_group,
+            "add_location_target": self._add_location_target,
             "update_campaign_budget": self._update_campaign_budget,
             "update_ad_group_bid": self._update_ad_group_bid,
             "add_campaign_negative_keyword": self._add_campaign_negative_keyword,
@@ -631,6 +664,125 @@ class GoogleAdsExecutor(Executor):
                 "status": status,
                 "ad_group_type": AD_GROUP_TYPE,
                 "cpc_bid_micros": cpc_bid_micros,
+            },
+        )
+
+    def _add_location_target(
+        self, request: MutationRequest, client: Any
+    ) -> MutationResult:
+        """Target one or more locations, ATOMICALLY with the presence setting.
+
+        Every other write tool here changes one thing. This one cannot: a
+        campaign's location targeting is N criteria plus a campaign-level
+        setting that decides what those criteria MEAN, and applying half of
+        that is worse than applying none of it. A campaign left with the new
+        locations but still on PRESENCE_OR_INTEREST looks restricted in the UI
+        and is not.
+
+        So all of it goes in ONE `GoogleAdsService.mutate`, which applies its
+        operations as a single transaction while partial_failure is off -
+        the same reasoning that made create_campaign atomic.
+        """
+        campaign_id = _digits(request.payload, "campaign_id")
+        raw_ids = list(request.payload.get("geo_target_constant_ids") or [])
+        ids = [str(value).strip() for value in raw_ids]
+        if not ids:
+            raise ExecutorError(
+                "a location change needs at least one geo target constant id"
+            )
+        for value in ids:
+            if not value.isdigit():
+                raise ExecutorError(
+                    f"geo_target_constant_id must be numeric, got {value!r}"
+                )
+        if len(set(ids)) != len(ids):
+            # Google would refuse the duplicate and fail the whole batch, but
+            # failing here says why.
+            raise ExecutorError(f"duplicate geo target constant ids: {ids}")
+
+        service = client.get_service("GoogleAdsService")
+        criterion_service = client.get_service("CampaignCriterionService")
+        campaign_path = criterion_service.campaign_path(
+            request.customer_id, campaign_id
+        )
+
+        operations: list[Any] = []
+        for value in ids:
+            operation = client.get_type("MutateOperation")
+            criterion = operation.campaign_criterion_operation.create
+            criterion.campaign = campaign_path
+            # Explicitly false, on exactly the reasoning that governs the
+            # keyword tools. The v25 proto defines `negative` as "Whether to
+            # target (false) or exclude (true) the criterion", so a location
+            # created with this left to chance would EXCLUDE the place we
+            # meant to target - the precise opposite, and silent.
+            criterion.negative = False
+            # ENABLED, and this is the one place rules.new_entities_start_paused
+            # deliberately does not apply. A PAUSED location criterion
+            # restricts nothing, so creating one would leave the campaign
+            # serving worldwide under a preview that said otherwise.
+            criterion.status = client.enums.CampaignCriterionStatusEnum.ENABLED
+            # Resource name format verified twice: documented in the v25
+            # GeoTargetConstant proto and produced by
+            # GeoTargetConstantServiceClient.geo_target_constant_path.
+            criterion.location.geo_target_constant = f"geoTargetConstants/{value}"
+            # `type_` is deliberately NOT set. It is Output only in the API -
+            # Google derives it from which criterion field is populated.
+            operations.append(operation)
+
+        positive = request.payload.get("positive_geo_target_type")
+        if positive is not None:
+            if positive != POSITIVE_GEO_TARGET_TYPE:
+                raise ExecutorError(
+                    f"this server only sets a positive geo target type of "
+                    f"{POSITIVE_GEO_TARGET_TYPE}, got {positive!r}"
+                )
+            operation = client.get_type("MutateOperation")
+            campaign = operation.campaign_operation.update
+            campaign.resource_name = campaign_path
+            campaign.geo_target_type_setting.positive_geo_target_type = (
+                client.enums.PositiveGeoTargetTypeEnum[positive]
+            )
+            self._seal_mask(
+                request.operation, operation.campaign_operation, campaign, client
+            )
+            operations.append(operation)
+
+        response = self._send(
+            service.mutate, request, mutate_operations=operations
+        )
+
+        if request.validate_only:
+            return MutationResult(
+                success=True,
+                resource_names=(),
+                details={"validate_only": True, "operation": request.operation},
+            )
+
+        created = tuple(
+            result.campaign_criterion_result.resource_name
+            or result.campaign_result.resource_name
+            for result in response.mutate_operation_responses
+        )
+        if not created:
+            raise ExecutorError(
+                "add_location_target reported success but returned no resource "
+                "names, so we cannot confirm anything changed. Check the account."
+            )
+
+        logger.info(
+            "APPLIED %s customer=%s resources=%s",
+            request.operation,
+            request.customer_id,
+            list(created),
+        )
+        return MutationResult(
+            success=True,
+            resource_names=created,
+            details={
+                "operation": "add_location_target",
+                "geo_target_constant_ids": ids,
+                "positive_geo_target_type": positive,
             },
         )
 

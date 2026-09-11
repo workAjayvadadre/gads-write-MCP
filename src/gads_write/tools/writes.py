@@ -44,6 +44,7 @@ from typing import Any
 
 from fastmcp.exceptions import ToolError
 
+from ..ads.executor import POSITIVE_GEO_TARGET_TYPE
 from ..ads.reads import AdsReader, AdsReadError
 from ..auth.identity import current_caller
 from ..safety.plans import PlanError, PlanStore
@@ -58,9 +59,11 @@ from .operations import (
     OPERATIONS,
     ad_group_campaign_verdict,
     budget_spend_delta,
+    location_target_verdict,
     recheck_bid,
     recheck_budget,
     recheck_create_ad_group,
+    recheck_location_target,
     shared_budget_verdict,
     units_from_micros,
     validate_campaign_status_args,
@@ -886,6 +889,231 @@ def register_write_tools(
                 "campaign_id": campaign.campaign_id,
                 "ad_group_name": name,
                 "created_status": status,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # location targeting
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations=annotations_for("add_location_target"))
+    async def add_location_target(
+        customer_id: str, campaign_id: str, location_ids: list[str]
+    ) -> dict:
+        """Draft location targeting for a campaign. Does NOT apply it.
+
+        A Search campaign with no location criteria serves EVERYWHERE, so this
+        is usually the change that restricts a campaign rather than widening
+        it - but adding a location to a campaign that already has some does
+        widen it, and the preview lists both.
+
+        `location_ids` are geo target constant ids from find_locations, never
+        names. "Delhi" matches a city, a state and a union territory, so a
+        name is a question; this tool will not answer it on your behalf.
+
+        It also sets the campaign's location option to PRESENCE - people IN or
+        regularly in the targeted places. Google's default additionally serves
+        to anyone in the world merely searching ABOUT them, which would make
+        "targeting India" untrue. That setting is campaign-level, so it is
+        shown on the preview with its previous value.
+
+        Returns a preview naming every location and a plan_id; nothing changes
+        until confirm_and_apply.
+        """
+        customer_id = str(customer_id).strip()
+        campaign_id = str(campaign_id).strip()
+        wanted = [str(value).strip() for value in (location_ids or [])]
+        arguments = {
+            "customer_id": customer_id,
+            "campaign_id": campaign_id,
+            "location_ids": wanted,
+        }
+
+        caller, _ = await _authorise("add_location_target", customer_id, arguments)
+
+        # Refused here rather than falling through to the "nothing to do"
+        # branch below. An empty list is a malformed call, not a change that
+        # happens to be unnecessary, and reporting it as the latter would tell
+        # somebody their locations were already targeted when none were named.
+        if not wanted:
+            raise ToolError(
+                "give at least one location id. Use find_locations to look one "
+                "up - it returns the id to pass here. Nothing was changed."
+            )
+
+        campaign = await _campaign_or_fail(customer_id, campaign_id)
+
+        # What the campaign already targets. Read before anything is drafted,
+        # for two reasons: the mutate is all-or-nothing, so one duplicate
+        # would fail the whole batch; and a preview offering to add a place
+        # the campaign already targets is a preview that lies.
+        try:
+            existing = await reader.campaign_locations(
+                customer_id=customer_id, campaign_id=campaign_id
+            )
+        except AdsReadError as exc:
+            raise ToolError(
+                f"could not read the locations campaign {campaign_id} already "
+                f"targets: {exc}. Nothing was changed."
+            ) from exc
+
+        try:
+            found = await reader.geo_targets_by_id(
+                customer_id=customer_id, geo_target_ids=wanted
+            )
+        except AdsReadError as exc:
+            raise ToolError(f"{exc}. Nothing was changed.") from exc
+
+        by_id = {row.geo_target_id: row for row in found}
+        missing = [value for value in wanted if value not in by_id]
+        if missing:
+            raise ToolError(
+                f"Google has no enabled place with id(s) {missing}. Look them "
+                "up with find_locations - it returns the id to use. Nothing "
+                "was changed."
+            )
+
+        targeted = {row.geo_target_id for row in existing if not row.negative}
+        excluded = {row.geo_target_id for row in existing if row.negative}
+
+        clashing = [value for value in wanted if value in excluded]
+        if clashing:
+            # Adding a location positively while it is excluded is a
+            # contradiction, and there is no tool here to remove the
+            # exclusion, so this cannot be resolved from this server.
+            names = ", ".join(by_id[value].describe() for value in clashing)
+            raise ToolError(
+                f"Campaign {campaign.name!r} currently EXCLUDES {names}. "
+                "Targeting and excluding the same place is a contradiction, "
+                "and this server has no tool to remove an exclusion - do that "
+                "in the Google Ads UI first. Nothing was changed."
+            )
+
+        to_add = [value for value in wanted if value not in targeted]
+        already = [value for value in wanted if value in targeted]
+
+        if not to_add:
+            # Not an error, and deliberately not a plan. The pause_campaign
+            # rule: a confirmed, audited change that changed nothing makes the
+            # audit log harder to read.
+            names = ", ".join(by_id[value].describe() for value in already)
+            return {
+                "ok": True,
+                "no_change_needed": True,
+                "campaign_id": campaign.campaign_id,
+                "campaign_name": campaign.name,
+                "already_targeted": names,
+                "message": (
+                    f"Campaign {campaign.name!r} already targets {names}. "
+                    "Nothing to do."
+                ),
+            }
+
+        current_geo_type = campaign.positive_geo_target_type or ""
+        # None means "leave the campaign record alone" - it is already
+        # presence-only, so there is nothing to write and the mutate carries
+        # criterion creates only.
+        set_geo_type = (
+            None if current_geo_type == POSITIVE_GEO_TARGET_TYPE
+            else POSITIVE_GEO_TARGET_TYPE
+        )
+        payload: dict[str, Any] = {
+            "campaign_id": campaign_id,
+            "geo_target_constant_ids": to_add,
+            "positive_geo_target_type": set_geo_type,
+            # What the preview was built against. Confirm compares this to the
+            # campaign as it is then: if somebody switched the setting back in
+            # the Google Ads UI, the preview's promise no longer holds.
+            "expected_positive_geo_target_type": current_geo_type,
+        }
+
+        suitable = location_target_verdict(campaign, payload)
+        if not suitable.allowed:
+            raise ToolError(
+                f"Campaign {campaign.name!r} (id {campaign.campaign_id}): "
+                f"{' '.join(suitable.reasons)} Nothing was changed."
+            )
+
+        decision = await _decide(
+            "add_location_target",
+            customer_id,
+            arguments,
+            validate=_validator("add_location_target", arguments),
+            evaluate=_evaluator(
+                recheck_location_target, arguments, current=campaign, payload=payload
+            ),
+        )
+        policy = decision.policy or policy_store.current()
+
+        # Every location named in full. A preview that said "3 locations"
+        # would be asking someone to approve a number, not a decision.
+        lines = [
+            f"Account {customer_id}",
+            f"Campaign {campaign.name!r} (id {campaign.campaign_id})",
+            f"  ADD {len(to_add)} location target(s):",
+            *[f"      + {by_id[value].describe()}" for value in to_add],
+        ]
+        if already:
+            lines.append("  already targeted, not added again:")
+            lines.extend(f"      = {by_id[value].describe()}" for value in already)
+
+        others = sorted(
+            row.display_name or row.geo_target_constant
+            for row in existing
+            if not row.negative and row.geo_target_id not in set(wanted)
+        )
+        if others:
+            lines.append("  other locations this campaign already targets:")
+            lines.extend(f"      . {name}" for name in others)
+        elif not already:
+            lines.append(
+                "  This campaign had NO location targeting, so it was serving"
+            )
+            lines.append("  everywhere. After this it serves only where listed.")
+
+        lines.append("")
+        if set_geo_type is None:
+            lines.append(
+                "  who sees it : people IN or regularly in these locations"
+            )
+            lines.append("                (already set that way, unchanged)")
+        else:
+            lines.append(
+                "  who sees it : people IN or regularly in these locations"
+            )
+            lines.append(
+                f"                changed from {current_geo_type or 'unset'}, "
+                "which also"
+            )
+            lines.append(
+                "                served people elsewhere searching ABOUT them"
+            )
+        if excluded:
+            lines.append(
+                f"  NOTE: this campaign also excludes {len(excluded)} location(s), "
+                "which this change does not touch."
+            )
+
+        return _park(
+            caller=caller,
+            tool="add_location_target",
+            customer_id=customer_id,
+            arguments=arguments,
+            preview="\n".join(lines),
+            policy=policy,
+            # No spend delta. Location targeting moves no daily budget: it
+            # changes WHERE the existing budget is spent, not how much.
+            spend_delta_units=None,
+            metadata={
+                "campaign_name": campaign.name,
+                "operation": "add_location_target",
+                "payload": payload,
+            },
+            extra={
+                "campaign_id": campaign.campaign_id,
+                "locations_added": [by_id[value].describe() for value in to_add],
+                "already_targeted": [by_id[value].describe() for value in already],
+                "positive_geo_target_type": POSITIVE_GEO_TARGET_TYPE,
             },
         )
 

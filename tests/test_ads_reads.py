@@ -311,6 +311,14 @@ async def _capture_queries() -> list[str]:
         limit=10,
         campaign_id="777",
     )
+    await reader.find_geo_targets(customer_id="1234567890", query="Delhi")
+    await reader.find_geo_targets(
+        customer_id="1234567890", query="Delhi", country_code="IN"
+    )
+    await reader.geo_targets_by_id(
+        customer_id="1234567890", geo_target_ids=["2356", "1007751"]
+    )
+    await reader.campaign_locations(customer_id="1234567890", campaign_id="55")
     return [query for _, query in service.queries]
 
 
@@ -368,6 +376,12 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         customer_user_access as cua_mod,
     )
     from google.ads.googleads.v25.resources.types import (
+        campaign_criterion as campaign_criterion_mod,
+    )
+    from google.ads.googleads.v25.resources.types import (
+        geo_target_constant as geo_mod,
+    )
+    from google.ads.googleads.v25.resources.types import (
         search_term_view as stv_mod,
     )
 
@@ -382,6 +396,8 @@ async def test_every_selected_field_exists_in_the_pinned_api_version() -> None:
         "ad_group": ad_group_mod.AdGroup,
         "campaign": campaign_mod.Campaign,
         "campaign_budget": campaign_budget_mod.CampaignBudget,
+        "campaign_criterion": campaign_criterion_mod.CampaignCriterion,
+        "geo_target_constant": geo_mod.GeoTargetConstant,
         "customer": customer_mod.Customer,
         "customer_client": customer_client_mod.CustomerClient,
         "customer_user_access": cua_mod.CustomerUserAccess,
@@ -573,3 +589,189 @@ async def test_a_permission_failure_on_both_framings_still_raises() -> None:
         await reader.account_summary("1234567890")
 
     assert len(service.managers) == 2, "tried both framings before giving up"
+
+
+# ---------------------------------------------------------------------------
+# geo targets - the one place free text reaches a GAQL literal
+# ---------------------------------------------------------------------------
+# Every other read interpolates ids and dates, which `_literal` restricts to a
+# character class no quote can hide in. A place-name search cannot: "New Delhi"
+# has a space, so it needs its own, looser literal - and looser is exactly
+# where injections live.
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "Delhi' OR '1'='1",
+        "Delhi'",
+        'Delhi"',
+        "Delhi\\",
+        # The four characters GAQL treats as LIKE wildcards. Harmless to the
+        # query's shape, but they silently change what the pattern MEANS, and
+        # the escape scheme for them is not one we have verified.
+        "Del%hi",
+        "Del_hi",
+        "Del[hi",
+        "Del]hi",
+        "",
+        "   ",
+    ],
+)
+async def test_hostile_place_names_never_reach_a_query(hostile: str) -> None:
+    from gads_write.ads.reads import _text_literal
+
+    service = FakeService(rows=[])
+    with pytest.raises(AdsReadError):
+        _text_literal(hostile, field="query")
+
+    with pytest.raises(AdsReadError):
+        await StubReader(service).find_geo_targets(
+            customer_id="1234567890", query=hostile
+        )
+    # The point: it failed BEFORE anything was sent.
+    assert service.queries == []
+
+
+@pytest.mark.parametrize(
+    "ordinary", ["Delhi", "New Delhi", "St. Louis", "Washington, D.C.", "Sault Ste-Marie"]
+)
+def test_ordinary_place_names_pass(ordinary: str) -> None:
+    from gads_write.ads.reads import _text_literal
+
+    assert _text_literal(ordinary, field="query") == ordinary
+
+
+async def test_a_name_search_looks_only_at_enabled_targets() -> None:
+    """REMOVAL_PLANNED targets still resolve, but Google is retiring them, so
+    suggesting one hands somebody a target that stops working."""
+    service = FakeService(rows=[])
+    await StubReader(service).find_geo_targets(
+        customer_id="1234567890", query="Delhi"
+    )
+    _, query = service.queries[0]
+    assert "geo_target_constant.status = 'ENABLED'" in query
+    assert "geo_target_constant.name LIKE '%Delhi%'" in query
+
+
+async def test_the_country_filter_is_only_added_when_asked_for() -> None:
+    service = FakeService(rows=[])
+    reader = StubReader(service)
+    await reader.find_geo_targets(customer_id="1234567890", query="Delhi")
+    await reader.find_geo_targets(
+        customer_id="1234567890", query="Delhi", country_code="IN"
+    )
+    # In the WHERE clause, not the SELECT - country_code is selected either way.
+    assert "geo_target_constant.country_code = " not in service.queries[0][1]
+    assert "geo_target_constant.country_code = 'IN'" in service.queries[1][1]
+
+
+async def test_a_hostile_country_code_never_reaches_the_query() -> None:
+    service = FakeService(rows=[])
+    with pytest.raises(AdsReadError):
+        await StubReader(service).find_geo_targets(
+            customer_id="1234567890", query="Delhi", country_code="IN' OR '1'='1"
+        )
+    assert service.queries == []
+
+
+async def test_ids_are_looked_up_by_resource_name() -> None:
+    """Resource-name filtering is the one filter on this resource Google's own
+    documentation demonstrates, and the ids are digits-only by then, so the
+    composed literal cannot carry anything that escapes it."""
+    service = FakeService(rows=[])
+    await StubReader(service).geo_targets_by_id(
+        customer_id="1234567890", geo_target_ids=["2356", "1007751"]
+    )
+    _, query = service.queries[0]
+    assert (
+        "geo_target_constant.resource_name IN "
+        "('geoTargetConstants/2356', 'geoTargetConstants/1007751')"
+    ) in query
+
+
+@pytest.mark.parametrize("hostile", ["2356'", "abc", "23 56", "geoTargetConstants/1"])
+async def test_a_non_numeric_geo_target_id_is_refused(hostile: str) -> None:
+    service = FakeService(rows=[])
+    with pytest.raises(AdsReadError):
+        await StubReader(service).geo_targets_by_id(
+            customer_id="1234567890", geo_target_ids=[hostile]
+        )
+    assert service.queries == []
+
+
+async def test_no_ids_asks_google_nothing() -> None:
+    service = FakeService(rows=[])
+    assert await StubReader(service).geo_targets_by_id(
+        customer_id="1234567890", geo_target_ids=[]
+    ) == ()
+    assert service.queries == []
+
+
+def _geo_row(gid="2356", name="Delhi", canonical="Delhi,India", target_type="Region"):
+    return SimpleNamespace(
+        geo_target_constant=SimpleNamespace(
+            id=gid,
+            resource_name=f"geoTargetConstants/{gid}",
+            name=name,
+            canonical_name=canonical,
+            country_code="IN",
+            target_type=target_type,
+            status=SimpleNamespace(name="ENABLED"),
+        )
+    )
+
+
+async def test_matches_come_back_with_what_tells_them_apart() -> None:
+    """"Delhi" is a city, a state and a union territory. The canonical name
+    and the target type are the only things that distinguish them, so a row
+    missing either is useless for choosing."""
+    service = FakeService(
+        rows=[
+            _geo_row("1007751", "Delhi", "Delhi,India", "Region"),
+            _geo_row("9040379", "New Delhi", "New Delhi,Delhi,India", "City"),
+        ]
+    )
+    rows = await StubReader(service).find_geo_targets(
+        customer_id="1234567890", query="Delhi"
+    )
+    assert [row.describe() for row in rows] == [
+        "Delhi,India (Region)",
+        "New Delhi,Delhi,India (City)",
+    ]
+
+
+async def test_campaign_locations_exclude_removed_criteria() -> None:
+    service = FakeService(rows=[])
+    await StubReader(service).campaign_locations(
+        customer_id="1234567890", campaign_id="55"
+    )
+    _, query = service.queries[0]
+    assert "campaign_criterion.type = 'LOCATION'" in query
+    assert "campaign_criterion.status != 'REMOVED'" in query
+    assert "campaign.id = 55" in query
+
+
+async def test_an_excluded_location_is_reported_as_excluded() -> None:
+    """`negative` means EXCLUDE, not target. Reading it as the other way round
+    would make the tool offer to add a place the campaign is blocking."""
+    service = FakeService(
+        rows=[
+            SimpleNamespace(
+                campaign_criterion=SimpleNamespace(
+                    criterion_id=11,
+                    location=SimpleNamespace(
+                        geo_target_constant="geoTargetConstants/2356"
+                    ),
+                    negative=True,
+                    status=SimpleNamespace(name="ENABLED"),
+                    display_name="India",
+                )
+            )
+        ]
+    )
+    rows = await StubReader(service).campaign_locations(
+        customer_id="1234567890", campaign_id="55"
+    )
+    assert rows[0].negative is True
+    assert rows[0].geo_target_id == "2356"

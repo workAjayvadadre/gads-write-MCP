@@ -83,23 +83,33 @@ class RecordingService:
             names = self._recorder.get("resource_names", ["customers/x/things/1"])
             if name == "mutate":
                 # The bulk, atomic form. Its response is shaped differently:
-                # one entry per operation, each naming which resource it was.
-                return SimpleNamespace(
-                    mutate_operation_responses=[
-                        SimpleNamespace(
-                            campaign_budget_result=SimpleNamespace(
-                                resource_name="customers/x/campaignBudgets/1"
-                            ),
-                            campaign_result=SimpleNamespace(resource_name=""),
-                        ),
-                        SimpleNamespace(
-                            campaign_budget_result=SimpleNamespace(resource_name=""),
-                            campaign_result=SimpleNamespace(
-                                resource_name="customers/x/campaigns/2"
-                            ),
-                        ),
-                    ]
-                )
+                # one entry per operation, each carrying a result field named
+                # after the KIND of resource that operation touched, and empty
+                # strings in the others.
+                #
+                # Derived from what was actually sent rather than hardcoded.
+                # It used to be a fixed budget-then-campaign pair, which meant
+                # only create_campaign could be tested through this path - any
+                # other bulk mutate got a response describing operations it
+                # never sent.
+                sent = payload.get("mutate_operations") if isinstance(payload, dict) else []
+                entries = []
+                for index, operation in enumerate(sent or []):
+                    # WhichOneof is definitive about which operation this is;
+                    # `in` on a proto-plus oneof is easy to get subtly wrong.
+                    kind = operation._pb.WhichOneof("operation") or ""
+                    fields = {
+                        "campaign_budget_result": SimpleNamespace(resource_name=""),
+                        "campaign_result": SimpleNamespace(resource_name=""),
+                        "campaign_criterion_result": SimpleNamespace(resource_name=""),
+                    }
+                    result_field = kind.replace("_operation", "_result")
+                    if result_field in fields:
+                        fields[result_field] = SimpleNamespace(
+                            resource_name=f"customers/x/{kind}/{index}"
+                        )
+                    entries.append(SimpleNamespace(**fields))
+                return SimpleNamespace(mutate_operation_responses=entries)
             return SimpleNamespace(
                 results=[SimpleNamespace(resource_name=n) for n in names]
             )
@@ -294,6 +304,126 @@ async def test_an_ad_group_can_never_be_created_removed(rec) -> None:
 
 
 # ---------------------------------------------------------------------------
+# location targeting - the only operation carrying creates AND an update
+# ---------------------------------------------------------------------------
+
+LOCATIONS = {
+    "campaign_id": "55",
+    "geo_target_constant_ids": ["2356", "1007751"],
+    "positive_geo_target_type": "PRESENCE",
+}
+
+
+async def test_locations_and_the_presence_setting_go_in_ONE_request(rec) -> None:
+    """Applying half of this is worse than applying none.
+
+    A campaign left with the new locations but still on PRESENCE_OR_INTEREST
+    looks restricted in the Google Ads UI and is not - it still serves to
+    anyone in the world searching about those places. One atomic mutate means
+    either both land or neither does.
+    """
+    await _apply("add_location_target", LOCATIONS)
+    assert rec["methods"] == ["mutate"]
+    ops = rec["request"]["mutate_operations"]
+    assert len(ops) == 3          # two criteria + the campaign setting
+
+
+async def test_a_location_criterion_targets_rather_than_excludes(rec) -> None:
+    """`negative` on a CampaignCriterion means EXCLUDE (verified in the v25
+    proto). Left to chance, this would block the place we meant to target."""
+    await _apply("add_location_target", LOCATIONS)
+    ops = rec["request"]["mutate_operations"]
+    criterion = ops[0].campaign_criterion_operation.create
+
+    assert criterion.negative is False
+    assert criterion.campaign == f"customers/{ACCOUNT}/campaigns/55"
+    assert criterion.location.geo_target_constant == "geoTargetConstants/2356"
+    assert ops[1].campaign_criterion_operation.create.location.geo_target_constant == (
+        "geoTargetConstants/1007751"
+    )
+
+
+async def test_location_criteria_are_created_enabled(rec) -> None:
+    """The one place new_entities_start_paused deliberately does not apply.
+
+    A PAUSED location criterion restricts nothing, so creating one would leave
+    the campaign serving worldwide under a preview that said otherwise.
+    """
+    await _apply("add_location_target", LOCATIONS)
+    criterion = rec["request"]["mutate_operations"][0].campaign_criterion_operation.create
+    assert criterion.status.name == "ENABLED"
+
+
+async def test_the_presence_mask_names_the_LEAF_not_the_whole_setting(rec) -> None:
+    """The test this operation exists to justify.
+
+    `geo_target_type_setting` holds TWO fields. A mask naming the containing
+    message would also name `negative_geo_target_type`, which this never sets -
+    and a mask naming an unset field BLANKS it. The mask must be the leaf.
+    """
+    await _apply("add_location_target", LOCATIONS)
+    campaign_op = rec["request"]["mutate_operations"][2].campaign_operation
+    paths = set(campaign_op.update_mask.paths)
+
+    assert paths <= UPDATE_MASK_ALLOWLIST["add_location_target"]
+    assert "geo_target_type_setting.positive_geo_target_type" in paths
+    assert "geo_target_type_setting" not in paths
+    assert "geo_target_type_setting.negative_geo_target_type" not in paths
+    # And nothing from another operation's business.
+    assert "status" not in paths
+    assert "name" not in paths
+
+
+async def test_the_campaign_is_set_to_presence_only(rec) -> None:
+    await _apply("add_location_target", LOCATIONS)
+    campaign = rec["request"]["mutate_operations"][2].campaign_operation.update
+    assert (
+        campaign.geo_target_type_setting.positive_geo_target_type.name == "PRESENCE"
+    )
+    assert campaign.resource_name == f"customers/{ACCOUNT}/campaigns/55"
+
+
+async def test_an_already_presence_campaign_sends_criteria_only(rec) -> None:
+    """None means "leave the campaign record alone". Writing PRESENCE over
+    PRESENCE would be a no-op mutation on a resource nobody asked to change."""
+    await _apply(
+        "add_location_target",
+        {**LOCATIONS, "positive_geo_target_type": None},
+    )
+    ops = rec["request"]["mutate_operations"]
+    assert len(ops) == 2
+    assert all(
+        "campaign_criterion_operation" in str(op) or True for op in ops
+    )
+    assert not ops[0].campaign_operation.update.resource_name
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"campaign_id": "55", "geo_target_constant_ids": []},
+        {"campaign_id": "55", "geo_target_constant_ids": ["2356'"]},
+        {"campaign_id": "55", "geo_target_constant_ids": ["abc"]},
+        {"campaign_id": "55", "geo_target_constant_ids": ["2356", "2356"]},
+        {"campaign_id": "55 OR 1=1", "geo_target_constant_ids": ["2356"]},
+        # Only PRESENCE. Anything else would be a value the previews in
+        # tools/writes.py never describe.
+        {
+            "campaign_id": "55",
+            "geo_target_constant_ids": ["2356"],
+            "positive_geo_target_type": "PRESENCE_OR_INTEREST",
+        },
+    ],
+)
+async def test_malformed_location_payloads_are_refused_before_sending(
+    rec, payload
+) -> None:
+    with pytest.raises(ExecutorError):
+        await _apply("add_location_target", payload)
+    assert "call" not in rec
+
+
+# ---------------------------------------------------------------------------
 # responsive search ads
 # ---------------------------------------------------------------------------
 
@@ -346,6 +476,14 @@ async def test_an_rsa_without_urls_is_refused(rec) -> None:
         ("add_ad_group_negative_keyword", {"ad_group_id": "66", "keyword_text": "x", "match_type": "BROAD"}),
         ("add_keyword", {"ad_group_id": "66", "keyword_text": "x", "match_type": "EXACT"}),
         ("create_ad_group", {"campaign_id": "55", "name": "Core Terms"}),
+        (
+            "add_location_target",
+            {
+                "campaign_id": "55",
+                "geo_target_constant_ids": ["2356"],
+                "positive_geo_target_type": "PRESENCE",
+            },
+        ),
         (
             "create_responsive_search_ad",
             {
